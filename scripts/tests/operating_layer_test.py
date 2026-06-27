@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+operating_layer_test.py - self-test suite for operating-layer.py.
+
+Stdlib only. Run: python3 ~/.claude/scripts/tests/operating_layer_test.py
+Exit 0 = all pass; non-zero = failures.
+"""
+import ast
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+CLI = (HERE / ".." / "operating-layer.py").resolve()
+ROOT = Path("/private/tmp/operating-layer-test")
+
+_passes = 0
+_failures = []
+
+
+def check(cond, label):
+    global _passes
+    if cond:
+        _passes += 1
+    else:
+        _failures.append(label)
+        sys.stderr.write(f"FAIL: {label}\n")
+
+
+def reset():
+    if ROOT.exists():
+        shutil.rmtree(ROOT)
+    (ROOT / "claude").mkdir(parents=True)
+    (ROOT / "codex").mkdir(parents=True)
+    (ROOT / "projects").mkdir(parents=True)
+    (ROOT / "out").mkdir(parents=True)
+    (ROOT / "claude" / "hooks").mkdir()
+    (ROOT / "claude" / "logs").mkdir()
+    (ROOT / "claude" / "sensory-memory").mkdir()
+    (ROOT / "codex" / "hooks").mkdir()
+    (ROOT / "codex" / "skills").mkdir()
+    (ROOT / "codex" / "plugins" / "cache").mkdir(parents=True)
+
+
+def write(path, text):
+    full = ROOT / path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text(text, encoding="utf-8")
+    return full
+
+
+def touch_old(path, days=90):
+    full = ROOT / path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text("old evidence\n", encoding="utf-8")
+    old = time.time() - days * 86400
+    os.utime(full, (old, old))
+    return full
+
+
+def base_cmd(subcommand, extra=None):
+    cmd = [
+        sys.executable,
+        str(CLI),
+        subcommand,
+        "--claude-home", str(ROOT / "claude"),
+        "--codex-home", str(ROOT / "codex"),
+        "--projects-root", str(ROOT / "projects"),
+        "--output-root", str(ROOT / "out"),
+        "--since-days", "3650",
+        "--json",
+    ]
+    if extra:
+        cmd.extend(extra)
+    return cmd
+
+
+def run(subcommand, extra=None):
+    proc = subprocess.run(base_cmd(subcommand, extra), capture_output=True, text=True, timeout=120)
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except Exception:
+        data = None
+    return data, proc
+
+
+def ids(data):
+    return {f["id"] for f in data.get("findings", [])} if isinstance(data, dict) else set()
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def assert_no_secret_output(text, label):
+    lowered = text.lower()
+    check("sk-proj-" not in text and "password=hunter2" not in lowered and "api_key=abc" not in lowered, label)
+
+
+def test_intel_detection_and_clean():
+    reset()
+    write(
+        "claude/hooks/ingest.log",
+        "\n".join([
+            "2026-06-27T10:00:00Z [track] stop: ingest http=500 cwd=/tmp/app session=s1 password=hunter2",
+            "2026-06-27T10:01:00Z [track] stop: ingest http=400 invalid_payload cwd=/tmp/app session=s2",
+            "2026-06-27T10:02:00Z [track] stop: ingest http=000000 cwd=/tmp/app session=s3",
+            "",
+        ]),
+    )
+    write("codex/hooks/ingest.log", "2026-06-27T10:00:00Z [track] stop: ingest http=200\n")
+    write("claude/logs/1pct-violations.log", '{"ts":"2026-06-27T10:00:00Z","flags":["ready-to-proceed"]}\n')
+    write("claude/sensory-memory/groq-failures.log", "2026-06-27T10:00:00Z model_not_found moonshotai/kimi\n")
+    write("codex/session_index.jsonl", '{"updated_at":"2026-06-27T10:00:00Z","thread_name":"Review workflow audit"}\n')
+    data, proc = run("intel")
+    check(proc.returncode == 0, "intel bad fixture exits 0")
+    got = ids(data)
+    check("opintel-artifact-ingest-http-500-claude" in got, "intel detects http 500 artifact ingest failures")
+    check("opintel-artifact-ingest-http-400-invalid-payload-claude" in got, "intel detects invalid payload artifact ingest failures")
+    check("opintel-artifact-ingest-http-000000-claude" in got, "intel detects transport/no-response artifact ingest failures")
+    check("opintel-false-pause-hits" in got, "intel detects false pause hits")
+    check("opintel-provider-model-drift" in got, "intel detects provider drift")
+    assert_no_secret_output(proc.stdout, "intel redacts secret-like log content")
+
+    reset()
+    write("codex/session_index.jsonl", '{"updated_at":"2026-06-27T10:00:00Z","thread_name":"Ordinary work"}\n')
+    data, _proc = run("intel")
+    check(not any(i.startswith("opintel-artifact-ingest") for i in ids(data)), "intel clean fixture avoids ingest FP")
+    check("opintel-provider-model-drift" not in ids(data), "intel clean fixture avoids provider FP")
+
+
+def test_tools_detection_and_clean():
+    reset()
+    write("claude/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
+    write("codex/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
+    write("claude/skills/close-day/SKILL.md", "---\nname: close-day\n---\n")
+    write("codex/config.toml", '[mcp_servers.figma]\nauth = "missing"\n')
+    data, _proc = run("tools")
+    got = ids(data)
+    check("tools-duplicate-skill-families" in got, "tools detects duplicate skill family")
+    check("tools-auth-broken" in got, "tools detects broken auth marker")
+    check("tools-legacy-skills" in got, "tools detects legacy skill")
+    registry = read_json(ROOT / "out" / "operator-intelligence" / "tool-registry.json")
+    duplicate_records = [r for r in registry if r["id"] == "duplicate"]
+    check(all("canonical_id" in r and "source_root" in r and "risk_rank" in r for r in duplicate_records), "tools records carry canonicalization fields")
+    check(any(r["copy_role"].startswith("canonical") for r in duplicate_records), "tools marks canonical duplicate copy")
+    check(any(r["copy_role"] == "custom-copy" for r in duplicate_records), "tools marks noncanonical custom duplicate copy")
+
+    reset()
+    write("claude/skills/one/SKILL.md", "---\nname: one\n---\n")
+    data, _proc = run("tools")
+    check("tools-duplicate-skill-families" not in ids(data), "tools clean fixture avoids duplicate FP")
+    check("tools-auth-broken" not in ids(data), "tools clean fixture avoids auth FP")
+
+
+def test_portfolio_evidence_ai_boundary_agent_cards():
+    reset()
+    write("projects/app/README.md", "# App\n")
+    write("projects/app-copy/README.md", "# App copy\n")
+    write("projects/local-ai-kit/README.md", "# LAIK\nlocal AI runtime\n")
+    write("projects/local-ai-kit/CLAUDE.md", "MCP tools allowed. No eval yet.\n")
+    touch_old("projects/app/evals/backtest-results.md", days=100)
+    write("projects/agents/hermes/README.md", "# Hermes\nMCP tools allowed.\n")
+
+    data, _proc = run("portfolio")
+    check("portfolio-unresolved-canonical-checkout" in ids(data), "portfolio detects unresolved canonical checkout")
+
+    data, _proc = run("evidence")
+    check("evidence-stale-records" in ids(data), "evidence detects stale evidence")
+
+    data, _proc = run("ai-contract")
+    got = ids(data)
+    check("ai-contract-missing-eval" in got, "ai-contract detects missing eval")
+    check("ai-contract-missing-kill-switch" in got, "ai-contract detects missing kill switch")
+    check("ai-contract-low-readiness-score" in got, "ai-contract detects low readiness score")
+    contracts = read_json(ROOT / "out" / "operator-intelligence" / "ai-contracts.json")
+    laik = next(c for c in contracts if c["system"] == "local-ai-kit")
+    check(isinstance(laik["readiness_score"], int), "ai contract emits numeric readiness score")
+    check(laik["readiness_status"] == "not ready", "ai contract marks low fixture not ready")
+
+    data, _proc = run("agent-cards")
+    check("agent-cards-incomplete-readiness" in ids(data), "agent cards detect incomplete readiness")
+    cards = read_json(ROOT / "out" / "operator-intelligence" / "agent-capability-cards.json")
+    check(cards and "readiness_score" in cards[0], "agent cards include readiness score")
+
+    proc = subprocess.run(
+        base_cmd("boundary", ["--check-write", str(ROOT / "projects" / "koho-yehovah" / "file.md")]),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    result = json.loads(proc.stdout)
+    check(result["allowed"] is False, "boundary check-write detects cross-client ambiguity")
+
+    data, _proc = run("boundary")
+    check("boundary-cross-client-ambiguous-project" not in ids(data), "boundary project scan avoids path-only FP")
+
+
+def test_all_smoke_outputs_parse_and_redact():
+    reset()
+    write("claude/hooks/ingest.log", "2026-06-27T10:00:00Z stop: ingest http=400 api_key=abc123\n")
+    write("claude/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
+    write("codex/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
+    write("projects/app/README.md", "# App\n")
+    touch_old("projects/app/.runs/smoke.txt", days=91)
+    data, proc = run("all")
+    check(proc.returncode == 0, "all smoke exits 0")
+    check(data and Path(data["report"]).exists(), "all smoke writes markdown report")
+    check(data and Path(data["html"]).exists(), "all smoke writes html report")
+    check((ROOT / "out" / "operator-intelligence" / "findings.ndjson").exists(), "all writes findings ndjson")
+    check((ROOT / "out" / "operator-intelligence" / "tool-registry.json").exists(), "all writes tool registry")
+    check((ROOT / "out" / "operator-intelligence" / "portfolio-registry.yaml").exists(), "all writes portfolio yaml")
+    check((ROOT / "out" / "operator-intelligence" / "evidence-registry.ndjson").exists(), "all writes evidence ndjson")
+    check((ROOT / "out" / "operator-intelligence" / "improvement-queue.json").exists(), "all writes improvement queue")
+    check((ROOT / "out" / "operator-intelligence" / "compare.json").exists(), "all writes compare json")
+    check(any((ROOT / "out" / "operator-intelligence" / "history").glob("*-findings.ndjson")), "all writes findings history snapshot")
+    check(Path(data["planning_proof"]["markdown"]).exists(), "all writes planning consumption proof")
+    json.loads((ROOT / "out" / "operator-intelligence" / "tool-registry.json").read_text())
+    json.loads((ROOT / "out" / "operator-intelligence" / "improvement-queue.json").read_text())
+    json.loads((ROOT / "out" / "operator-intelligence" / "compare.json").read_text())
+    for line in (ROOT / "out" / "operator-intelligence" / "findings.ndjson").read_text().splitlines():
+        json.loads(line)
+    assert_no_secret_output((ROOT / "out" / "operator-artifacts").read_text() if False else proc.stdout, "all stdout redacts secrets")
+    for file in (ROOT / "out").rglob("*"):
+        if file.is_file() and file.suffix in {".md", ".html", ".json", ".jsonl", ".yaml"}:
+            assert_no_secret_output(file.read_text(errors="ignore"), f"{file.name} redacts secrets")
+
+
+def test_improve_and_compare_control_loop():
+    reset()
+    write("projects/app/README.md", "# App\n")
+    write("claude/sensory-memory/groq-failures.log", "2026-06-27T10:00:00Z model_not_found stale/model\n")
+    data, proc = run("all")
+    check(proc.returncode == 0 and data, "control loop first all exits 0")
+
+    write("claude/hooks/ingest.log", "2026-06-27T10:05:00Z stop: ingest http=500 cwd=/tmp/app session=s4\n")
+    data, proc = run("all")
+    check(proc.returncode == 0 and data, "control loop second all exits 0")
+
+    improve, proc = run("improve")
+    check(proc.returncode == 0, "improve exits 0")
+    records = improve.get("records", [])
+    check(records and records[0]["score"] >= records[-1]["score"], "improve returns ranked queue")
+    check(any("artifact-ingest" in r["id"] or "provider-model-drift" in r["id"] for r in records[:3]), "improve prioritizes radar/provider findings")
+
+    compare, proc = run("compare")
+    check(proc.returncode == 0, "compare exits 0")
+    summary = compare.get("summary", {})
+    check(summary.get("added", 0) + summary.get("worsened", 0) > 0, "compare detects added or worsened findings")
+    check(Path(compare["report"]).exists() and Path(compare["html"]).exists(), "compare writes markdown and html report")
+
+
+def test_daily_work_envelope_and_pathway_cooperation():
+    reset()
+    write("projects/operating-layer/README.md", "# Operating Layer\n")
+    evidence = write("out/operator-artifacts/proof.md", "proof without secrets\n")
+    before_project_files = sorted(p.relative_to(ROOT / "projects") for p in (ROOT / "projects").rglob("*") if p.is_file())
+
+    start, proc = run("work-start", ["--project", str(ROOT / "projects" / "operating-layer"), "--goal", "Fix Codex artifact ingest invalid payloads"])
+    check(proc.returncode == 0, "work-start exits 0")
+    work_id = start.get("work_id")
+    check(work_id and work_id.startswith("W-"), "work-start creates stable work id")
+
+    start2, _proc = run("work-start", ["--project", str(ROOT / "projects" / "operating-layer"), "--goal", "Fix Codex artifact ingest invalid payloads"])
+    check(start2.get("work_id") == work_id, "work-start repeats stable work id")
+    items = (ROOT / "out" / "operator-intelligence" / "work-items.ndjson").read_text().splitlines()
+    check(len(items) == 1, "work-start upserts instead of duplicating work item")
+
+    log1, proc = run("work-log", [
+        "--work-id", work_id,
+        "--pathway", "research",
+        "--kind", "source-matrix",
+        "--gate", "capability-map",
+        "--evidence", str(evidence),
+        "--result", "pass",
+    ])
+    check(proc.returncode == 0 and log1.get("run_id", "").startswith(f"R-{work_id}-research"), "work-log records research run")
+
+    log2, _proc = run("work-log", [
+        "--work-id", work_id,
+        "--pathway", "security",
+        "--kind", "control",
+        "--evidence", str(evidence),
+        "--control-risk", "pii-boundary",
+        "--target-pathways", "release,docs",
+    ])
+    controls = [r for r in log2.get("records", []) if r.get("control_id")]
+    check(controls and controls[0]["control_id"].startswith("C-security-pii-boundary"), "work-log creates pathway control")
+    control_id = controls[0]["control_id"]
+
+    status, _proc = run("work-status", ["--work-id", work_id])
+    summary = status["summary"]
+    check(control_id in [c["control_id"] for c in summary["open_controls"]], "later pathway status sees prior pathway control")
+    check("security" in summary["pathway_coverage"]["seen"], "status reports pathway coverage")
+
+    run("work-log", [
+        "--work-id", work_id,
+        "--pathway", "release",
+        "--kind", "control-resolution",
+        "--evidence", str(evidence),
+        "--control-id", control_id,
+        "--control-status", "resolved",
+        "--result", "pass",
+    ])
+    run("work-log", [
+        "--work-id", work_id,
+        "--pathway", "quality",
+        "--kind", "smoke",
+        "--evidence", str(evidence),
+        "--result", "pass",
+    ])
+
+    close, _proc = run("work-close", ["--work-id", work_id])
+    check(close.get("closed") is True, "work-close closes ready work item")
+    daily, proc = run("work-daily")
+    check(proc.returncode == 0, "work-daily exits 0")
+    check((ROOT / "out" / "operator-intelligence" / "daily-work-dashboard.json").exists(), "work-daily writes dashboard json")
+    check(Path(daily["report"]).exists() and Path(daily["html"]).exists(), "work-daily writes markdown and html")
+
+    after_project_files = sorted(p.relative_to(ROOT / "projects") for p in (ROOT / "projects").rglob("*") if p.is_file())
+    check(after_project_files == before_project_files, "daily work commands do not modify project repo files")
+    for file in (ROOT / "out").rglob("*"):
+        if file.is_file() and file.suffix in {".md", ".html", ".json", ".jsonl", ".yaml", ".ndjson"}:
+            assert_no_secret_output(file.read_text(errors="ignore"), f"{file.name} redacts secrets in daily work outputs")
+
+
+def test_daily_work_stale_measurement_detection():
+    reset()
+    write("projects/operating-layer/README.md", "# Operating Layer\n")
+    start, _proc = run("work-start", ["--project", str(ROOT / "projects" / "operating-layer"), "--goal", "Stale measurement test"])
+    work_id = start["work_id"]
+    stale = {
+        "measurement_id": "M-stale",
+        "run_id": "R-stale",
+        "work_id": work_id,
+        "pathway": "quality",
+        "gate": "smoke",
+        "kind": "test",
+        "result": "pass",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "evidence_id": "E-stale",
+        "evidence_path": str(ROOT / "out" / "old.md"),
+        "stale_after_days": 1,
+    }
+    path = ROOT / "out" / "operator-intelligence" / "pathway-measurements.ndjson"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(stale) + "\n", encoding="utf-8")
+    status, _proc = run("work-status", ["--work-id", work_id])
+    check(status["summary"]["stale_measurements"], "work-status detects stale measurement")
+    check(status["summary"]["closeout_readiness"] == "not_ready", "stale measurement blocks closeout readiness")
+
+
+def test_pathway_next_recommendation_and_cohesion():
+    reset()
+    write("projects/consult-ops/README.md", "# ConsultOps\n")
+    evidence = write("out/operator-artifacts/pn-proof.md", "proof without secrets\n")
+    project_path = str(ROOT / "projects" / "consult-ops")
+    before_project_files = sorted(p.relative_to(ROOT / "projects") for p in (ROOT / "projects").rglob("*") if p.is_file())
+
+    # 1. No tracked work -> foundation-first: research recommended, 11 ranked pathways.
+    rec, proc = run("pathway-next", ["--project", project_path])
+    check(proc.returncode == 0, "pathway-next exits 0")
+    check(rec.get("recommended_pathway") == "research", "untracked project recommends research foundation gate")
+    check(len(rec.get("ranked", [])) == 11, "pathway-next ranks all 11 pathways")
+    check({f["id"] for f in rec.get("findings", [])} == {"pathway-next-recommendation"}, "pathway-next emits recommendation finding")
+    check(Path(rec["report"]).exists() and Path(rec["html"]).exists(), "pathway-next writes markdown and html")
+    check("work-start" in rec.get("next_command", ""), "untracked project proposes work-start to open shared id")
+
+    # Resolve by bare project name against projects-root.
+    by_name, _proc = run("pathway-next", ["--project", "consult-ops"])
+    check(by_name.get("project") == "consult-ops", "pathway-next resolves project by bare name")
+
+    # 1b. Project-local ingestion: a .planning audit finding routes to its pathway.
+    write("projects/consult-ops/.planning/audit.json", json.dumps({
+        "findings": [
+            {"id": "rls-open", "severity": "high", "message": "anon read exposure", "pathway": "security"},
+            {"id": "vague", "severity": "low", "message": "noop"},
+        ]
+    }))
+    # Re-baseline after fixture writes; the tool must not mutate project files from here.
+    before_project_files = sorted(p.relative_to(ROOT / "projects") for p in (ROOT / "projects").rglob("*") if p.is_file())
+    rec_local, _proc = run("pathway-next", ["--project", project_path])
+    check(rec_local.get("signal_sources", {}).get("project_local", 0) >= 2,
+          "pathway-next ingests project-local findings (audit + missing STATE.md)")
+    sec = next((s for s in rec_local["ranked"] if s["pathway"] == "security"), {})
+    check(sec.get("score", 0) >= 8, "explicit-pathway local finding boosts its target pathway")
+    gov = next((s for s in rec_local["ranked"] if s["pathway"] == "govern"), {})
+    check(any("STATE.md" in r for r in gov.get("reasons", [])), "missing STATE.md surfaces as a govern signal")
+
+    # 2. Satisfy foundation gates, then a downstream control re-ranks the target pathway.
+    start, _proc = run("work-start", ["--project", project_path, "--goal", "Prove ConsultOps next-pathway routing"])
+    work_id = start.get("work_id")
+    run("work-log", ["--work-id", work_id, "--pathway", "research", "--kind", "dossier", "--evidence", str(evidence), "--result", "pass"])
+    run("work-log", ["--work-id", work_id, "--pathway", "govern", "--kind", "decision", "--evidence", str(evidence), "--result", "pass"])
+    run("work-log", [
+        "--work-id", work_id, "--pathway", "security", "--kind", "control", "--evidence", str(evidence),
+        "--control-risk", "rls-gap", "--target-pathways", "data",
+    ])
+
+    rec2, _proc = run("pathway-next", ["--project", project_path])
+    check(rec2.get("recommended_pathway") == "data", "open control re-ranks target pathway to the top")
+    top = rec2["ranked"][0]
+    check(any("rls-gap" in r for r in top["reasons"]), "recommendation cites the originating control as evidence")
+    check(rec2.get("work_id") == work_id, "tracked project reuses shared work id")
+    check("work-log" in rec2.get("next_command", "") and work_id in rec2.get("next_command", ""), "next_command logs against shared work id")
+
+    # 3. Central-output-only + secret hygiene.
+    after_project_files = sorted(p.relative_to(ROOT / "projects") for p in (ROOT / "projects").rglob("*") if p.is_file())
+    check(after_project_files == before_project_files, "pathway-next does not modify project repo files")
+    for file in (ROOT / "out").rglob("*"):
+        if file.is_file() and file.suffix in {".md", ".html", ".json", ".ndjson"}:
+            assert_no_secret_output(file.read_text(errors="ignore"), f"{file.name} redacts secrets in pathway-next outputs")
+
+
+def test_ingest_review_closes_loop():
+    reset()
+    write("projects/consult-ops/README.md", "# ConsultOps\n")
+    project_path = str(ROOT / "projects" / "consult-ops")
+    out_file = ROOT / "projects" / "consult-ops" / ".planning" / "review" / "latest-findings.json"
+
+    # Prefix routing: one finding per mapped guard prefix + a non-finding that must be skipped.
+    review_json = {
+        "verdict": "FIX_THEN_SHIP",
+        "findings": [
+            {"id": "sec-rls-disabled", "severity": "high", "title": "anon read exposure"},
+            {"id": "mig-drop-table", "severity": "high", "title": "drop table"},
+            {"id": "gov-no-ledger", "severity": "warn", "title": "no ledger"},
+            {"id": "rel-no-deploy-rails", "severity": "warn", "title": "no rails"},
+            {"id": "impl-no-spec", "severity": "warn", "title": "no spec"},
+            {"id": "q-no-coverage-gate", "severity": "warn", "title": "no gate"},
+            {"id": "obs-no-instrumentation", "severity": "warn", "title": "no otel"},
+            {"id": "td-stale-deps", "severity": "info", "title": "stale"},
+            {"id": "ff-no-lock", "severity": "warn", "title": "no foundation lock"},
+            {"id": "rs-no-dossier", "severity": "warn", "title": "no dossier"},
+            {"not": "a finding"},
+        ],
+    }
+    review_path = write("out/review-input.json", json.dumps(review_json))
+
+    res, proc = run("ingest-review", ["--project", project_path, "--input", str(review_path)])
+    check(proc.returncode == 0, "ingest-review exits 0")
+    check(res.get("finding_count") == 10, "ingest-review writes all findings and skips non-findings")
+    check(out_file.exists(), "ingest-review writes .planning/review/latest-findings.json")
+    written = read_json(out_file)
+    tag = {f["id"]: f["pathway"] for f in written["findings"]}
+    expected = {
+        "sec-rls-disabled": "security", "mig-drop-table": "data", "gov-no-ledger": "govern",
+        "rel-no-deploy-rails": "release", "impl-no-spec": "implementation",
+        "q-no-coverage-gate": "quality", "obs-no-instrumentation": "observability",
+        "td-stale-deps": "techdebt", "ff-no-lock": "research", "rs-no-dossier": "research",
+    }
+    check(all(tag.get(k) == v for k, v in expected.items()), "guard id prefixes route to correct pathways")
+
+    # Overwrite, not append: a second ingest with one finding replaces the file.
+    review2 = write("out/review-input-2.json", json.dumps({"findings": [{"id": "sec-one", "severity": "warn", "title": "x"}]}))
+    res2, _proc = run("ingest-review", ["--project", project_path, "--input", str(review2)])
+    check(res2.get("finding_count") == 1 and len(read_json(out_file)["findings"]) == 1, "second ingest overwrites (no append)")
+
+    # External signal: re-ingest the full set, then pathway-next sees it and security ranks high.
+    run("ingest-review", ["--project", project_path, "--input", str(review_path)])
+    rec, _proc = run("pathway-next", ["--project", project_path])
+    check(rec.get("signal_sources", {}).get("project_local", 0) >= 10, "pathway-next ingests review findings from .planning")
+    sec = next((s for s in rec["ranked"] if s["pathway"] == "security"), {})
+    check(sec.get("score", 0) >= 8, "ingested high-severity security finding raises security in the ranking")
+
+    # Stdin path (review-stack pipes the pool, no --input file).
+    stdin_payload = json.dumps({"findings": [{"id": "sec-stdin", "severity": "warn", "title": "via stdin"}]})
+    proc_stdin = subprocess.run(base_cmd("ingest-review", ["--project", project_path]),
+                                input=stdin_payload, capture_output=True, text=True, timeout=60)
+    stdin_res = json.loads(proc_stdin.stdout or "{}")
+    check(stdin_res.get("finding_count") == 1, "ingest-review reads the finding pool from stdin")
+
+    # Emergency escalation: a cluster of error findings out-ranks the govern foundation gate.
+    write("projects/consult-ops/.planning/review/latest-findings.json", json.dumps({"findings": [
+        {"id": "sec-a", "severity": "high", "title": "p0 one", "pathway": "security"},
+        {"id": "sec-b", "severity": "high", "title": "p0 two", "pathway": "security"},
+        {"id": "sec-c", "severity": "high", "title": "p0 three", "pathway": "security"},
+    ]}))
+    rec_fire, _proc = run("pathway-next", ["--project", project_path])
+    sec_s = next((s["score"] for s in rec_fire["ranked"] if s["pathway"] == "security"), 0)
+    gov_s = next((s["score"] for s in rec_fire["ranked"] if s["pathway"] == "govern"), 0)
+    check(sec_s > gov_s, "3 error findings out-rank the govern foundation gate (no masking of live fires)")
+
+    # Secret hygiene on the written client-repo file.
+    secret_in = write("out/review-secret.json", json.dumps({"findings": [
+        {"id": "sec-leak", "severity": "high", "title": "token sk-proj-abc123def456ghi789jkl012mno in code"}
+    ]}))
+    run("ingest-review", ["--project", project_path, "--input", str(secret_in)])
+    assert_no_secret_output(out_file.read_text(errors="ignore"), "ingest-review redacts secrets in written file")
+
+
+def test_stale_review_gate():
+    reset()
+    write("projects/consult-ops/README.md", "# ConsultOps\n")
+    project_path = str(ROOT / "projects" / "consult-ops")
+    review_dir = "projects/consult-ops/.planning/review/latest-findings.json"
+    sec_finding = {"id": "sec-rls", "severity": "high", "title": "anon read", "pathway": "security"}
+
+    # Stale review (20 days old): findings must NOT be ingested; a stale-review finding appears.
+    old_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 20 * 86400))
+    write(review_dir, json.dumps({"generated_at": old_ts, "source": "review-stack", "findings": [sec_finding]}))
+    rec_stale, _proc = run("pathway-next", ["--project", project_path])
+    sec_stale = next((s["score"] for s in rec_stale["ranked"] if s["pathway"] == "security"), 0)
+    reasons = " ".join(r for s in rec_stale["ranked"] for r in s.get("reasons", []))
+    check(sec_stale < 40, "stale review's security finding is not ingested (no +40)")
+    check("stale-review" in reasons, "stale review surfaces a stale-review finding")
+
+    # Fresh review (now): findings ARE ingested.
+    new_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    write(review_dir, json.dumps({"generated_at": new_ts, "source": "review-stack", "findings": [sec_finding]}))
+    rec_fresh, _proc = run("pathway-next", ["--project", project_path])
+    sec_fresh = next((s["score"] for s in rec_fresh["ranked"] if s["pathway"] == "security"), 0)
+    check(sec_fresh >= 40, "fresh review's security finding is ingested (+40)")
+
+
+def test_pathway_metric():
+    reset()
+    write("projects/consult-ops/README.md", "# ConsultOps\n")
+    evidence = write("out/operator-artifacts/m-proof.md", "proof\n")
+    project_path = str(ROOT / "projects" / "consult-ops")
+
+    # A recommendation with no follow-up -> rate 0, gate fails.
+    run("pathway-next", ["--project", project_path])
+    m0, proc = run("pathway-metric", ["--gate-target", "0.5"])
+    check(proc.returncode == 0, "pathway-metric exits 0")
+    check(m0["metric"]["total_recommendations"] >= 1, "pathway-metric counts recommendations")
+    check(m0["metric"]["acted_on"] == 0 and m0["metric"]["rate"] == 0.0, "no follow-up -> rate 0.0")
+    check(m0["metric"]["gate_pass"] is False, "rate below target fails the gate")
+
+    # Act on it: a matching work-log (same project + pathway) makes it acted-on.
+    pathway = m0["records"][0]["pathway"]
+    start, _proc = run("work-start", ["--project", project_path, "--goal", "act on the recommendation"])
+    work_id = start["work_id"]
+    run("work-log", ["--work-id", work_id, "--pathway", pathway, "--kind", "verify", "--evidence", str(evidence), "--result", "pass"])
+    m1, _proc = run("pathway-metric", ["--gate-target", "0.5"])
+    check(m1["metric"]["acted_on"] >= 1 and m1["metric"]["rate"] > 0, "matching work-log marks the recommendation acted-on")
+    check(pathway in m1["metric"]["by_pathway"], "pathway-metric breaks the rate down by pathway")
+
+
+def test_project_scoping_no_substring_bleed():
+    # Regression for the GLM-caught P0: project 'ops' must not match '/x/consult-ops/y'.
+    reset()
+    write("projects/ops/README.md", "# ops\n")
+    write("projects/consult-ops/README.md", "# consult-ops\n")
+    findings = [
+        {"id": "sec-belongs-to-ops", "workflow": "security", "severity": "error", "message": "m",
+         "evidence": [{"path": str(ROOT / "projects" / "ops" / "x.py")}]},
+        {"id": "sec-belongs-to-consultops", "workflow": "security", "severity": "error", "message": "m",
+         "evidence": [{"path": str(ROOT / "projects" / "consult-ops" / "y.py")}]},
+    ]
+    fpath = ROOT / "out" / "operator-intelligence" / "findings.ndjson"
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    fpath.write_text("\n".join(json.dumps(f) for f in findings) + "\n", encoding="utf-8")
+
+    rec, _proc = run("pathway-next", ["--project", str(ROOT / "projects" / "ops")])
+    check(rec["signal_sources"]["operating_layer"] == 1, "project 'ops' scopes only its own finding, not consult-ops's (no substring bleed)")
+
+
+def _duplicate_module_level_names(source):
+    """Names bound 2+ times at the literal module top level (the SEVERITY_WEIGHT
+    shadowing class GLM caught). Only scans tree.body, so try/except import
+    fallbacks and `if`-guarded re-binds are not flagged."""
+    tree = ast.parse(source)
+    counts = {}
+
+    def bump(name):
+        counts[name] = counts.get(name, 0) + 1
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bump(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    bump(tgt.id)
+                elif isinstance(tgt, (ast.Tuple, ast.List)):
+                    for elt in tgt.elts:
+                        if isinstance(elt, ast.Name):
+                            bump(elt.id)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None and isinstance(node.target, ast.Name):
+            bump(node.target.id)
+    return {name: n for name, n in counts.items() if n > 1}
+
+
+def test_source_integrity_no_duplicate_module_level_names():
+    # The guard must actually work: a planted duplicate is detected, singles are not.
+    planted = _duplicate_module_level_names("A = 1\nB = 2\nA = 3\n")
+    check(planted.get("A") == 2, "duplicate-name guard detects a planted module-level dup")
+    check("B" not in planted, "guard does not false-flag a single assignment")
+    # Legitimate try/except import fallbacks and if-guarded re-binds must NOT be flagged.
+    benign = (
+        "try:\n    import foo as bar\nexcept ImportError:\n    bar = None\n"
+        "X = 1\nif True:\n    X = 2\n"
+    )
+    check(_duplicate_module_level_names(benign) == {}, "guard ignores try/except + conditional re-binding")
+    # Regression: operating-layer.py must have no shadowed module-level constants/defs.
+    real_dups = _duplicate_module_level_names(CLI.read_text(encoding="utf-8"))
+    check(real_dups == {}, f"operating-layer.py has no duplicate module-level names (found: {real_dups})")
+
+
+def main():
+    tests = [
+        test_source_integrity_no_duplicate_module_level_names,
+        test_intel_detection_and_clean,
+        test_tools_detection_and_clean,
+        test_portfolio_evidence_ai_boundary_agent_cards,
+        test_all_smoke_outputs_parse_and_redact,
+        test_improve_and_compare_control_loop,
+        test_daily_work_envelope_and_pathway_cooperation,
+        test_daily_work_stale_measurement_detection,
+        test_pathway_next_recommendation_and_cohesion,
+        test_ingest_review_closes_loop,
+        test_stale_review_gate,
+        test_pathway_metric,
+        test_project_scoping_no_substring_bleed,
+    ]
+    for test in tests:
+        test()
+    if _failures:
+        sys.stderr.write(f"\n{len(_failures)} failure(s), {_passes} pass(es)\n")
+        return 1
+    print(f"{_passes}/{_passes} checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

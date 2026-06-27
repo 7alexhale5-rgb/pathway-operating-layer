@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test scratch (the suite writes under /private/tmp, but guard anyway)
+/private/tmp/operating-layer-test/
+
+# Editor / OS
+.DS_Store
+*.swp
