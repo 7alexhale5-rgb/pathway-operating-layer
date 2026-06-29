@@ -25,7 +25,12 @@ external surface, no deploy.
 
 - **Gap B — evidence-grounded recommender:** confidence rises from `low` when a repo carries live
   signals (seed a project with an open finding → `pathway-next` confidence ≠ `low`). Falsifiable.
-- **Gap C — autonomy unlock:** follows B (no separate metric — it is gated on B's confidence).
+- **Gap C — autonomy unlock — SHIPPED:** `pathway-next` now computes `suggested_autonomy_tier`
+  (`recommend` | `execute-safe`) from the proof track record + trust + the pick's confidence, fresh
+  each determine turn; the `/pathway` loop reads the field instead of re-deriving the Tier-2 rule.
+  Falsifiable gate (green): a project with `proved_rate ≥ 0.5` AND trust = `pass` AND a high-confidence
+  pick returns `execute-safe`; any signal short of the bar fails closed to `recommend`. Regression test
+  `test_suggested_autonomy_tier_gates_on_proof_trust_confidence` (unit truth-table + end-to-end wiring).
 - **Gap D — learning loop:** closed outcomes reweight rankings; measurable as ranking shift after N closes.
 - **Gap E — tier calibration:** replace the heuristic tier→pathway map with measured defaults.
 

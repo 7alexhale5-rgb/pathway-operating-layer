@@ -161,16 +161,21 @@ On EXECUTE the loop runs the **culmination of the stack** for the chosen pathway
 `execution_stack` + `execution_tools` profile (all 11 pathways carry one, baked into the engine),
 Karpathy-wrapped — not a single command.
 
-**Autonomy is earned by the proof metric — never assumed.** Before each *execute*, read the
-project's proof rate (`pathway-metric` → `proved_rate`) and trust status (`pathway-trust`):
+**Autonomy is earned by the proof metric — never assumed.** The engine computes the ceiling for
+you: `pathway-next` returns `suggested_autonomy_tier` (`recommend` | `execute-safe`), derived fresh
+each determine turn from the proof track record (`proved_rate`), trust, and the recommended pick's
+`confidence` — with `autonomy_rationale` exposing the three inputs and the reason. **Read that field;
+never re-derive the rule.** Staleness fail-closes to Tier 1 in code (the metric is recomputed this
+turn), so the field is always current. The tiers it picks between:
 
-- **Tier 1 · Recommend** — the default, and the **only** tier when `proved_rate < 0.50` OR trust ≠ `pass`.
+- **Tier 1 · Recommend** — the default, and what the engine returns (`suggested_autonomy_tier ==
+  "recommend"`) whenever `proved_rate < 0.50` OR trust ≠ `pass` OR the pick isn't `high`-confidence.
   Determine the next pathway, explain it in plain English, stage the exact `card.skill` command —
   then STOP and let the user press go. Log proof only after they confirm it's done with a real artifact.
-- **Tier 2 · Execute-safe** — unlocks only when `proved_rate ≥ 0.50` (sustained **and fresh** —
-  recompute `pathway-metric` this turn; a metric older than the current run is treated as Tier 1,
-  fail-closed) AND trust = `pass` AND recommendation `confidence` = `high`. The loop may auto-run only
-  the **local, reversible portion** of the plan/analyze pathways — `research, govern, data, security,
+- **Tier 2 · Execute-safe** — the engine returns `suggested_autonomy_tier == "execute-safe"` only when
+  `proved_rate ≥ 0.50` AND trust = `pass` AND recommendation `confidence` = `high` (all computed fresh
+  this turn). The loop may then auto-run only the **local, reversible portion** of the plan/analyze
+  pathways — `research, govern, data, security,
   quality, observability, docs` — i.e. steps that only write plans / dossiers / docs to the working
   tree. **It pauses mid-pathway, even inside a "safe" pathway, the instant a step would:** touch a real
   database or prod surface (data's "verify a real row", security's "prove closed in prod"), send our
@@ -187,8 +192,9 @@ to `doc-coauthoring`, which authors a doc without committing or shipping.)
 
 1. **Determine** — `pathway-next --project <project> --json`. Read `recommended_pathway`, the
    `karpathy_card` (decision / verifier_good / real_artifact / skill + `execution_stack` +
-   `execution_tools` — the full best-execution profile), `confidence`, and `work_id`.
-   If `work_id` is null, run START first (ask for the goal if none was given).
+   `execution_tools` — the full best-execution profile), `confidence`, `suggested_autonomy_tier`
+   (+ `autonomy_rationale`), and `work_id`. The engine already gated the tier — apply it, don't
+   recompute. If `work_id` is null, run START first (ask for the goal if none was given).
 2. **Trust gate** — read the trust status in the JSON. If `fail`, the move becomes "fix trust,"
    not the recommended pathway — surface that and stop.
 3. **Execute** — run the pathway's **best-execution profile**, not just one skill: walk the card's
@@ -220,7 +226,8 @@ turn-by-turn with the user. Always name the current tier in the first line of ea
 - Never modify the target project's repo files; this tool only writes to the central operator-intelligence store.
 - Plain English in chat; the CLI mechanics stay under the hood.
 - The router is read-only advice. START / LOG / CLOSE are the only state changes, and only on explicit intent.
-- LOOP autonomy is earned by the proof metric: default to Tier 1 (recommend) and stay there whenever
-  `proved_rate < 0.50` or trust ≠ `pass`. Higher tiers unlock only on the named conditions.
+- LOOP autonomy is earned by the proof metric: default to Tier 1 (recommend) and stay there unless
+  `pathway-next` returns `suggested_autonomy_tier == "execute-safe"`. The engine computes that field
+  (proof rate ≥ 0.50 + trust pass + high confidence, fresh each turn); never re-derive it by hand.
 - LOOP never auto-runs `/ship`, `work-close`, prod-flag flips, or external sends at any tier — pause and ask.
 - One project per loop, one shared work ID. Recompute `pathway-metric` every turn so it is never stale.
