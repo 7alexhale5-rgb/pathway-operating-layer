@@ -2,7 +2,10 @@
 
 Operator intelligence for engineering pathways. Ranks the next-best pathway for a
 project (foundation-first), tracks the work against one shared ID, and feeds
-review-stack findings back into the recommendation loop.
+review-stack findings back into the recommendation loop. The loop learns: closed
+outcomes reweight future rankings and calibrate the tier→pathway map, recommendation
+confidence is grounded in live evidence, and execution autonomy is earned by a proof
+metric — the engine emits a `suggested_autonomy_tier` rather than assuming it.
 
 The canonical source lives **here**; the files are symlinked into `~/.claude` so
 Claude Code loads the slash command and the script resolves at its expected
@@ -13,7 +16,7 @@ absolute path. This repo exists so the work is version-controlled and `rm`-safe 
 
 | Repo path | Symlinked to | Role |
 | --- | --- | --- |
-| `scripts/operating-layer.py` | `~/.claude/scripts/operating-layer.py` | CLI (7 subcommands) |
+| `scripts/operating-layer.py` | `~/.claude/scripts/operating-layer.py` | CLI (28 subcommands) |
 | `scripts/tests/operating_layer_test.py` | `~/.claude/scripts/tests/...` | Self-test suite (stdlib only) |
 | `commands/pathway.md` | `~/.claude/commands/pathway.md` | `/pathway` front door |
 | `references/pathway-operating-layer.md` | `~/.claude/references/...` | Design reference |
@@ -31,15 +34,20 @@ git clone <remote> ~/Projects/pathway-operating-layer
 python3 ~/Projects/pathway-operating-layer/scripts/tests/operating_layer_test.py
 ```
 
-137/137 checks pass. Includes an AST guard that fails the build on any duplicate
+303/303 checks pass. Includes an AST guard that fails the build on any duplicate
 module-level constant/def name (the shadowing class a second-model review caught
 that unit tests missed).
 
 ## Subcommands
 
-`pathway-next`, `ingest-review`, `pathway-metric`, `work-start`, `work-log`,
-`work-close`, `work-daily`. Prefer the `/pathway` slash command over the raw CLI —
-it drives the work envelope so no flags are memorized.
+28 in total. The pathway loop: `pathway-next` (recommend + `suggested_autonomy_tier`),
+`pathway-trust`, `pathway-metric`, `pathway-run`, and `tier-calibrate` (measured
+tier→pathway defaults from closed-outcome history — advisory, never auto-applied).
+The work envelope: `work-start`, `work-log`, `work-close`, `work-cover`,
+`work-status`, `work-daily`, `proof-add`, `proof-report`. Plus the operating-layer
+scans (`intel`, `tools`, `portfolio`, `boundary`, `ingest-review`, …) and `all`.
+Prefer the `/pathway` slash command over the raw CLI — it drives the work envelope so
+no flags are memorized.
 
 ## Gotcha
 
