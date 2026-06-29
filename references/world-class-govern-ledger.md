@@ -40,7 +40,18 @@ external surface, no deploy.
   attributable (the dampened row carries a "Demonstrated" reason), and it is project-scoped (another
   project's closes don't bleed). Test `test_learning_loop_closed_outcomes_reweight_rankings`; proven
   live (this repo's closes dampened govern/implementation/quality, surfacing `release` as next).
-- **Gap E — tier calibration:** replace the heuristic tier→pathway map with measured defaults.
+- **Gap E — tier calibration — SHIPPED:** the heuristic `PATHWAY_TIERS` map is a guess; closed
+  outcomes are evidence. New `tier-calibrate` command (`compute_tier_calibration`) measures, per tier
+  across ALL closed outcomes, how often each pathway was proved vs marked N/A, and flags where the
+  measured need diverges from the default — `docs` over-included, `security` under-included, etc.
+  **Advisory only:** it never mutates the map (silently dropping a pathway would break the coverage
+  guarantee); a human adopts changes by ADR. A tier under a 2-close floor makes no claim (fail-closed).
+  Falsifiable gate (green): seeded "live" closes where docs is always N/A and security always proved
+  yield docs=drop-candidate + security=add-candidate (measured divergence), while a sub-floor tier
+  yields none. Test `test_tier_calibration_measures_defaults_from_closed_outcomes`. Dual second-model
+  critic (Codex + GLM-5.2) on the diff — both flagged duplicate-counting (fixed: one status per
+  pathway per outcome), plus raw-rate thresholds + deterministic sort. Proven live: demoable (4 closes)
+  measures exactly its default; live (1 close) withholds under the floor.
 
 ## Scope locked for THIS loop
 
