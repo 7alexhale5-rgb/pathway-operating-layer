@@ -3849,13 +3849,22 @@ def run_pathway_next(args, paths):
     ranked = score_pathways(paths, project_path, project_name, scoped_findings, work_summaries)
     recommended = ranked[0]
     # Itinerary override: when the active outcome still owes required pathways, the next
-    # move is the foundation-first OPEN-REQUIRED one — the router walks the committed
-    # itinerary rather than greedily re-picking the global max. This is what guarantees
-    # every necessary pathway is covered and none is silently skipped.
+    # move comes from the committed itinerary (so coverage is never silently skipped) —
+    # but WITHIN that set the order is evidence-driven, not a fixed list. Foundations
+    # (govern/research) stay first while open, because they are prerequisites. Among the
+    # remaining open-required pathways the router follows live EVIDENCE: it picks the
+    # highest-scored one (ranked is score-sorted, with findings/controls already routed to
+    # pathways), so the next move bends toward current risk instead of canonical order.
+    # (Gap B part 2: coverage guarantee + evidence-grounded ordering, together.)
     active_summary = work_summaries[0] if work_summaries else None
     itinerary_open = (active_summary or {}).get("itinerary_coverage", {}).get("open", []) if active_summary else []
     if itinerary_open:
-        first = itinerary_open[0]  # itinerary_coverage() returns these foundation-first
+        FOUNDATIONS = ("govern", "research")
+        open_foundations = [p for p in itinerary_open if p in FOUNDATIONS]
+        if open_foundations:
+            first = open_foundations[0]  # itinerary_open is canonical-ordered: govern before research
+        else:
+            first = next((r["pathway"] for r in ranked if r["pathway"] in itinerary_open), itinerary_open[0])
         recommended = next((r for r in ranked if r["pathway"] == first), recommended)
     card = karpathy_card(recommended["pathway"], project_name, args.goal)
     trust = load_pathway_trust_summary(paths)
