@@ -8,6 +8,7 @@ goal is to make the environment self-aware: logs, tools, projects, evidence,
 AI/agent readiness, and client/workspace boundaries.
 """
 import argparse
+import ast
 import hashlib
 import html
 import json
@@ -111,6 +112,94 @@ PATHWAY_ORDER = [
     "design",
     "docs",
 ]
+
+# === Itinerary: coverage by construction =====================================
+# A "done" tier sizes the set of engineering pathways an outcome MUST cover before
+# it can close. Tiers are cumulative supersets (live ⊃ demoable, production-secure ⊃
+# live). The router seeds this onto the work item at START; work-close is hard-refused
+# until every entry is `proved` (real artifact) or `na` (explicit reason). This is what
+# turns "use every necessary pathway" from a hope into an enforced guarantee.
+PATHWAY_TIERS = {
+    "demoable": ["govern", "implementation", "quality"],
+    "live": ["govern", "data", "implementation", "quality", "observability", "release", "docs"],
+    "production-secure": [
+        "research", "govern", "data", "security", "implementation",
+        "quality", "observability", "techdebt", "release", "docs",
+    ],
+}
+
+# Conditional pathways pulled into ANY tier when the goal's own words demand them
+# (same keyword-gating idea the planning specialist-lenses use).
+PATHWAY_KEYWORD_GATES = {
+    "design": r"\b(ui|ux|screen|component|page|frontend|front-end|layout|form|dashboard|design|css|tailwind|figma)\b",
+    "research": r"\b(new|evaluate|spike|investigate|unknown|unfamiliar|should we|which|compare|explore)\b",
+    "data": r"\b(schema|migration|migrate|db|database|table|supabase|postgres|sql|index|column|boundary|tenant)\b",
+}
+
+# Canonical execution order: foundation-first, dependencies before dependents. The
+# router walks the itinerary in this order so govern precedes the slice, research/data
+# precede what builds on them — no skipped foundations.
+PATHWAY_CANON_ORDER = [
+    "govern", "research", "data", "security", "design", "implementation",
+    "quality", "observability", "techdebt", "release", "docs",
+]
+
+DEFAULT_ITINERARY_TIER = "live"
+
+
+def compute_itinerary(tier, goal):
+    """Return the ordered required-pathway itinerary for an outcome.
+
+    `tier` sizes the cumulative base set; keyword gates pull in design/research/data
+    when the goal's own words demand them. Order is canonical (foundation-first). Every
+    entry starts `required`; it becomes `proved` on a real-artifact work-log or `na`
+    via work-cover, and the outcome cannot close while any entry is still `required`.
+    """
+    base = set(PATHWAY_TIERS.get((tier or DEFAULT_ITINERARY_TIER).lower(), PATHWAY_TIERS[DEFAULT_ITINERARY_TIER]))
+    text = (goal or "").lower()
+    for pathway, pattern in PATHWAY_KEYWORD_GATES.items():
+        if re.search(pattern, text):
+            base.add(pathway)
+    ordered = [p for p in PATHWAY_CANON_ORDER if p in base]
+    return [{"pathway": p, "status": "required", "reason": "", "proved_by_run": ""} for p in ordered]
+
+
+def merge_itinerary(old, new):
+    """Resize an itinerary to a new required set while preserving proof already earned.
+
+    On a tier change, pathways that were already `proved`/`na` keep that status; pathways
+    new to the tier come in `required`; pathways dropped by the tier fall off. A re-START
+    must never silently discard coverage that was already paid for.
+    """
+    prior = {e.get("pathway"): e for e in (old or [])}
+    new_pathways = {e["pathway"] for e in new}
+    merged = []
+    for entry in new:
+        prev = prior.get(entry["pathway"])
+        merged.append(prev if prev and prev.get("status") in ("proved", "na") else entry)
+    # Never discard earned proof: a tier downgrade keeps proved/na pathways the new tier
+    # dropped, as retained coverage (both critics flagged this). They no longer block
+    # (proved/na), but the record of work done is preserved.
+    for pathway, prev in prior.items():
+        if pathway not in new_pathways and prev.get("status") in ("proved", "na"):
+            merged.append(prev)
+    merged.sort(key=lambda e: PATHWAY_CANON_ORDER.index(e["pathway"]) if e.get("pathway") in PATHWAY_CANON_ORDER else 99)
+    return merged
+
+
+def itinerary_coverage(item):
+    """Return (covered_count, total, [open_required_pathways]) for a work item.
+
+    Covered = proved or na. Open required = still owed proof. The list is foundation-
+    first so the router's next pick walks dependencies in order.
+    """
+    itin = (item or {}).get("itinerary") or []
+    covered = [e for e in itin if e.get("status") in ("proved", "na")]
+    open_required = [e.get("pathway") for e in itin if e.get("status", "required") == "required"]
+    open_required.sort(key=lambda p: PATHWAY_CANON_ORDER.index(p) if p in PATHWAY_CANON_ORDER else 99)
+    return len(covered), len(itin), open_required
+
+
 WORK_STALE_DAYS = 14
 REVIEW_STALE_DAYS = 14  # a .planning/review/latest-findings.json older than this is not trusted as current
 
@@ -215,7 +304,58 @@ PATHWAY_DOCTRINE = {
         "good": "Onboarding gap closed; key decision captured as an ADR/runbook.",
         "artifact": "updated README/runbook/ADR matching reality",
         "move": "Write the one doc/ADR that removes a recurring question.",
-        "skill": "/closeout-stack",
+        "skill": "doc-coauthoring",
+    },
+}
+
+# Per-pathway BEST-EXECUTION profile: the culmination of Alex's actual skills + env +
+# plugins + MCP + subagents the loop should orchestrate on EXECUTE — not just the single
+# card skill. Karpathy-wrapped: primary build action -> second-model critic -> real-artifact
+# proof. Keyed to PATHWAY_DOCTRINE; surfaced through karpathy_card() so /pathway loop reads it.
+PATHWAY_EXECUTION = {
+    "research": {
+        "stack": ["/research-stack --deep (primary)", "deep-research for adversarial fact-check", "/devilsadvocate to triage claims", "live-citation validation"],
+        "tools": ["firecrawl MCP", "perplexity MCP", "web-search-prime + web-reader", "get-code-context-exa", "zread repo Q&A", "agent-reach", "research agent"],
+    },
+    "govern": {
+        "stack": ["/planning-stack --deep (primary)", "/brainstorm-stack to pin the decision", "/premortem to stress it", "second-model critic on the metric"],
+        "tools": ["govern.py ledger", "stakeholder-reviewer agent", "memory-vault decisions/"],
+    },
+    "data": {
+        "stack": ["/planning-stack --tech (primary)", "supabase-patterns recipes", "verify on a real DB row"],
+        "tools": ["supabase MCP", "supabase-ssh docs", "context7 schema-typed", "database-reviewer agent", "migration-guard"],
+    },
+    "security": {
+        "stack": ["/review-stack --audit (primary)", "security-review skill", "/codex:adversarial-review (second model)", "prove the hole closed on the live surface"],
+        "tools": ["security-reviewer agent", "sec- guards", "koho-guardrail + secret guards", "Vercel runtime logs"],
+    },
+    "release": {
+        "stack": ["/ship (primary)", "/commit first", "deploy-verify on the deployed asset", "rollback rehearsal before flip"],
+        "tools": ["Vercel MCP (deploy / build-logs / runtime-errors)", "feature-flag or canary", "betterstack uptime"],
+    },
+    "implementation": {
+        "stack": ["/build-stack (primary)", "test-driven-development first", "subagent-driven-development for large slices", "/review-stack + /codex:review", "prove on served/deployed artifact"],
+        "tools": ["context7 library docs", "implementer + quickfix agents", "build-error-resolver agent"],
+    },
+    "quality": {
+        "stack": ["/review-stack (primary)", "/regression-test golden set", "eval-harness for LLM paths", "second-model critic before merge"],
+        "tools": ["tester agent", "coverage gate (quality-guard)", "Langfuse / Promptfoo evals"],
+    },
+    "observability": {
+        "stack": ["/planning-stack --tech (primary)", "wire the one signal that exposes the top failure", "alert on the failure mode", "runbook delta"],
+        "tools": ["betterstack MCP", "sentry MCP + sentry-cli + seer", "Langfuse LLM traces"],
+    },
+    "techdebt": {
+        "stack": ["/build-stack (primary)", "/simplify", "deletion before abstraction", "/review-stack to verify"],
+        "tools": ["refactor-cleaner agent", "knip / depcheck / ts-prune", "tool-registry canonical-role map"],
+    },
+    "design": {
+        "stack": ["/design-stack --refactor (primary)", "ua-ux for build", "ua-ux-critique before ship", "token-conformance + a11y gate"],
+        "tools": ["Figma MCP", "pencil MCP", "design-library.json + design-vault", "brand-system-extractor agent", "DESIGN.md lint"],
+    },
+    "docs": {
+        "stack": ["doc-coauthoring (primary, authors in place, no commit)", "ADR / runbook convention", "verify the doc matches reality"],
+        "tools": ["docs/adr + docs/runbooks templates", "memory-vault handoffs (source, not substitute)"],
     },
 }
 
@@ -519,6 +659,15 @@ class Paths:
         self.controls_path = self.operator_intel / "controls.ndjson"
         self.daily_dashboard_path = self.operator_intel / "daily-work-dashboard.json"
         self.recommendations_path = self.operator_intel / "pathway-recommendations.ndjson"
+        self.pathway_trust_path = self.operator_intel / "pathway-trust.json"
+        self.proofs_path = self.operator_intel / "proofs.ndjson"
+        self.pathway_run_plans_path = self.operator_intel / "pathway-run-plans.ndjson"
+        self.pathway_decisions_path = self.operator_intel / "pathway-decisions.ndjson"
+        self.learning_candidates_path = self.operator_intel / "learning-candidates.ndjson"
+        self.portfolio_next_path = self.operator_intel / "portfolio-next.json"
+        self.rule_map_path = self.operator_intel / "rule-map.json"
+        self.cockpit_path = self.operator_intel / "cockpit.json"
+        self.pfos_cockpit_path = self.operator_intel / "pfos-cockpit.json"
 
 
 def cutoff_from_args(args):
@@ -586,6 +735,59 @@ def next_run_id(paths, work_id, pathway):
 
 def measurement_id(run_id, gate):
     return f"M-{run_id}-{safe_slug(gate)[:40]}"
+
+
+def proof_id_for(evidence_path, work_id="", pathway="", proof_type="", recommendation_id=""):
+    basis = "|".join(str(p) for p in (evidence_id_for_path(evidence_path), work_id, pathway, proof_type, recommendation_id))
+    return f"P-{sha_text(basis, 12)}"
+
+
+def upsert_proof(paths, proof):
+    proofs = [p for p in read_ndjson(paths.proofs_path) if p.get("proof_id") != proof.get("proof_id")]
+    proofs.append(proof)
+    write_ndjson(paths.proofs_path, proofs)
+    return proofs
+
+
+def build_proof_record(args, work_item=None, run_id="", measurement_id_value=""):
+    evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
+    if not evidence_path or not Path(evidence_path).exists():
+        return None, finding(
+            "proof-add-missing-evidence",
+            "proof-registry",
+            "warn",
+            "Proof registry requires --evidence pointing at an existing local artifact.",
+            [line_evidence(evidence_path or "<missing>")],
+            "Pass a real Markdown, JSON, screenshot, report, test output, or other verification artifact.",
+            "static",
+            "high",
+        )
+    proof_type = args.proof_type or "artifact"
+    project_path = str(Path(args.project).expanduser()) if getattr(args, "project", None) else ""
+    project_name = Path(project_path).name if project_path else ""
+    if work_item:
+        project_path = work_item.get("project", project_path)
+        project_name = work_item.get("project_name", project_name)
+    proof = {
+        "proof_id": proof_id_for(evidence_path, args.work_id or "", args.pathway or "", proof_type, args.recommendation_id or ""),
+        "timestamp": iso_now(),
+        "proof_type": proof_type,
+        "evidence_id": evidence_id_for_path(evidence_path),
+        "evidence_path": evidence_path,
+        "work_id": args.work_id or "",
+        "pathway": args.pathway or "",
+        "gate": args.gate or args.kind or "",
+        "result": args.result or "present",
+        "stale_after_days": args.stale_after_days,
+        "verified_by": args.verified_by or "",
+        "recommendation_id": args.recommendation_id or "",
+        "run_id": run_id,
+        "measurement_id": measurement_id_value,
+        "project": project_name,
+        "project_path": project_path,
+        "source": "operating-layer proof registry",
+    }
+    return proof, None
 
 
 def control_id(source_pathway, risk, work_id):
@@ -2090,12 +2292,18 @@ def work_status_summary(paths, work_id):
     stale = stale_measurements(measurements)
     pathways_seen = sorted(set(r.get("pathway") for r in runs if r.get("pathway")))
     missing_core_pathways = [p for p in PATHWAY_ORDER if p not in pathways_seen]
-    ready = bool(item and runs and not open_controls and not missing_evidence and not stale)
+    covered, total, itinerary_open = itinerary_coverage(item)
+    # The coverage gate: an outcome is NOT ready while any itinerary pathway is still
+    # owed proof. work-close reads this readiness, so it inherits the refusal for free.
+    ready = bool(item and runs and not open_controls and not missing_evidence and not stale and not itinerary_open)
     return {
         "work_item": item,
         "runs": runs,
         "measurements": measurements,
         "controls": controls,
+        "tier": (item or {}).get("tier", ""),
+        "itinerary": (item or {}).get("itinerary", []),
+        "itinerary_coverage": {"covered": covered, "total": total, "open": itinerary_open},
         "pathway_coverage": {
             "seen": pathways_seen,
             "missing_core": missing_core_pathways,
@@ -2105,11 +2313,11 @@ def work_status_summary(paths, work_id):
         "stale_measurements": stale,
         "open_controls": open_controls,
         "closeout_readiness": "ready" if ready else "not_ready",
-        "warnings": work_warnings(item, runs, measurements, open_controls, stale),
+        "warnings": work_warnings(item, runs, measurements, open_controls, stale, itinerary_open),
     }
 
 
-def work_warnings(item, runs, measurements, open_controls, stale):
+def work_warnings(item, runs, measurements, open_controls, stale, itinerary_open=None):
     warnings = []
     if not item:
         warnings.append("No linked work item exists for this work_id.")
@@ -2121,6 +2329,11 @@ def work_warnings(item, runs, measurements, open_controls, stale):
         warnings.append(f"{len(stale)} measurements are stale.")
     if open_controls:
         warnings.append(f"{len(open_controls)} controls remain open.")
+    if itinerary_open:
+        warnings.append(
+            f"{len(itinerary_open)} required pathways still need proof or an explicit N/A: "
+            + ", ".join(itinerary_open) + "."
+        )
     return warnings
 
 
@@ -2343,6 +2556,137 @@ def render_html(md_path, html_path):
     write_text(html_path, fallback_html(md, Path(md_path).stem))
 
 
+def explicit_runner_integrity(test_path):
+    """Static check: every module-level test_* function is present in main()'s tests list."""
+    try:
+        source = safe_read_text(test_path, max_bytes=2_000_000)
+        tree = ast.parse(source)
+    except Exception as exc:
+        return {"name": "operating_layer_test runner integrity", "status": "fail", "summary": str(exc)}
+
+    discovered = {
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    }
+    registered = set()
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name != "main":
+            continue
+        for stmt in ast.walk(node):
+            if isinstance(stmt, ast.Assign):
+                if not any(isinstance(t, ast.Name) and t.id == "tests" for t in stmt.targets):
+                    continue
+                if isinstance(stmt.value, ast.List):
+                    for elt in stmt.value.elts:
+                        if isinstance(elt, ast.Name):
+                            registered.add(elt.id)
+    missing = sorted(discovered - registered)
+    status = "fail" if missing else "pass"
+    return {
+        "name": "operating_layer_test runner integrity",
+        "status": status,
+        "summary": "all test_* callables registered" if not missing else f"missing: {', '.join(missing)}",
+        "missing": missing,
+        "discovered": len(discovered),
+        "registered": len(registered),
+    }
+
+
+def run_trust_command(name, cmd, budget_sec):
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(20, int(budget_sec * 4)))
+        elapsed = time.time() - t0
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "name": name,
+            "status": "fail",
+            "elapsed_sec": round(time.time() - t0, 2),
+            "budget_sec": budget_sec,
+            "summary": f"timed out: {exc}",
+        }
+    status = "pass"
+    if proc.returncode != 0:
+        status = "fail"
+    elif elapsed > budget_sec:
+        status = "warn"
+    return {
+        "name": name,
+        "status": status,
+        "elapsed_sec": round(elapsed, 2),
+        "budget_sec": budget_sec,
+        "returncode": proc.returncode,
+        "summary": (
+            "ok" if status == "pass"
+            else f"elapsed {elapsed:.2f}s exceeds budget {budget_sec:.2f}s" if status == "warn"
+            else (proc.stderr or proc.stdout or "command failed")[:500]
+        ),
+    }
+
+
+def aggregate_trust_status(checks):
+    statuses = {c.get("status") for c in checks}
+    if "fail" in statuses:
+        return "fail"
+    if "warn" in statuses:
+        return "warn"
+    return "pass"
+
+
+def render_pathway_trust_report(result):
+    lines = [
+        "# Pathway Trust Report",
+        "",
+        f"Generated: {result['generated_at']}",
+        "",
+        f"**Status:** `{result['status']}`",
+        "",
+        "| Check | Status | Time | Summary |",
+        "|---|---:|---:|---|",
+    ]
+    for check in result["checks"]:
+        elapsed = check.get("elapsed_sec")
+        elapsed_txt = f"{elapsed:.2f}s" if isinstance(elapsed, (int, float)) else "-"
+        lines.append(f"| {check['name']} | `{check['status']}` | {elapsed_txt} | {check.get('summary', '')} |")
+    lines += [
+        "",
+        "## Plain-English Summary",
+        "",
+        "Pathway trust checks whether the operating layer can trust its own recommendation inputs: "
+        "test registration, guard trust smokes, shared scanner contract, and optional project guard timings.",
+        "",
+        "A `pass` means the harness found no missing tests, the guard trust suites passed, and any project timing probes stayed inside budget.",
+        "A `warn` means the command worked but a timing budget needs attention. A `fail` means `/pathway` input trust is compromised.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def load_pathway_trust_summary(paths):
+    data = read_json_file(paths.pathway_trust_path, {})
+    if not isinstance(data, dict) or not data:
+        return {"status": "unknown", "generated_at": "", "summary": "pathway-trust has not run yet"}
+    return {
+        "status": data.get("status", "unknown"),
+        "generated_at": data.get("generated_at", ""),
+        "summary": data.get("summary", ""),
+        "json": str(paths.pathway_trust_path),
+        "report": data.get("report", ""),
+        "html": data.get("html", ""),
+    }
+
+
+def pathway_scripts_dir(paths):
+    candidates = [
+        paths.claude_home / "scripts",
+        DEFAULT_CLAUDE_HOME / "scripts",
+        Path(__file__).resolve().parent,
+    ]
+    for candidate in candidates:
+        if (candidate / "techdebt-guard.py").exists() and (candidate / "tests").exists():
+            return candidate
+    return candidates[-1]
+
+
 def write_improvement_artifacts(paths, findings):
     items = build_improvement_queue(findings)
     write_json(paths.improvement_queue_path, {"generated_at": iso_now(), "items": items})
@@ -2380,6 +2724,26 @@ def run_work_start(args, paths):
     project_path = str(Path(args.project).expanduser())
     work_id = stable_work_id(project_path, args.goal)
     context = current_work_context(paths, project_path)
+    existing = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == work_id), None)
+    explicit_tier = getattr(args, "tier", None)
+    existing_itin = (existing or {}).get("itinerary")
+    if explicit_tier:
+        # A tier was chosen → seed (or resize) the coverage itinerary. The /pathway skill
+        # always passes a tier, so the coverage guarantee holds for every tracked outcome.
+        tier = explicit_tier.lower()
+        if tier not in PATHWAY_TIERS:
+            tier = DEFAULT_ITINERARY_TIER
+        itinerary = (merge_itinerary(existing_itin, compute_itinerary(tier, args.goal))
+                     if existing_itin else compute_itinerary(tier, args.goal))
+    elif existing_itin:
+        # Re-START without a tier: preserve the in-progress itinerary and its earned proof.
+        tier = (existing or {}).get("tier", DEFAULT_ITINERARY_TIER)
+        itinerary = existing_itin
+    else:
+        # No tier chosen and no prior itinerary → loose tracking, no coverage gate
+        # (backward-compatible: bare `work-start` behaves as it did before the feature).
+        tier = (existing or {}).get("tier", "")
+        itinerary = []
     item = update_work_item(
         paths,
         work_id,
@@ -2389,10 +2753,126 @@ def run_work_start(args, paths):
         project_name=Path(project_path).name,
         goal=args.goal,
         context=context,
+        tier=tier,
+        itinerary=itinerary,
         closeout_readiness="not_ready",
     )
     dashboard = build_daily_dashboard(paths)
     return {"records": [item], "findings": [], "work_id": work_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
+
+
+def run_work_cover(args, paths):
+    """Edit an outcome's itinerary: mark a pathway not-applicable (--na, with --reason)
+    or append a newly-revealed required pathway (--add). Every drop is an explicit
+    recorded reason and every addition is deliberate — that is the coverage guarantee."""
+    if not args.work_id or not args.pathway:
+        return {
+            "findings": [finding(
+                "work-cover-missing-input",
+                "daily-work",
+                "warn",
+                "work-cover requires --work-id and --pathway (plus --na --reason, or --add).",
+                [line_evidence(paths.work_items_path)],
+                "Run `work-cover --work-id ID --pathway NAME --na --reason TEXT` or `--add`.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+    records = load_work_records(paths)
+    item = next((w for w in records["items"] if w.get("work_id") == args.work_id), None)
+    if not item:
+        return {
+            "findings": [finding(
+                "work-cover-unknown-work-id",
+                "daily-work",
+                "warn",
+                f"No work item found for work_id {args.work_id}.",
+                [line_evidence(paths.work_items_path, source=args.work_id)],
+                "Run work-start first, or correct the work_id.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+    # Validate inputs (Codex P2): a non-canonical pathway would be unrecommendable and
+    # could leave the outcome unclosable; and exactly one action must be chosen.
+    if args.pathway not in PATHWAY_CANON_ORDER:
+        return {
+            "findings": [finding(
+                "work-cover-unknown-pathway",
+                "daily-work",
+                "warn",
+                f"'{args.pathway}' is not a known pathway. Choose one of: {', '.join(PATHWAY_CANON_ORDER)}.",
+                [line_evidence(paths.work_items_path, source=args.work_id)],
+                "Re-run with a canonical pathway name.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+    if bool(args.add) == bool(args.na):
+        return {
+            "findings": [finding(
+                "work-cover-needs-one-action",
+                "daily-work",
+                "warn",
+                "work-cover needs exactly one of --na (mark not-applicable) or --add (append as required).",
+                [line_evidence(paths.work_items_path, source=args.work_id)],
+                "Re-run with exactly one of `--na --reason TEXT` or `--add`.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+    itinerary = list(item.get("itinerary") or [])
+    entry = next((e for e in itinerary if e.get("pathway") == args.pathway), None)
+    if args.add:
+        if entry:
+            # Never downgrade earned proof on --add (GLM P1 + reproduced): only an absent
+            # or already-required entry stays required; proved/na is preserved as-is.
+            if entry.get("status") not in ("proved", "na"):
+                entry["status"] = "required"
+            if args.reason:
+                entry["reason"] = args.reason
+        else:
+            itinerary.append({
+                "pathway": args.pathway,
+                "status": "required",
+                "reason": args.reason or "revealed during execution",
+                "proved_by_run": "",
+            })
+        itinerary.sort(key=lambda e: PATHWAY_CANON_ORDER.index(e["pathway"]) if e.get("pathway") in PATHWAY_CANON_ORDER else 99)
+    else:
+        # Default action marks not-applicable, and it REQUIRES a reason — nothing is
+        # ever dropped silently. That refusal is the point of the whole mechanism.
+        if not args.reason:
+            return {
+                "findings": [finding(
+                    "work-cover-na-needs-reason",
+                    "daily-work",
+                    "warn",
+                    "Marking a pathway not-applicable requires --reason (why it does not apply).",
+                    [line_evidence(paths.work_items_path, source=args.work_id)],
+                    "Re-run with `--na --reason \"<why this pathway does not apply>\"`.",
+                    "static",
+                    "high",
+                )],
+                "records": [],
+            }
+        if entry:
+            entry["status"] = "na"
+            entry["reason"] = args.reason
+        else:
+            itinerary.append({"pathway": args.pathway, "status": "na", "reason": args.reason, "proved_by_run": ""})
+    item = update_work_item(paths, args.work_id, itinerary=itinerary)
+    covered, total, open_required = itinerary_coverage(item)
+    return {
+        "records": [item],
+        "findings": [],
+        "work_id": args.work_id,
+        "itinerary_coverage": {"covered": covered, "total": total, "open": open_required},
+    }
 
 
 def run_work_status(args, paths):
@@ -2412,6 +2892,81 @@ def run_work_status(args, paths):
         }
     summary = work_status_summary(paths, args.work_id)
     return {"records": [summary], "findings": [], "summary": summary}
+
+
+def render_learning_report(candidates):
+    lines = [
+        "# Pathway Learning Candidates",
+        "",
+        f"Generated: {iso_now()}",
+        "",
+        "| Learning | Project | Work | Changed thing | Proof | Global rule candidate |",
+        "|---|---|---|---|---|---|",
+    ]
+    for item in sorted(candidates, key=lambda x: x.get("timestamp", ""), reverse=True)[:50]:
+        lines.append(
+            "| "
+            + " | ".join([
+                table_cell(item.get("learning_id")),
+                table_cell(item.get("project")),
+                table_cell(item.get("work_id")),
+                table_cell(item.get("changed_thing")),
+                table_cell(item.get("proof_that_mattered")),
+                table_cell(item.get("possible_global_rule")),
+            ])
+            + " |"
+        )
+    if not candidates:
+        lines += ["", "No learning candidates have been extracted yet."]
+    return "\n".join(lines) + "\n"
+
+
+def write_learning_report(paths, candidates):
+    md_path = dated_artifact_path(paths, "learning-candidates")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_learning_report(candidates))
+    render_html(md_path, html_path)
+    return md_path, html_path
+
+
+def extract_learning_candidate(paths, summary, closed_item):
+    item = closed_item or summary.get("work_item") or {}
+    work_id = item.get("work_id", "")
+    proofs = [p for p in read_ndjson(paths.proofs_path) if p.get("work_id") == work_id]
+    latest_proof = sorted(proofs, key=lambda p: p.get("timestamp", ""), reverse=True)[0] if proofs else {}
+    measurements = summary.get("measurements", [])
+    latest_measurement = sorted(measurements, key=lambda m: m.get("timestamp", ""), reverse=True)[0] if measurements else {}
+    pathways = summary.get("pathway_coverage", {}).get("seen", [])
+    proof_path = latest_proof.get("evidence_path") or latest_measurement.get("evidence_path", "")
+    verified_by = latest_proof.get("verified_by") or latest_measurement.get("gate", "")
+    pathway = latest_proof.get("pathway") or latest_measurement.get("pathway") or (pathways[-1] if pathways else "")
+    possible_rule = (
+        f"Require proof metadata on {pathway} closeouts." if latest_proof
+        else f"Require proof-add/work-log --proof-type before closing {pathway or 'pathway'} work."
+    )
+    return {
+        "learning_id": f"L-{short_hash(work_id, proof_path, pathway, length=10)}",
+        "timestamp": iso_now(),
+        "work_id": work_id,
+        "project": item.get("project_name", ""),
+        "project_path": item.get("project", ""),
+        "changed_thing": item.get("goal", ""),
+        "proof_that_mattered": proof_path,
+        "failure_caught": "; ".join(summary.get("warnings", [])) or "none at closeout",
+        "guard_involved": verified_by,
+        "pathways_seen": pathways,
+        "project_learning": f"{item.get('project_name', 'project')} closed {pathway or 'pathway'} work with proof {Path(proof_path).name if proof_path else 'missing'}.",
+        "possible_global_rule": possible_rule,
+        "source": "operating-layer work-close",
+    }
+
+
+def write_learning_candidate(paths, candidate):
+    candidates = [c for c in read_ndjson(paths.learning_candidates_path) if c.get("learning_id") != candidate.get("learning_id")]
+    candidates.append(candidate)
+    write_ndjson(paths.learning_candidates_path, candidates)
+    md_path, html_path = write_learning_report(paths, candidates)
+    return candidates, md_path, html_path
 
 
 def run_work_log(args, paths):
@@ -2472,6 +3027,14 @@ def run_work_log(args, paths):
         "stale_after_days": args.stale_after_days,
         "controls_seen": [c.get("control_id") for c in records["controls"] if c.get("work_id") == args.work_id and c.get("status", "open") != "resolved"],
     }
+    proof = None
+    if args.proof_type or args.verified_by or args.recommendation_id:
+        proof, proof_finding = build_proof_record(args, work_item=item, run_id=run_id, measurement_id_value=measurement["measurement_id"])
+        if proof_finding:
+            findings.append(proof_finding)
+        if proof:
+            run["proof_id"] = proof["proof_id"]
+            measurement["proof_id"] = proof["proof_id"]
     all_runs = records["runs"] + [run]
     all_measurements = records["measurements"] + [measurement]
     controls = records["controls"]
@@ -2506,10 +3069,26 @@ def run_work_log(args, paths):
     write_ndjson(paths.pathway_runs_path, all_runs)
     write_ndjson(paths.pathway_measurements_path, all_measurements)
     write_ndjson(paths.controls_path, controls)
+    if proof:
+        upsert_proof(paths, proof)
+        write_proof_report(paths, read_ndjson(paths.proofs_path))
     if item:
-        update_work_item(paths, args.work_id, last_pathway=args.pathway, last_run_id=run_id)
+        updates = {"last_pathway": args.pathway, "last_run_id": run_id}
+        # Mark the itinerary entry proved ONLY when this log carries a real artifact
+        # that exists on disk. A path string alone (or a bare result=pass) must never
+        # satisfy the gate — otherwise `--evidence /does/not/exist` could fake coverage
+        # and let work-close succeed without proof (Codex P0). Proof = a real file.
+        proved = bool(evidence_path) and Path(evidence_path).is_file()
+        itinerary = item.get("itinerary") or []
+        if proved and itinerary:
+            for entry in itinerary:
+                if entry.get("pathway") == args.pathway and entry.get("status") == "required":
+                    entry["status"] = "proved"
+                    entry["proved_by_run"] = run_id
+                    updates["itinerary"] = itinerary
+        update_work_item(paths, args.work_id, **updates)
     dashboard = build_daily_dashboard(paths)
-    return {"records": [run, measurement] + ([control] if control else []), "findings": findings, "run_id": run_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
+    return {"records": [run, measurement] + ([proof] if proof else []) + ([control] if control else []), "findings": findings, "run_id": run_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
 
 
 def run_work_close(args, paths):
@@ -2543,8 +3122,19 @@ def run_work_close(args, paths):
         dashboard = build_daily_dashboard(paths)
         return {"records": [summary], "findings": findings, "closed": False, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
     item = update_work_item(paths, args.work_id, status="closed", closed_at=iso_now(), closeout_readiness="ready")
+    learning = extract_learning_candidate(paths, summary, item)
+    _candidates, learning_md, learning_html = write_learning_candidate(paths, learning)
     dashboard = build_daily_dashboard(paths)
-    return {"records": [item], "findings": [], "closed": True, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
+    return {
+        "records": [item, learning],
+        "findings": [],
+        "closed": True,
+        "learning": learning,
+        "learning_report": str(learning_md),
+        "learning_html": str(learning_html),
+        "dashboard": str(paths.daily_dashboard_path),
+        "daily": dashboard,
+    }
 
 
 def run_work_daily(args, paths):
@@ -2562,6 +3152,41 @@ def run_work_daily(args, paths):
             "stuck": len(dashboard.get("stuck_work_items", [])),
             "open_controls": len(dashboard.get("top_open_controls", [])),
         },
+    }
+
+
+def run_proof_add(args, paths):
+    work_item = None
+    if args.work_id:
+        work_item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
+    proof, proof_finding = build_proof_record(args, work_item=work_item)
+    if proof_finding:
+        return {
+            "records": [],
+            "findings": [proof_finding],
+            "proofs_path": str(paths.proofs_path),
+        }
+    proofs = upsert_proof(paths, proof)
+    md_path, html_path = write_proof_report(paths, proofs)
+    return {
+        "records": [proof],
+        "findings": [],
+        "proof_id": proof["proof_id"],
+        "proofs_path": str(paths.proofs_path),
+        "report": str(md_path),
+        "html": str(html_path),
+    }
+
+
+def run_proof_report(args, paths):
+    proofs = read_ndjson(paths.proofs_path)
+    md_path, html_path = write_proof_report(paths, proofs)
+    return {
+        "records": proofs,
+        "findings": [],
+        "proofs_path": str(paths.proofs_path),
+        "report": str(md_path),
+        "html": str(html_path),
     }
 
 
@@ -2856,12 +3481,46 @@ def karpathy_card(pathway, project_name, goal):
         "real_artifact": doctrine.get("artifact", ""),
         "one_percent_move": doctrine.get("move", ""),
         "skill": doctrine.get("skill", ""),
+        "execution_stack": list(PATHWAY_EXECUTION.get(pathway, {}).get("stack", [])),
+        "execution_tools": list(PATHWAY_EXECUTION.get(pathway, {}).get("tools", [])),
         "goal": goal or f"Advance {project_name} via the {pathway} pathway",
     }
 
 
-def render_pathway_next_report(paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources=None):
+def recommendation_confidence(ranked, has_context, trust):
+    recommended = ranked[0] if ranked else {"score": 0, "reasons": [], "pathway": ""}
+    runner_up = ranked[1] if len(ranked) > 1 else {"score": 0, "reasons": [], "pathway": ""}
+    score_gap = int(recommended.get("score", 0) or 0) - int(runner_up.get("score", 0) or 0)
+    missing = []
+    if not has_context:
+        missing.append("No project-scoped findings or active work item were found.")
+    trust_status = (trust or {}).get("status", "unknown")
+    if trust_status != "pass":
+        missing.append(f"pathway-trust status is {trust_status}.")
+    level = "high" if score_gap >= 25 and not missing else "medium" if score_gap >= 8 else "low"
+    if trust_status == "fail":
+        level = "low"
+    top_reason = (recommended.get("reasons") or ["lowest-coverage pathway"])[0]
+    runner_reason = (runner_up.get("reasons") or ["runner-up has weaker current evidence"])[0]
+    return {
+        "level": level,
+        "score_gap": score_gap,
+        "runner_up_pathway": runner_up.get("pathway", ""),
+        "runner_up_reason": runner_reason,
+        "why_this": top_reason,
+        "why_not_runner_up": (
+            f"{runner_up.get('pathway', 'runner-up')} lost by {score_gap} point(s): {runner_reason}"
+            if runner_up.get("pathway") else "No runner-up pathway was available."
+        ),
+        "top_evidence": (recommended.get("reasons") or ["lowest-coverage pathway"])[:3],
+        "missing_evidence": missing,
+    }
+
+
+def render_pathway_next_report(paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources=None, trust=None, confidence=None):
     sources = sources or {}
+    trust = trust or {"status": "unknown", "summary": "pathway-trust has not run yet"}
+    confidence = confidence or recommendation_confidence(ranked, has_context, trust)
     rec_pathway = recommended["pathway"]
     lines = [
         f"# Next-Best Pathway — {project_name}",
@@ -2884,6 +3543,30 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
         f"- **Verifier (what good looks like):** {card['verifier_good']}",
         f"- **Real artifact (proof):** {card['real_artifact']}",
         f"- **Skill to run:** `{card['skill']}`",
+        f"- **Best-execution stack:** {' → '.join(card.get('execution_stack', [])) or card['skill']}",
+        f"- **Env / plugins / MCP:** {', '.join(card.get('execution_tools', [])) or '—'}",
+        "",
+        "## Pathway Trust",
+        "",
+        f"- **Status:** `{trust.get('status', 'unknown')}`",
+        f"- **Summary:** {trust.get('summary', 'pathway-trust has not run yet')}",
+        f"- **Report:** `{trust.get('report', '') or 'not generated'}`",
+        "",
+        "## Recommendation Confidence",
+        "",
+        f"- **Level:** `{confidence.get('level', 'unknown')}`",
+        f"- **Why this, why not runner-up:** {confidence.get('why_this', '')} / {confidence.get('why_not_runner_up', '')}",
+        f"- **Runner-up:** `{confidence.get('runner_up_pathway', '') or 'none'}`",
+        f"- **Score gap:** {confidence.get('score_gap', 0)}",
+        "",
+        "Top evidence:",
+    ]
+    lines.extend(f"- {reason}" for reason in confidence.get("top_evidence", []))
+    missing = confidence.get("missing_evidence", [])
+    if missing:
+        lines += ["", "Missing evidence:"]
+        lines.extend(f"- {item}" for item in missing)
+    lines += [
         "",
         "## The 1% operator move",
         "",
@@ -2937,6 +3620,186 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
     return "\n".join(lines) + "\n"
 
 
+def table_cell(value):
+    return str(value or "").replace("|", "\\|").replace("\n", " ")[:220]
+
+
+def proof_is_stale(proof):
+    ts = parse_ts(proof.get("timestamp"))
+    if not ts:
+        return False
+    stale_after = int(proof.get("stale_after_days") or WORK_STALE_DAYS)
+    return (utc_now() - ts).days > stale_after
+
+
+def render_proof_report(proofs):
+    stale_count = len([p for p in proofs if proof_is_stale(p)])
+    lines = [
+        "# Pathway Proof Registry",
+        "",
+        f"Generated: {iso_now()}",
+        "",
+        f"**Proofs:** {len(proofs)}",
+        f"**Stale proofs:** {stale_count}",
+        "",
+        "```mermaid",
+        "flowchart LR",
+        '  A["Recommendation"] --> B["Work log"]',
+        '  B --> C["Proof artifact"]',
+        '  C --> D["Metric proved-rate"]',
+        "```",
+        "",
+        "| Proof | Project | Pathway | Type | Result | Verified by | Evidence |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for proof in sorted(proofs, key=lambda p: p.get("timestamp", ""), reverse=True)[:50]:
+        lines.append(
+            "| "
+            + " | ".join([
+                table_cell(proof.get("proof_id")),
+                table_cell(proof.get("project")),
+                table_cell(proof.get("pathway")),
+                table_cell(proof.get("proof_type")),
+                table_cell(proof.get("result")),
+                table_cell(proof.get("verified_by")),
+                table_cell(proof.get("evidence_path")),
+            ])
+            + " |"
+        )
+    if not proofs:
+        lines += ["", "No proofs have been recorded yet."]
+    return "\n".join(lines) + "\n"
+
+
+def write_proof_report(paths, proofs):
+    md_path = dated_artifact_path(paths, "proof-registry")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_proof_report(proofs))
+    render_html(md_path, html_path)
+    return md_path, html_path
+
+
+def guard_command_for_pathway(paths, pathway, project_path):
+    script_name = "migration-guard.py" if pathway == "data" else f"{pathway}-guard.py"
+    script = pathway_scripts_dir(paths) / script_name
+    if not script.exists():
+        return ""
+    return f"python3 {script} --project {project_path} --json"
+
+
+def render_pathway_run_plan(plan):
+    lines = [
+        f"# Pathway Run Plan - {plan['project']} / {plan['pathway']}",
+        "",
+        f"Generated: {plan['timestamp']}",
+        "",
+        f"- Work ID: `{plan['work_id']}`",
+        f"- Recommendation ID: `{plan.get('recommendation_id', '')}`",
+        f"- Confidence: `{plan.get('confidence', '')}`",
+        f"- Goal: {plan.get('goal', '')}",
+        "",
+        "## Skill And Guard",
+        "",
+        f"- Skill: `{plan.get('skill', '') or 'none'}`",
+        f"- Guard command: `{plan.get('guard_command', '') or 'none available'}`",
+        "",
+        "## 1% Move",
+        "",
+        f"> {plan.get('one_percent_move', '')}",
+        "",
+        "## Required Proof Before Closeout",
+        "",
+        f"- Proof type: `{plan.get('required_proof_type', 'artifact')}`",
+        f"- Proof must satisfy: {plan.get('proof_requirement', '')}",
+        "",
+        "```bash",
+        plan.get("proof_command", ""),
+        "```",
+        "",
+        "## Source Recommendation",
+        "",
+        f"- Report: `{plan.get('pathway_next_report', '')}`",
+        f"- HTML: `{plan.get('pathway_next_html', '')}`",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_pathway_run_plan(paths, plan):
+    md_path = dated_artifact_path(paths, f"pathway-run-{safe_slug(plan['project'])}-{safe_slug(plan['pathway'])}")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_pathway_run_plan(plan))
+    render_html(md_path, html_path)
+    plans = [p for p in read_ndjson(paths.pathway_run_plans_path) if p.get("plan_id") != plan.get("plan_id")]
+    plan = {**plan, "report": str(md_path), "html": str(html_path)}
+    plans.append(plan)
+    write_ndjson(paths.pathway_run_plans_path, plans)
+    return plan, md_path, html_path
+
+
+def run_pathway_trust(args, paths):
+    script_dir = pathway_scripts_dir(paths)
+    test_dir = script_dir / "tests"
+    project_path = resolve_project_path(args, paths) if args.project else None
+
+    checks = [
+        explicit_runner_integrity(test_dir / "operating_layer_test.py"),
+        run_trust_command("pathway_fs helper contract", [sys.executable, str(test_dir / "pathway_fs_test.py")], 2.0),
+        run_trust_command("techdebt guard trust suite", [sys.executable, str(test_dir / "techdebt_guard_test.py")], 5.0),
+        run_trust_command("design guard trust suite", [sys.executable, str(test_dir / "design_guard_test.py")], 5.0),
+        run_trust_command("observability guard trust suite", [sys.executable, str(test_dir / "observability_guard_test.py")], 7.0),
+    ]
+
+    if project_path:
+        probes = [
+            ("techdebt project probe", [sys.executable, str(script_dir / "techdebt-guard.py"), "--project", project_path, "--json"], 5.0),
+            ("design project probe", [sys.executable, str(script_dir / "design-guard.py"), "--project", project_path, "--json"], 5.0),
+            ("observability project probe", [sys.executable, str(script_dir / "observability-guard.py"), "--project", project_path, "--profile", "multi-tenant-saas", "--json"], 7.0),
+        ]
+        checks.extend(run_trust_command(name, cmd, budget) for name, cmd, budget in probes)
+    elif args.project:
+        checks.append({
+            "name": "project resolution",
+            "status": "fail",
+            "summary": f"project not found: {args.project}",
+        })
+
+    status = aggregate_trust_status(checks)
+    summary = (
+        "all trust checks passed" if status == "pass"
+        else "trust checks passed with warnings" if status == "warn"
+        else "one or more trust checks failed"
+    )
+    result = {
+        "generated_at": iso_now(),
+        "status": status,
+        "summary": summary,
+        "project": str(project_path or ""),
+        "checks": checks,
+    }
+    write_json(paths.pathway_trust_path, result)
+    md_path = dated_artifact_path(paths, "pathway-trust")
+    html_path = md_path.with_suffix(".html")
+    result["report"] = str(md_path)
+    result["html"] = str(html_path)
+    write_text(md_path, render_pathway_trust_report(result))
+    render_html(md_path, html_path)
+    write_json(paths.pathway_trust_path, result)
+
+    result["records"] = checks
+    result["findings"] = [finding(
+        "pathway-trust-status",
+        "pathway-trust",
+        "info" if status == "pass" else "warn",
+        f"Pathway trust status: {status}. {summary}.",
+        [line_evidence(md_path)],
+        "Fix failing trust checks before relying on pathway-next recommendations." if status == "fail"
+        else "Use pathway-next with the recorded trust context.",
+        "runtime",
+        "high",
+    )]
+    return result
+
+
 def run_pathway_next(args, paths):
     project_path = resolve_project_path(args, paths)
     if not project_path:
@@ -2963,7 +3826,21 @@ def run_pathway_next(args, paths):
     work_summaries = [work_status_summary(paths, w.get("work_id")) for w in work_items]
     ranked = score_pathways(paths, project_path, project_name, scoped_findings, work_summaries)
     recommended = ranked[0]
+    # Itinerary override: when the active outcome still owes required pathways, the next
+    # move is the foundation-first OPEN-REQUIRED one — the router walks the committed
+    # itinerary rather than greedily re-picking the global max. This is what guarantees
+    # every necessary pathway is covered and none is silently skipped.
+    active_summary = work_summaries[0] if work_summaries else None
+    itinerary_open = (active_summary or {}).get("itinerary_coverage", {}).get("open", []) if active_summary else []
+    if itinerary_open:
+        first = itinerary_open[0]  # itinerary_coverage() returns these foundation-first
+        recommended = next((r for r in ranked if r["pathway"] == first), recommended)
     card = karpathy_card(recommended["pathway"], project_name, args.goal)
+    trust = load_pathway_trust_summary(paths)
+    has_context = bool(scoped_findings or work_items)
+    confidence = recommendation_confidence(ranked, has_context, trust)
+    recommendations = read_ndjson(paths.recommendations_path)
+    recommendation_id = f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}"
 
     work_id = work_items[0].get("work_id") if work_items else None
     if work_id:
@@ -2971,7 +3848,9 @@ def run_pathway_next(args, paths):
             f"python3 ~/.claude/scripts/operating-layer.py work-log \\\n"
             f"  --work-id {work_id} \\\n"
             f"  --pathway {recommended['pathway']} --kind verify \\\n"
-            f"  --evidence <path-to-real-artifact> --gate {recommended['pathway']}-gate"
+            f"  --evidence <path-to-real-artifact> --gate {recommended['pathway']}-gate \\\n"
+            f"  --proof-type artifact --verified-by \"<verification-command>\" \\\n"
+            f"  --recommendation-id {recommendation_id}"
         )
     else:
         goal_text = args.goal or f"Advance {project_name} via {recommended['pathway']}"
@@ -2981,20 +3860,22 @@ def run_pathway_next(args, paths):
             f"  --goal \"{goal_text}\""
         )
 
-    has_context = bool(scoped_findings or work_items)
     md_path = dated_artifact_path(paths, f"pathway-next-{safe_slug(project_name)}")
     html_path = md_path.with_suffix(".html")
     write_text(md_path, render_pathway_next_report(
-        paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources))
+        paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources, trust, confidence))
     render_html(md_path, html_path)
 
     # Log the recommendation so pathway-metric can measure follow-through (govern metric).
-    recommendations = read_ndjson(paths.recommendations_path)
     recommendations.append({
-        "recommendation_id": f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}",
+        "recommendation_id": recommendation_id,
         "project": project_name,
         "pathway": recommended["pathway"],
         "work_id": work_id or "",
+        "confidence": confidence.get("level", ""),
+        "runner_up_pathway": confidence.get("runner_up_pathway", ""),
+        "why_this": confidence.get("why_this", ""),
+        "why_not_runner_up": confidence.get("why_not_runner_up", ""),
         "timestamp": iso_now(),
     })
     write_ndjson(paths.recommendations_path, recommendations)
@@ -3021,8 +3902,96 @@ def run_pathway_next(args, paths):
         "next_command": next_command,
         "ranked": ranked,
         "signal_sources": sources,
+        "pathway_trust": trust,
+        "recommendation_id": recommendation_id,
+        "recommendation_confidence": confidence,
+        "itinerary": (active_summary or {}).get("itinerary", []) if active_summary else [],
+        "itinerary_coverage": (active_summary or {}).get("itinerary_coverage", {}) if active_summary else {},
         "report": str(md_path),
         "html": str(html_path),
+    }
+
+
+def run_pathway_run(args, paths):
+    project_path = resolve_project_path(args, paths)
+    if not project_path:
+        return {
+            "findings": [finding(
+                "pathway-run-missing-project",
+                "pathway-run",
+                "warn",
+                "pathway-run requires --project (a path or a project name under the projects root).",
+                [line_evidence(paths.portfolio_path)],
+                "Run `pathway-run --project <name> --goal <outcome>`.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+    project_name = Path(project_path).name
+    work_items = active_work_for_project(paths, project_path, project_name)
+    goal_text = args.goal or f"Advance {project_name} through /pathway"
+    if work_items:
+        item = work_items[0]
+        work_id = item.get("work_id")
+    else:
+        work_id = stable_work_id(project_path, goal_text)
+        item = update_work_item(
+            paths,
+            work_id,
+            status="active",
+            mode="semi-automatic",
+            project=project_path,
+            project_name=project_name,
+            goal=goal_text,
+            context=current_work_context(paths, project_path),
+            closeout_readiness="not_ready",
+        )
+
+    rec = run_pathway_next(args, paths)
+    pathway = rec.get("recommended_pathway", "")
+    card = rec.get("karpathy_card", {})
+    guard_command = guard_command_for_pathway(paths, pathway, project_path)
+    proof_command = (
+        f"python3 ~/.claude/scripts/operating-layer.py work-log \\\n"
+        f"  --work-id {work_id} \\\n"
+        f"  --pathway {pathway} --kind verify \\\n"
+        f"  --evidence <path-to-real-artifact> --gate {pathway}-gate \\\n"
+        f"  --proof-type artifact --verified-by \"{guard_command or card.get('skill', '<verification-command>')}\" \\\n"
+        f"  --recommendation-id {rec.get('recommendation_id', '')}"
+    )
+    plan = {
+        "plan_id": f"PRUN-{short_hash(project_path, work_id, pathway, rec.get('recommendation_id', ''), length=10)}",
+        "timestamp": iso_now(),
+        "project": project_name,
+        "project_path": project_path,
+        "work_id": work_id,
+        "goal": item.get("goal", goal_text),
+        "pathway": pathway,
+        "recommendation_id": rec.get("recommendation_id", ""),
+        "confidence": rec.get("recommendation_confidence", {}).get("level", ""),
+        "skill": card.get("skill", ""),
+        "guard_command": guard_command,
+        "one_percent_move": rec.get("one_percent_move", ""),
+        "required_proof_type": "artifact",
+        "proof_requirement": f"Run the {pathway} move and attach the real verification artifact before closeout.",
+        "proof_command": proof_command,
+        "pathway_next_report": rec.get("report", ""),
+        "pathway_next_html": rec.get("html", ""),
+    }
+    plan, md_path, html_path = write_pathway_run_plan(paths, plan)
+    dashboard = build_daily_dashboard(paths)
+    return {
+        "records": [item, plan],
+        "findings": rec.get("findings", []),
+        "work_id": work_id,
+        "recommendation_id": rec.get("recommendation_id", ""),
+        "recommended_pathway": pathway,
+        "run_plan": plan,
+        "report": str(md_path),
+        "html": str(html_path),
+        "dashboard": str(paths.daily_dashboard_path),
+        "daily": dashboard,
     }
 
 
@@ -3136,6 +4105,7 @@ def run_pathway_metric(args, paths):
     gate_target = args.gate_target if args.gate_target is not None else 0.5
     recs = read_ndjson(paths.recommendations_path)
     runs = read_ndjson(paths.pathway_runs_path)
+    proofs = read_ndjson(paths.proofs_path)
     items = read_ndjson(paths.work_items_path)
     project_of = {w.get("work_id"): w.get("project_name") for w in items if w.get("work_id")}
 
@@ -3155,8 +4125,31 @@ def run_pathway_metric(args, paths):
                     return True
         return False
 
+    def proved(rec):
+        rec_ts = parse_ts(rec.get("timestamp"))
+        for proof in proofs:
+            proof_rec = proof.get("recommendation_id")
+            if proof_rec:
+                if proof_rec != rec.get("recommendation_id"):
+                    continue
+            else:
+                same_work = rec.get("work_id") and proof.get("work_id") == rec.get("work_id")
+                same_proj = bool(rec.get("project")) and proof.get("project") == rec.get("project")
+                same_pathway = proof.get("pathway") == rec.get("pathway")
+                if not (same_pathway and (same_work or same_proj)):
+                    continue
+            if proof.get("pathway") and proof.get("pathway") != rec.get("pathway"):
+                continue
+            proof_ts = parse_ts(proof.get("timestamp"))
+            if rec_ts and proof_ts:
+                delta = (proof_ts - rec_ts).total_seconds()
+                if 0 <= delta <= window_days * 86400:
+                    return True
+        return False
+
     by_pathway = {}
     acted = 0
+    proved_count = 0
     total = 0
     skipped = 0
     for rec in recs:
@@ -3165,24 +4158,33 @@ def run_pathway_metric(args, paths):
             continue
         total += 1
         hit = acted_on(rec)
+        proof_hit = proved(rec)
         acted += 1 if hit else 0
-        bucket = by_pathway.setdefault(rec.get("pathway", "?"), {"total": 0, "acted_on": 0})
+        proved_count += 1 if proof_hit else 0
+        bucket = by_pathway.setdefault(rec.get("pathway", "?"), {"total": 0, "acted_on": 0, "proved": 0})
         bucket["total"] += 1
         bucket["acted_on"] += 1 if hit else 0
+        bucket["proved"] += 1 if proof_hit else 0
     for bucket in by_pathway.values():
         bucket["rate"] = round(bucket["acted_on"] / bucket["total"], 3) if bucket["total"] else 0.0
+        bucket["proved_rate"] = round(bucket["proved"] / bucket["total"], 3) if bucket["total"] else 0.0
 
     rate = round(acted / total, 3) if total else 0.0
+    proved_rate = round(proved_count / total, 3) if total else 0.0
     metric = {
-        "metric": "recommendation-action rate",
+        "metric": "recommendation action and proof rate",
         "generated_at": iso_now(),
         "window_days": window_days,
         "total_recommendations": total,
         "skipped_no_timestamp": skipped,
         "acted_on": acted,
         "rate": rate,
+        "acted_on_rate": rate,
+        "proved": proved_count,
+        "proved_rate": proved_rate,
         "gate_target": gate_target,
         "gate_pass": (total > 0 and rate >= gate_target),
+        "proof_gate_pass": (total > 0 and proved_rate >= gate_target),
         "by_pathway": by_pathway,
     }
     write_json(paths.operator_intel / "pathway-metric.json", metric)
@@ -3191,6 +4193,855 @@ def run_pathway_metric(args, paths):
         "findings": [],
         "metric": metric,
         "written": str(paths.operator_intel / "pathway-metric.json"),
+    }
+
+
+def portfolio_next_items(paths):
+    projects = scan_projects(paths)
+    work_records = load_work_records(paths)
+    known_paths = {p.get("path") for p in projects}
+    for work in work_records["items"]:
+        project_path = work.get("project")
+        if not project_path or project_path in known_paths:
+            continue
+        p = Path(project_path)
+        projects.append({
+            "name": work.get("project_name") or p.name,
+            "path": project_path,
+            "kind": classify_project(p) if p.exists() else "tracked-work",
+            "stack": detect_stack(p) if p.exists() else [],
+            "canonical_status": "tracked-work",
+            "deploy_targets": [],
+            "data_boundary": project_boundary(p) if p.exists() else "unknown",
+            "evidence_refs": quick_evidence_refs(p) if p.exists() else [],
+            "last_verified": mtime_iso(p / ".planning") or mtime_iso(p / "README.md") or mtime_iso(p) if p.exists() else None,
+            "next_action": "continue active work",
+        })
+        known_paths.add(project_path)
+    proofs = read_ndjson(paths.proofs_path)
+    recs = read_ndjson(paths.recommendations_path)
+    out = []
+    for project in projects:
+        name = project.get("name", "")
+        work_items = [
+            w for w in work_records["items"]
+            if w.get("status", "active") != "closed"
+            and (w.get("project") == project.get("path") or w.get("project_name") == name)
+        ]
+        work_ids = {w.get("work_id") for w in work_items}
+        open_controls = [
+            c for c in work_records["controls"]
+            if c.get("work_id") in work_ids and c.get("status", "open") != "resolved"
+        ]
+        measurements = [m for m in work_records["measurements"] if m.get("work_id") in work_ids]
+        stale_measurement_count = len(stale_measurements(measurements))
+        project_proofs = [p for p in proofs if p.get("project") == name or p.get("project_path") == project.get("path")]
+        stale_proof_count = len([p for p in project_proofs if proof_is_stale(p)])
+        rec_count = len([r for r in recs if r.get("project") == name])
+        score = 0
+        reasons = []
+        if project.get("canonical_status") == "unresolved":
+            score += 25
+            reasons.append("canonical checkout unresolved")
+        if not project.get("evidence_refs"):
+            score += 8
+            reasons.append("no indexed evidence refs")
+        if work_items:
+            score += 10 * len(work_items)
+            reasons.append(f"{len(work_items)} active work item(s)")
+        if open_controls:
+            score += 50 * len(open_controls)
+            reasons.append(f"{len(open_controls)} open control(s)")
+        if stale_measurement_count:
+            score += 20 * stale_measurement_count
+            reasons.append(f"{stale_measurement_count} stale measurement(s)")
+        if stale_proof_count:
+            score += 15 * stale_proof_count
+            reasons.append(f"{stale_proof_count} stale proof(s)")
+        if rec_count and not project_proofs:
+            score += 12
+            reasons.append("recommendations exist but no proof recorded")
+        if rec_count:
+            score += min(20, rec_count * 4)
+            reasons.append(f"{rec_count} recommendation(s)")
+        if not reasons:
+            reasons.append(project.get("next_action", "keep current"))
+        out.append({
+            "project": name,
+            "project_path": project.get("path"),
+            "score": score,
+            "reasons": reasons,
+            "active_work": len(work_items),
+            "open_controls": len(open_controls),
+            "stale_measurements": stale_measurement_count,
+            "stale_proofs": stale_proof_count,
+            "recommendations": rec_count,
+            "canonical_status": project.get("canonical_status"),
+            "next_action": project.get("next_action"),
+        })
+    return sorted(out, key=lambda item: (-item["score"], item["project"]))
+
+
+def render_portfolio_next_report(items):
+    lines = [
+        "# Portfolio Next Queue",
+        "",
+        f"Generated: {iso_now()}",
+        "",
+        "| Rank | Project | Score | Top reason | Active | Controls | Proofs stale |",
+        "|---:|---|---:|---|---:|---:|---:|",
+    ]
+    for i, item in enumerate(items, 1):
+        lines.append(
+            f"| {i} | `{table_cell(item.get('project'))}` | {item.get('score', 0)} | "
+            f"{table_cell((item.get('reasons') or [''])[0])} | {item.get('active_work', 0)} | "
+            f"{item.get('open_controls', 0)} | {item.get('stale_proofs', 0)} |"
+        )
+    if not items:
+        lines += ["", "No projects were discovered."]
+    return "\n".join(lines) + "\n"
+
+
+def run_portfolio_next(args, paths):
+    items = portfolio_next_items(paths)
+    result = {"generated_at": iso_now(), "items": items}
+    write_json(paths.portfolio_next_path, result)
+    md_path = dated_artifact_path(paths, "portfolio-next")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_portfolio_next_report(items))
+    render_html(md_path, html_path)
+    return {
+        "records": items,
+        "findings": [],
+        "queue": str(paths.portfolio_next_path),
+        "report": str(md_path),
+        "html": str(html_path),
+        "top_project": items[0]["project"] if items else "",
+    }
+
+
+def rule_map_records(paths):
+    script_dir = pathway_scripts_dir(paths)
+    candidates = [
+        {
+            "rule": "Proof-backed closeout",
+            "class": "always",
+            "criticality": "critical",
+            "description": "Closed work should emit learning from real proof, not transcript vibes.",
+            "backing_candidates": [Path(__file__).resolve()],
+        },
+        {
+            "rule": "Pathway guards are bounded and trusted",
+            "class": "always",
+            "criticality": "critical",
+            "description": "Guard scripts must stay fast enough to be reliable recommendation inputs.",
+            "backing_candidates": [script_dir / "tests" / "pathway_fs_test.py", script_dir / "tests" / "operating_layer_test.py"],
+        },
+        {
+            "rule": "Secret redaction in operator outputs",
+            "class": "never",
+            "criticality": "critical",
+            "description": "Operator artifacts must not leak tokens, passwords, or high-entropy secrets.",
+            "backing_candidates": [Path(__file__).resolve(), script_dir / "tests" / "operating_layer_test.py"],
+        },
+        {
+            "rule": "Confirm irreversible actions",
+            "class": "ask-first",
+            "criticality": "critical",
+            "description": "Deletes, force pushes, production mutations, external sends, and data loss need explicit confirmation.",
+            "backing_candidates": [],
+        },
+        {
+            "rule": "Use apply_patch for manual edits",
+            "class": "always",
+            "criticality": "warn",
+            "description": "Manual code edits should be visible, surgical patches.",
+            "backing_candidates": [],
+        },
+        {
+            "rule": "Do not mutate project repos from advisory commands",
+            "class": "never",
+            "criticality": "critical",
+            "description": "pathway-next, pathway-run, and portfolio-next write central operator artifacts only.",
+            "backing_candidates": [Path(__file__).resolve(), script_dir / "tests" / "operating_layer_test.py"],
+        },
+    ]
+    records = []
+    for item in candidates:
+        backing = [str(p) for p in item["backing_candidates"] if Path(p).exists()]
+        status = "enforced" if backing else "prose-only"
+        records.append({
+            "rule": item["rule"],
+            "class": item["class"],
+            "criticality": item["criticality"],
+            "description": item["description"],
+            "enforcement_status": status,
+            "backing_paths": backing,
+        })
+    return records
+
+
+def render_rule_map_report(records):
+    lines = [
+        "# Rule Enforcement Map",
+        "",
+        f"Generated: {iso_now()}",
+        "",
+        "| Rule | Class | Criticality | Status | Backing |",
+        "|---|---|---|---|---|",
+    ]
+    for record in records:
+        backing = ", ".join(record.get("backing_paths", [])) or "none"
+        lines.append(
+            f"| {table_cell(record.get('rule'))} | `{record.get('class')}` | `{record.get('criticality')}` | "
+            f"`{record.get('enforcement_status')}` | {table_cell(backing)} |"
+        )
+    gaps = [r for r in records if r.get("enforcement_status") == "prose-only" and r.get("criticality") == "critical"]
+    lines += ["", "## Critical Prose-Only Gaps", ""]
+    if gaps:
+        for gap in gaps:
+            lines.append(f"- `{gap['rule']}`: {gap['description']}")
+    else:
+        lines.append("- No critical prose-only gaps found.")
+    return "\n".join(lines) + "\n"
+
+
+def run_rule_map(args, paths):
+    records = rule_map_records(paths)
+    result = {"generated_at": iso_now(), "rules": records}
+    write_json(paths.rule_map_path, result)
+    md_path = dated_artifact_path(paths, "rule-map")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_rule_map_report(records))
+    render_html(md_path, html_path)
+    return {
+        "records": records,
+        "findings": [],
+        "rule_map": str(paths.rule_map_path),
+        "report": str(md_path),
+        "html": str(html_path),
+        "prose_only_critical": [r for r in records if r.get("enforcement_status") == "prose-only" and r.get("criticality") == "critical"],
+    }
+
+
+def latest_artifacts(paths, limit=12):
+    if not paths.operator_artifacts.exists():
+        return []
+    files = [p for p in paths.operator_artifacts.glob("*") if p.is_file() and p.suffix in {".md", ".html", ".json"}]
+    files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return [{"path": str(p), "name": p.name, "mtime": mtime_iso(p)} for p in files[:limit]]
+
+
+def build_cockpit(paths):
+    dashboard = build_daily_dashboard(paths)
+    trust = load_pathway_trust_summary(paths)
+    portfolio_data = read_json_file(paths.portfolio_next_path, {"items": portfolio_next_items(paths)})
+    metric = read_json_file(paths.operator_intel / "pathway-metric.json", {})
+    proofs = read_ndjson(paths.proofs_path)
+    rules = read_json_file(paths.rule_map_path, {"rules": rule_map_records(paths)}).get("rules", [])
+    recs = sorted(read_ndjson(paths.recommendations_path), key=lambda r: r.get("timestamp", ""), reverse=True)
+    stale_proofs = [p for p in proofs if proof_is_stale(p)]
+    critical_rule_gaps = [
+        r for r in rules
+        if r.get("criticality") == "critical" and r.get("enforcement_status") == "prose-only"
+    ]
+    top_portfolio = (portfolio_data.get("items") or [None])[0]
+    latest_rec = recs[0] if recs else None
+    source_paths = {
+        "daily_dashboard": str(paths.daily_dashboard_path),
+        "portfolio_next": str(paths.portfolio_next_path),
+        "pathway_metric": str(paths.operator_intel / "pathway-metric.json"),
+        "proofs": str(paths.proofs_path),
+        "rule_map": str(paths.rule_map_path),
+    }
+    return {
+        "generated_at": iso_now(),
+        "daily_dashboard": dashboard,
+        "trust": trust,
+        "portfolio_top": top_portfolio,
+        "latest_recommendation": latest_rec,
+        "active_work_count": dashboard.get("active_count", 0),
+        "stuck_work_items": dashboard.get("stuck_work_items", []),
+        "open_controls": dashboard.get("top_open_controls", []),
+        "metric": metric,
+        "proof_count": len(proofs),
+        "stale_proofs": stale_proofs,
+        "critical_rule_gaps": critical_rule_gaps,
+        "latest_artifacts": latest_artifacts(paths),
+        "source_paths": {k: v for k, v in source_paths.items() if Path(v).exists()},
+    }
+
+
+def safe_display_text(value, limit=180):
+    text = redact(str(value or "")).replace("\n", " ").strip()
+    text = re.sub(r"/Users/[^\s`|,;)]+", lambda m: Path(m.group(0)).name, text)
+    text = re.sub(r"/private/tmp/[^\s`|,;)]+", lambda m: Path(m.group(0)).name, text)
+    text = re.sub(r"\bpython3\s+[^\n;]+", "verification command recorded", text)
+    text = re.sub(r"\bnpm\s+(?:run\s+)?[^\n;]+", "npm verification recorded", text)
+    text = re.sub(r"\bnpx\s+[^\n;]+", "node verification recorded", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def safe_artifact_name(value):
+    raw = str(value or "").strip()
+    name = Path(raw).name if raw else ""
+    return safe_display_text(name or "artifact", limit=80)
+
+
+def latest_recommendation_proof_status(latest_rec, proofs):
+    if not latest_rec:
+        return "unknown"
+    rec_id = latest_rec.get("recommendation_id")
+    pathway = latest_rec.get("pathway")
+    project = latest_rec.get("project")
+    matches = []
+    for proof in proofs:
+        if rec_id and proof.get("recommendation_id") == rec_id:
+            matches.append(proof)
+            continue
+        if proof.get("pathway") == pathway and proof.get("project") == project:
+            matches.append(proof)
+    if not matches:
+        return "missing"
+    return "stale" if all(proof_is_stale(p) for p in matches) else "proved"
+
+
+def safe_latest_recommendation(latest_rec, proofs):
+    if not latest_rec:
+        return None
+    return {
+        "project": safe_display_text(latest_rec.get("project"), 80),
+        "pathway": safe_display_text(latest_rec.get("pathway"), 40),
+        "recommendation_id": safe_display_text(latest_rec.get("recommendation_id"), 80),
+        "confidence": safe_display_text(latest_rec.get("confidence") or latest_rec.get("level") or "unknown", 40),
+        "runner_up_pathway": safe_display_text(latest_rec.get("runner_up_pathway"), 40),
+        "why_this": safe_display_text(latest_rec.get("why_this") or latest_rec.get("reason") or "Latest recorded recommendation.", 220),
+        "why_not_runner_up": safe_display_text(latest_rec.get("why_not_runner_up") or "Runner-up detail unavailable in the current ledger.", 220),
+        "proof_status": latest_recommendation_proof_status(latest_rec, proofs),
+    }
+
+
+def safe_proof_summary(proof):
+    return {
+        "proof_id": safe_display_text(proof.get("proof_id"), 80),
+        "project": safe_display_text(proof.get("project"), 80),
+        "pathway": safe_display_text(proof.get("pathway"), 40),
+        "proof_type": safe_display_text(proof.get("proof_type"), 40),
+        "result": safe_display_text(proof.get("result"), 40),
+        "status": "stale" if proof_is_stale(proof) else "current",
+        "artifact_name": safe_artifact_name(proof.get("evidence_path")),
+        "timestamp": safe_display_text(proof.get("timestamp"), 40),
+    }
+
+
+def safe_portfolio_item(item):
+    reasons = item.get("reasons") if isinstance(item.get("reasons"), list) else []
+    return {
+        "project": safe_display_text(item.get("project"), 80),
+        "score": int(item.get("score") or 0),
+        "reason": safe_display_text(reasons[0] if reasons else item.get("next_action"), 180),
+        "active_work": int(item.get("active_work") or 0),
+        "stale_proofs": int(item.get("stale_proofs") or 0),
+    }
+
+
+def safe_decision_summary(decision):
+    return {
+        "decision_id": safe_display_text(decision.get("decision_id"), 80),
+        "action": safe_display_text(decision.get("action"), 30),
+        "project": safe_display_text(decision.get("project"), 80),
+        "pathway": safe_display_text(decision.get("pathway"), 40),
+        "recommendation_id": safe_display_text(decision.get("recommendation_id"), 80),
+        "work_id": safe_display_text(decision.get("work_id"), 80),
+        "proof_id": safe_display_text(decision.get("proof_id"), 80),
+        "agent": safe_display_text(decision.get("agent"), 80),
+        "reason": safe_display_text(decision.get("reason"), 220),
+        "timestamp": safe_display_text(decision.get("timestamp"), 40),
+    }
+
+
+def build_decision_memory(decisions):
+    memory = []
+    for decision in decisions[:8]:
+        action = safe_display_text(decision.get("action"), 30) or "decision"
+        pathway = safe_display_text(decision.get("pathway"), 40) or "pathway"
+        project = safe_display_text(decision.get("project"), 80) or "project"
+        reason = safe_display_text(decision.get("reason"), 220) or "No rationale recorded."
+        memory.append({
+            "decision_id": safe_display_text(decision.get("decision_id"), 80),
+            "title": f"{action.title()} {pathway} for {project}",
+            "summary": reason,
+            "project": project,
+            "pathway": pathway,
+            "timestamp": safe_display_text(decision.get("timestamp"), 40),
+        })
+    return memory
+
+
+def build_agent_assignments(decisions, autonomous_queue):
+    assignments = []
+    for decision in decisions:
+        if decision.get("action") != "assign":
+            continue
+        agent = safe_display_text(decision.get("agent"), 80)
+        if not agent:
+            continue
+        assignments.append({
+            "assignment_id": safe_display_text(decision.get("decision_id"), 80),
+            "project": safe_display_text(decision.get("project"), 80),
+            "pathway": safe_display_text(decision.get("pathway"), 40),
+            "agent": agent,
+            "status": "assigned",
+            "reason": safe_display_text(decision.get("reason") or "Operator assigned this pathway.", 180),
+        })
+    for item in autonomous_queue:
+        if len(assignments) >= 8:
+            break
+        project = safe_display_text(item.get("project"), 80)
+        pathway = safe_display_text(item.get("pathway"), 40)
+        if not project and not pathway:
+            continue
+        assignments.append({
+            "assignment_id": f"suggested-{safe_slug(project or pathway)}-{len(assignments) + 1}",
+            "project": project,
+            "pathway": pathway,
+            "agent": "unassigned",
+            "status": "suggested",
+            "reason": safe_display_text(item.get("title") or item.get("reason"), 180),
+        })
+    return assignments[:8]
+
+
+def build_closeout_queue(cockpit, proofs):
+    proofs_by_id = {p.get("proof_id"): p for p in proofs if p.get("proof_id")}
+    dashboard = cockpit.get("daily_dashboard") or {}
+    queue = []
+    for summary in dashboard.get("work_summaries", [])[:8]:
+        item = summary.get("work_item") or {}
+        proof_ids = [
+            m.get("proof_id")
+            for m in summary.get("measurements", [])
+            if m.get("proof_id")
+        ]
+        proof_records = [proofs_by_id.get(pid) for pid in proof_ids if proofs_by_id.get(pid)]
+        has_current_proof = any(p and not proof_is_stale(p) for p in proof_records)
+        has_stale_proof = bool(proof_records) and not has_current_proof
+        ready = summary.get("closeout_readiness") == "ready" and has_current_proof
+        warnings = summary.get("warnings") if isinstance(summary.get("warnings"), list) else []
+        queue.append({
+            "work_id": safe_display_text(item.get("work_id"), 80),
+            "project": safe_display_text(item.get("project_name") or item.get("project"), 80),
+            "goal": safe_display_text(item.get("goal"), 180),
+            "status": "ready" if ready else "blocked",
+            "proof_status": "current" if has_current_proof else "stale" if has_stale_proof else "missing",
+            "reason": "Current proof supports closeout." if ready else safe_display_text(warnings[0] if warnings else "Closeout needs a current proof.", 220),
+        })
+    return queue
+
+
+def build_alex_queue(cockpit, latest_rec, metric):
+    queue = []
+    if latest_rec and latest_recommendation_proof_status(latest_rec, cockpit.get("proofs_for_status", [])) != "proved":
+        queue.append({
+            "kind": "proof-needed",
+            "priority": "high",
+            "title": f"Prove {safe_display_text(latest_rec.get('pathway'), 40)} recommendation",
+            "reason": "Latest recommendation is not linked to a current proof.",
+        })
+    for gap in cockpit.get("critical_rule_gaps", [])[:3]:
+        queue.append({
+            "kind": "rule-gap",
+            "priority": "high" if gap.get("criticality") == "critical" else "medium",
+            "title": safe_display_text(gap.get("rule") or gap.get("title") or "Rule gap", 120),
+            "reason": safe_display_text(gap.get("description") or "Critical rule is not enforced by code.", 220),
+        })
+    for item in cockpit.get("stuck_work_items", [])[:3]:
+        warnings = item.get("warnings") if isinstance(item.get("warnings"), list) else []
+        queue.append({
+            "kind": "stuck-work",
+            "priority": "medium",
+            "title": safe_display_text(item.get("goal") or item.get("work_id") or "Stuck work", 120),
+            "reason": safe_display_text(warnings[0] if warnings else "Work needs operator attention.", 220),
+        })
+    if metric and metric.get("proof_gate_pass") is False:
+        queue.append({
+            "kind": "metric-gap",
+            "priority": "medium",
+            "title": "Raise proved follow-through",
+            "reason": f"Proved rate is {metric.get('proved_rate', 0)} against target {metric.get('gate_target', 0)}.",
+        })
+    return queue[:6]
+
+
+def build_autonomous_queue(paths, portfolio_items):
+    plans = sorted(read_ndjson(paths.pathway_run_plans_path), key=lambda p: p.get("timestamp", ""), reverse=True)
+    queue = []
+    for plan in plans[:4]:
+        queue.append({
+            "kind": "pathway-run",
+            "priority": "normal",
+            "title": safe_display_text(plan.get("one_percent_move") or f"Continue {plan.get('pathway', 'pathway')} run", 140),
+            "reason": safe_display_text(plan.get("proof_requirement") or "Attach proof before closeout.", 220),
+            "project": safe_display_text(plan.get("project"), 80),
+            "pathway": safe_display_text(plan.get("pathway"), 40),
+        })
+    for item in portfolio_items[:3]:
+        queue.append({
+            "kind": "portfolio",
+            "priority": "normal",
+            "title": f"Inspect {safe_display_text(item.get('project'), 80)}",
+            "reason": safe_display_text((item.get("reasons") or [item.get("next_action", "")])[0], 180),
+            "project": safe_display_text(item.get("project"), 80),
+            "pathway": "",
+        })
+    return queue[:6]
+
+
+def build_tool_warnings(paths):
+    warnings = []
+    for finding_item in sorted(read_ndjson(paths.findings_path), key=lambda f: f.get("id", "")):
+        fid = finding_item.get("id", "")
+        if not (fid.startswith("opintel-provider-model-drift") or fid.startswith("tools-auth") or fid.startswith("tools-duplicate")):
+            continue
+        warnings.append({
+            "id": safe_display_text(fid, 100),
+            "severity": safe_display_text(finding_item.get("severity"), 30),
+            "label": safe_display_text(finding_item.get("message") or fid, 180),
+        })
+    return warnings[:6]
+
+
+def build_pfos_cockpit(paths):
+    cockpit = build_cockpit(paths)
+    if not paths.rule_map_path.exists():
+        cockpit["critical_rule_gaps"] = []
+    if not paths.portfolio_next_path.exists():
+        cockpit["portfolio_top"] = {}
+    if not paths.recommendations_path.exists():
+        cockpit["latest_recommendation"] = None
+    proofs = read_ndjson(paths.proofs_path)
+    decisions = sorted(read_ndjson(paths.pathway_decisions_path), key=lambda d: d.get("timestamp", ""), reverse=True)
+    cockpit["proofs_for_status"] = proofs
+    metric = cockpit.get("metric") or {}
+    latest_rec = cockpit.get("latest_recommendation") or {}
+    portfolio_items = (read_json_file(paths.portfolio_next_path, {"items": []}).get("items") or [])
+    safe_rec = safe_latest_recommendation(latest_rec, proofs)
+    stale_proofs = [p for p in proofs if proof_is_stale(p)]
+    evidence = [safe_proof_summary(p) for p in sorted(proofs, key=lambda p: p.get("timestamp", ""), reverse=True)[:8]]
+    portfolio_queue = [safe_portfolio_item(item) for item in portfolio_items[:8]]
+    rule_gap_labels = [
+        safe_display_text(gap.get("rule") or gap.get("title") or gap.get("description"), 120)
+        for gap in cockpit.get("critical_rule_gaps", [])
+    ]
+    artifacts = [
+        {
+            "name": safe_artifact_name(a.get("name") or a.get("path")),
+            "kind": safe_display_text(Path(str(a.get("name") or a.get("path") or "artifact")).suffix.lstrip(".") or "artifact", 40),
+            "generated_at": safe_display_text(a.get("mtime") or a.get("generated_at"), 40),
+        }
+        for a in cockpit.get("latest_artifacts", [])[:8]
+    ]
+    autonomous_queue = build_autonomous_queue(paths, portfolio_items)
+    snapshot = {
+        "schema_version": 3,
+        "generated_at": cockpit.get("generated_at"),
+        "trust": {
+            "status": safe_display_text(cockpit.get("trust", {}).get("status") or "unknown", 20),
+            "summary": safe_display_text(cockpit.get("trust", {}).get("summary") or "", 220),
+        },
+        "portfolio_top": safe_portfolio_item(cockpit.get("portfolio_top") or {}),
+        "latest_recommendation": safe_rec,
+        "recommendation": safe_rec,
+        "metric": {
+            "acted_on_rate": metric.get("acted_on_rate", metric.get("rate")),
+            "proved_rate": metric.get("proved_rate"),
+            "gate_target": metric.get("gate_target"),
+            "gate_pass": metric.get("gate_pass"),
+            "proof_gate_pass": metric.get("proof_gate_pass"),
+        },
+        "proof": {
+            "proof_count": len(proofs),
+            "stale_count": len(stale_proofs),
+            "acted_on_rate": metric.get("acted_on_rate", metric.get("rate")),
+            "proved_rate": metric.get("proved_rate"),
+        },
+        "proof_count": len(proofs),
+        "stale_proofs": [safe_proof_summary(p) for p in stale_proofs[:8]],
+        "active_work_count": int(cockpit.get("active_work_count") or 0),
+        "work": {
+            "active_count": int(cockpit.get("active_work_count") or 0),
+            "stuck_count": len(cockpit.get("stuck_work_items", [])),
+        },
+        "stuck_work_items": [
+            {
+                "work_id": safe_display_text(item.get("work_id"), 80),
+                "goal": safe_display_text(item.get("goal"), 180),
+            }
+            for item in cockpit.get("stuck_work_items", [])[:8]
+        ],
+        "critical_rule_gaps": [
+            {"rule": label}
+            for label in rule_gap_labels
+        ],
+        "latest_artifacts": artifacts,
+        "alex_queue": build_alex_queue(cockpit, latest_rec, metric),
+        "autonomous_queue": autonomous_queue,
+        "evidence_ledger": evidence,
+        "portfolio_queue": portfolio_queue,
+        "approval_history": [safe_decision_summary(d) for d in decisions[:8]],
+        "decision_memory": build_decision_memory(decisions),
+        "agent_assignments": build_agent_assignments(decisions, autonomous_queue),
+        "closeout_queue": build_closeout_queue(cockpit, proofs),
+        "health": {
+            "rule_gaps": rule_gap_labels,
+            "tool_warnings": build_tool_warnings(paths),
+        },
+    }
+    snapshot.pop("source_paths", None)
+    return snapshot
+
+
+def render_pfos_cockpit_report(snapshot):
+    rec = snapshot.get("recommendation") or {}
+    proof = snapshot.get("proof") or {}
+    lines = [
+        "# PFOS Pathway Cockpit Snapshot",
+        "",
+        f"Generated: {snapshot.get('generated_at')}",
+        "",
+        "## Recommendation",
+        "",
+        f"- Project: `{rec.get('project') or 'none'}`",
+        f"- Pathway: `{rec.get('pathway') or 'none'}`",
+        f"- Confidence: `{rec.get('confidence') or 'unknown'}`",
+        f"- Proof status: `{rec.get('proof_status') or 'unknown'}`",
+        f"- Why this: {rec.get('why_this') or 'n/a'}",
+        f"- Why not runner-up: {rec.get('why_not_runner_up') or 'n/a'}",
+        "",
+        "## Proof Health",
+        "",
+        f"- Proofs: {proof.get('proof_count', 0)}",
+        f"- Stale: {proof.get('stale_count', 0)}",
+        f"- Acted-on rate: {proof.get('acted_on_rate', 'n/a')}",
+        f"- Proved rate: {proof.get('proved_rate', 'n/a')}",
+        "",
+        "## Alex Queue",
+        "",
+    ]
+    lines.extend(f"- **{item.get('title')}** — {item.get('reason')}" for item in snapshot.get("alex_queue", []))
+    if not snapshot.get("alex_queue"):
+        lines.append("- No Alex-only queue items.")
+    lines += ["", "## Autonomous Queue", ""]
+    lines.extend(f"- **{item.get('title')}** — {item.get('reason')}" for item in snapshot.get("autonomous_queue", []))
+    if not snapshot.get("autonomous_queue"):
+        lines.append("- No safe autonomous queue items.")
+    lines += ["", "## Evidence Ledger", ""]
+    lines.extend(
+        f"- `{item.get('proof_id')}` {item.get('project')} / {item.get('pathway')} — {item.get('status')} ({item.get('artifact_name')})"
+        for item in snapshot.get("evidence_ledger", [])
+    )
+    if not snapshot.get("evidence_ledger"):
+        lines.append("- No proof summaries recorded.")
+    lines += ["", "## Steering", ""]
+    for item in snapshot.get("approval_history", [])[:6]:
+        lines.append(f"- `{item.get('action')}` {item.get('project')} / {item.get('pathway')} — {item.get('reason')}")
+    if not snapshot.get("approval_history"):
+        lines.append("- No pathway decisions recorded.")
+    lines += ["", "## Proof-Backed Closeout", ""]
+    for item in snapshot.get("closeout_queue", [])[:6]:
+        lines.append(f"- `{item.get('work_id')}` {item.get('status')} / proof `{item.get('proof_status')}` — {item.get('reason')}")
+    if not snapshot.get("closeout_queue"):
+        lines.append("- No active work closeout candidates.")
+    return "\n".join(lines) + "\n"
+
+
+def pathway_decision_id(record):
+    return "PD-" + short_hash(
+        record.get("timestamp", ""),
+        record.get("action", ""),
+        record.get("project", ""),
+        record.get("pathway", ""),
+        record.get("recommendation_id", ""),
+        record.get("work_id", ""),
+        record.get("proof_id", ""),
+        record.get("agent", ""),
+        record.get("reason", ""),
+        length=12,
+    )
+
+
+def render_pathway_decision_report(record):
+    lines = [
+        "# Pathway Decision",
+        "",
+        f"Generated: {record.get('timestamp')}",
+        "",
+        f"- Decision: `{record.get('decision_id')}`",
+        f"- Action: `{record.get('action')}`",
+        f"- Project: `{record.get('project') or 'none'}`",
+        f"- Pathway: `{record.get('pathway') or 'none'}`",
+        f"- Recommendation: `{record.get('recommendation_id') or 'none'}`",
+        f"- Work: `{record.get('work_id') or 'none'}`",
+        f"- Proof: `{record.get('proof_id') or 'none'}`",
+        f"- Agent: `{record.get('agent') or 'none'}`",
+        f"- Reason: {record.get('reason') or 'No reason recorded.'}",
+        "",
+        "This record is a steering-memory entry only. It does not execute external actions, shell commands, or production mutations.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def run_pathway_decision(args, paths):
+    allowed = {"approve", "reject", "assign", "closeout"}
+    action = safe_display_text(getattr(args, "action", ""), 30)
+    if action not in allowed:
+        return {
+            "findings": [finding(
+                "pathway-decision-missing-action",
+                "pathway-decision",
+                "warn",
+                "pathway-decision requires --action approve|reject|assign|closeout.",
+                [line_evidence(paths.pathway_decisions_path)],
+                "Pass a valid --action.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+    if action == "assign" and not safe_display_text(getattr(args, "agent", ""), 80):
+        return {
+            "findings": [finding(
+                "pathway-decision-missing-agent",
+                "pathway-decision",
+                "warn",
+                "Assignment decisions require --agent.",
+                [line_evidence(paths.pathway_decisions_path)],
+                "Pass --agent with the assignee label.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+
+    project_raw = getattr(args, "project", "") or ""
+    project = safe_display_text(Path(project_raw).name if "/" in str(project_raw) else project_raw, 80)
+    record = {
+        "timestamp": iso_now(),
+        "action": action,
+        "project": project,
+        "pathway": safe_display_text(getattr(args, "pathway", ""), 40),
+        "recommendation_id": safe_display_text(getattr(args, "recommendation_id", ""), 80),
+        "work_id": safe_display_text(getattr(args, "work_id", ""), 80),
+        "proof_id": safe_display_text(getattr(args, "proof_id", ""), 80),
+        "agent": safe_display_text(getattr(args, "agent", ""), 80),
+        "reason": safe_display_text(getattr(args, "reason", ""), 240),
+        "source": "operating-layer pathway-decision",
+    }
+    record["decision_id"] = pathway_decision_id(record)
+    decisions = read_ndjson(paths.pathway_decisions_path)
+    decisions.append(record)
+    write_ndjson(paths.pathway_decisions_path, decisions)
+    md_path = dated_artifact_path(paths, "pathway-decision")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_pathway_decision_report(record))
+    render_html(md_path, html_path)
+    return {
+        "records": [record],
+        "findings": [],
+        "decision": record,
+        "decision_ledger": str(paths.pathway_decisions_path),
+        "report": str(md_path),
+        "html": str(html_path),
+    }
+
+
+def run_pfos_cockpit(args, paths):
+    snapshot = build_pfos_cockpit(paths)
+    write_json(paths.pfos_cockpit_path, snapshot)
+    md_path = dated_artifact_path(paths, "pfos-cockpit")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_pfos_cockpit_report(snapshot))
+    render_html(md_path, html_path)
+    return {
+        "records": [snapshot],
+        "findings": [],
+        "pfos_cockpit": str(paths.pfos_cockpit_path),
+        "report": str(md_path),
+        "html": str(html_path),
+        "summary": {
+            "trust": snapshot.get("trust", {}).get("status"),
+            "recommendation": (snapshot.get("recommendation") or {}).get("pathway"),
+            "proof_status": (snapshot.get("recommendation") or {}).get("proof_status"),
+            "alex_queue_count": len(snapshot.get("alex_queue", [])),
+            "autonomous_queue_count": len(snapshot.get("autonomous_queue", [])),
+        },
+    }
+
+
+def render_cockpit_report(cockpit):
+    top = cockpit.get("portfolio_top") or {}
+    rec = cockpit.get("latest_recommendation") or {}
+    metric = cockpit.get("metric") or {}
+    lines = [
+        "# Operating Layer Cockpit",
+        "",
+        f"Generated: {cockpit.get('generated_at')}",
+        "",
+        "## What Is Happening",
+        "",
+        f"- Trust: `{cockpit.get('trust', {}).get('status', 'unknown')}` ({cockpit.get('trust', {}).get('summary', '')})",
+        f"- Active work items: {cockpit.get('active_work_count', 0)}",
+        f"- Proofs recorded: {cockpit.get('proof_count', 0)}",
+        f"- Stale proofs: {len(cockpit.get('stale_proofs', []))}",
+        f"- Critical prose-only rule gaps: {len(cockpit.get('critical_rule_gaps', []))}",
+        "",
+        "## What Matters",
+        "",
+        f"- Portfolio top project: `{top.get('project', 'none')}` score={top.get('score', 0)} reason={'; '.join(top.get('reasons', [])[:2])}",
+        f"- Latest recommendation: `{rec.get('project', 'none')}` -> `{rec.get('pathway', 'none')}` ({rec.get('recommendation_id', '')})",
+        f"- Recommendation acted-on rate: {metric.get('acted_on_rate', metric.get('rate', 'n/a'))}",
+        f"- Recommendation proved rate: {metric.get('proved_rate', 'n/a')}",
+        "",
+        "## What To Do Next",
+        "",
+    ]
+    if top:
+        lines.append(f"- Run `pathway-run --project {top.get('project')}` or open the portfolio report for `{top.get('project')}`.")
+    elif rec:
+        lines.append(f"- Continue latest recommendation `{rec.get('recommendation_id')}`.")
+    else:
+        lines.append("- Run `portfolio-next` and `pathway-next --project <project>` to seed the cockpit.")
+    lines += ["", "## Source Links", ""]
+    for label, path in cockpit.get("source_paths", {}).items():
+        lines.append(f"- {label}: `{path}`")
+    lines += ["", "## Latest Artifacts", ""]
+    for artifact in cockpit.get("latest_artifacts", []):
+        lines.append(f"- `{artifact.get('name')}`: `{artifact.get('path')}`")
+    if not cockpit.get("latest_artifacts"):
+        lines.append("- No artifacts found.")
+    return "\n".join(lines) + "\n"
+
+
+def run_cockpit(args, paths):
+    cockpit = build_cockpit(paths)
+    write_json(paths.cockpit_path, cockpit)
+    md_path = dated_artifact_path(paths, "cockpit")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_cockpit_report(cockpit))
+    render_html(md_path, html_path)
+    return {
+        "records": [cockpit],
+        "findings": [],
+        "cockpit": str(paths.cockpit_path),
+        "report": str(md_path),
+        "html": str(html_path),
+        "summary": {
+            "trust": cockpit.get("trust", {}).get("status"),
+            "top_project": (cockpit.get("portfolio_top") or {}).get("project"),
+            "active_work_count": cockpit.get("active_work_count"),
+            "critical_rule_gaps": len(cockpit.get("critical_rule_gaps", [])),
+        },
     }
 
 
@@ -3314,8 +5165,9 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Operating layer workflow CLI")
     parser.add_argument("subcommand", choices=[
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
-        "improve", "compare", "work-start", "work-status", "work-log", "work-close", "work-daily",
-        "pathway-next", "ingest-review", "pathway-metric", "all"
+        "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily",
+        "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
+        "pathway-decision", "ingest-review", "pathway-metric", "all"
     ])
     parser.add_argument("--claude-home", default=str(DEFAULT_CLAUDE_HOME))
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME))
@@ -3332,6 +5184,13 @@ def build_parser():
     parser.add_argument("--evidence", help="Local evidence path for work-log.")
     parser.add_argument("--gate", help="Specific gate or measurement name for work-log.")
     parser.add_argument("--result", help="Measurement result/status for work-log.")
+    parser.add_argument("--action", choices=["approve", "reject", "assign", "closeout"], help="pathway-decision action.")
+    parser.add_argument("--agent", help="pathway-decision assignee label.")
+    parser.add_argument("--reason", help="pathway-decision rationale.")
+    parser.add_argument("--proof-id", help="pathway-decision proof id for proof-backed closeout.")
+    parser.add_argument("--proof-type", help="Proof type to record with proof-add or work-log.")
+    parser.add_argument("--verified-by", help="Command, tool, or reviewer that verified the proof artifact.")
+    parser.add_argument("--recommendation-id", help="pathway-next recommendation_id this proof satisfies.")
     parser.add_argument("--control-risk", help="Create a control from this pathway risk.")
     parser.add_argument("--control-id", help="Existing control id to update.")
     parser.add_argument("--control-status", choices=["open", "resolved"], help="Control status for creation or update.")
@@ -3340,6 +5199,9 @@ def build_parser():
     parser.add_argument("--input", help="review-stack --json input file for ingest-review (or '-' / omit for stdin).")
     parser.add_argument("--window-days", type=int, help="pathway-metric: days after a recommendation to count a matching work-log as acted-on (default 1).")
     parser.add_argument("--gate-target", type=float, help="pathway-metric: minimum acted-on rate to pass the gate (default 0.5).")
+    parser.add_argument("--tier", choices=list(PATHWAY_TIERS.keys()), help="work-start: target 'done' tier sizing the required-pathway itinerary (default live).")
+    parser.add_argument("--na", action="store_true", help="work-cover: mark the pathway not-applicable (requires --reason).")
+    parser.add_argument("--add", action="store_true", help="work-cover: append the pathway to the itinerary as newly required.")
     return parser
 
 
@@ -3369,6 +5231,14 @@ def main(argv=None):
         result = run_improve(args, paths)
     elif args.subcommand == "compare":
         result = run_compare(args, paths)
+    elif args.subcommand == "portfolio-next":
+        result = run_portfolio_next(args, paths)
+    elif args.subcommand == "rule-map":
+        result = run_rule_map(args, paths)
+    elif args.subcommand == "cockpit":
+        result = run_cockpit(args, paths)
+    elif args.subcommand == "pfos-cockpit":
+        result = run_pfos_cockpit(args, paths)
     elif args.subcommand == "work-start":
         result = run_work_start(args, paths)
     elif args.subcommand == "work-status":
@@ -3377,10 +5247,22 @@ def main(argv=None):
         result = run_work_log(args, paths)
     elif args.subcommand == "work-close":
         result = run_work_close(args, paths)
+    elif args.subcommand == "work-cover":
+        result = run_work_cover(args, paths)
     elif args.subcommand == "work-daily":
         result = run_work_daily(args, paths)
+    elif args.subcommand == "proof-add":
+        result = run_proof_add(args, paths)
+    elif args.subcommand == "proof-report":
+        result = run_proof_report(args, paths)
+    elif args.subcommand == "pathway-trust":
+        result = run_pathway_trust(args, paths)
     elif args.subcommand == "pathway-next":
         result = run_pathway_next(args, paths)
+    elif args.subcommand == "pathway-run":
+        result = run_pathway_run(args, paths)
+    elif args.subcommand == "pathway-decision":
+        result = run_pathway_decision(args, paths)
     elif args.subcommand == "ingest-review":
         result = run_ingest_review(args, paths)
     elif args.subcommand == "pathway-metric":
