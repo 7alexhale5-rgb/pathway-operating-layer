@@ -5294,6 +5294,161 @@ def run_all(args, paths):
     }
 
 
+# Gap E (tier calibration) thresholds. A tier needs at least MIN_TIER_CALIBRATION_OUTCOMES closed
+# outcomes before its history is trusted to calibrate anything (one close is noise, not a signal).
+MIN_TIER_CALIBRATION_OUTCOMES = 2
+TIER_NEED_THRESHOLD = 0.5   # proved in >= this fraction of a tier's closes -> empirically needed
+TIER_DROP_THRESHOLD = 0.5   # a DEFAULT pathway marked N/A this often -> over-included (drop candidate)
+TIER_ADD_THRESHOLD = 0.5    # a NON-default pathway proved this often -> under-included (add candidate)
+
+
+def compute_tier_calibration(paths, min_outcomes=MIN_TIER_CALIBRATION_OUTCOMES,
+                             need=TIER_NEED_THRESHOLD, drop=TIER_DROP_THRESHOLD, add=TIER_ADD_THRESHOLD):
+    """Gap E: measure each tier's REAL pathway needs from closed-outcome history and surface where
+    the measured signal diverges from the hardcoded PATHWAY_TIERS default. Advisory only — it never
+    mutates the map (the coverage guarantee forbids silently dropping a pathway); a human adopts
+    confirmed changes by ADR. Tier definitions are global, so it aggregates closed outcomes across
+    ALL projects. A tier with fewer than `min_outcomes` closes makes no calibration claim."""
+    items = read_ndjson(paths.work_items_path)
+    closed = [w for w in items if w.get("status") in ("closed", "done") and w.get("tier") in PATHWAY_TIERS]
+
+    def canon_key(pathway):
+        idx = PATHWAY_CANON_ORDER.index(pathway) if pathway in PATHWAY_CANON_ORDER else len(PATHWAY_CANON_ORDER)
+        return (idx, pathway)  # name tiebreak keeps off-canon pathways deterministically ordered
+
+    tiers = []
+    for tier, default in PATHWAY_TIERS.items():
+        outcomes = [w for w in closed if w.get("tier") == tier]
+        m = len(outcomes)
+        proved, na = {}, {}
+        for w in outcomes:
+            # One status per pathway per outcome (last entry wins) so a duplicated/corrupted
+            # itinerary can never count a pathway twice and push a rate above 1.0.
+            status_by_pathway = {}
+            for entry in w.get("itinerary", []) or []:
+                pathway = entry.get("pathway")
+                if pathway:
+                    status_by_pathway[pathway] = entry.get("status")
+            for pathway, status in status_by_pathway.items():
+                if status == "proved":
+                    proved[pathway] = proved.get(pathway, 0) + 1
+                elif status == "na":
+                    na[pathway] = na.get(pathway, 0) + 1
+        seen = set(proved) | set(na) | set(default)
+        # Raw rates drive the threshold comparisons; rounding is display-only, so a value just under
+        # a threshold can never round up into a claim.
+        raw_proved = {p: (proved.get(p, 0) / m if m else 0.0) for p in seen}
+        raw_na = {p: (na.get(p, 0) / m if m else 0.0) for p in seen}
+        proved_rate = {p: round(raw_proved[p], 3) for p in seen}
+        na_rate = {p: round(raw_na[p], 3) for p in seen}
+        sufficient = m >= min_outcomes
+        default_set = set(default)
+        if sufficient:
+            measured_required = sorted((p for p in seen if raw_proved[p] >= need), key=canon_key)
+            drop_candidates = [{"pathway": p, "na_rate": na_rate[p]}
+                               for p in default if raw_na.get(p, 0.0) >= drop]
+            add_candidates = [{"pathway": p, "proved_rate": proved_rate[p]}
+                              for p in sorted(seen - default_set, key=canon_key)
+                              if raw_proved.get(p, 0.0) >= add]
+        else:
+            measured_required, drop_candidates, add_candidates = [], [], []
+        tiers.append({
+            "tier": tier,
+            "heuristic_default": list(default),
+            "closed_outcomes": m,
+            "sufficient": sufficient,
+            "min_outcomes": min_outcomes,
+            "proved_rate": proved_rate,
+            "na_rate": na_rate,
+            "measured_required": measured_required,
+            "drop_candidates": drop_candidates,
+            "add_candidates": add_candidates,
+            "diverges_from_default": bool(drop_candidates or add_candidates),
+        })
+    return {
+        "metric": "tier calibration (measured tier->pathway defaults)",
+        "generated_at": iso_now(),
+        "thresholds": {"min_outcomes": min_outcomes, "need": need, "drop": drop, "add": add},
+        "tiers": tiers,
+    }
+
+
+def render_tier_calibration_report(cal):
+    th = cal.get("thresholds", {})
+    lines = [
+        "# Tier Calibration — measured tier->pathway defaults",
+        "",
+        f"Generated: {cal.get('generated_at', '')}",
+        "",
+        "The tier->pathway map is a heuristic. This compares it against what closed outcomes actually "
+        "needed (proved) versus did not (marked N/A). **Advisory only** — adopt changes by ADR; the "
+        "engine never auto-edits the map, because silently dropping a pathway would break the coverage guarantee.",
+        "",
+        f"Thresholds: >={int(th.get('need', 0.5) * 100)}% proved = needed · "
+        f">={int(th.get('drop', 0.5) * 100)}% N/A = drop-candidate · "
+        f">={int(th.get('add', 0.5) * 100)}% proved (non-default) = add-candidate · "
+        f"min {th.get('min_outcomes', 2)} closes to calibrate.",
+        "",
+    ]
+    for t in cal.get("tiers", []):
+        lines += [f"## `{t['tier']}` — {t['closed_outcomes']} closed outcome(s)", ""]
+        if not t["sufficient"]:
+            lines += [f"_Insufficient history ({t['closed_outcomes']} < {t['min_outcomes']}) — default unchanged._", ""]
+            continue
+        lines += [
+            f"- **Heuristic default:** {', '.join(t['heuristic_default'])}",
+            f"- **Measured-required:** {', '.join(t['measured_required']) or '—'}",
+        ]
+        if t["drop_candidates"]:
+            lines.append("- **Drop candidates (over-included):** " + ", ".join(
+                f"`{d['pathway']}` (N/A {int(d['na_rate'] * 100)}%)" for d in t["drop_candidates"]))
+        if t["add_candidates"]:
+            lines.append("- **Add candidates (under-included):** " + ", ".join(
+                f"`{a['pathway']}` (proved {int(a['proved_rate'] * 100)}%)" for a in t["add_candidates"]))
+        if not t["diverges_from_default"]:
+            lines.append("- Measured need matches the heuristic default — no change suggested.")
+        lines += [""]
+    lines += [
+        "## Plain-English Summary",
+        "",
+        "**What we're building** — A way to check whether our preset checklists for \"how done is done\" "
+        "match what finished work actually needed.",
+        "",
+        "**Why this piece** — The presets were an educated guess. Now that real projects have finished, we "
+        "can see which steps they always needed and which they always skipped.",
+        "",
+        "**The surprise** — Sometimes a step we assumed was required gets skipped every time, and a step we "
+        "left off the list gets done every time.",
+        "",
+        "**The real problem I caught** — Editing the checklist automatically could let the system quietly drop "
+        "a step that mattered, so this only advises — a person makes the call.",
+        "",
+        "**Where we are right now** — Read-only. It reports the gap between the preset and the evidence and "
+        "changes nothing on its own.",
+        "",
+        "**The one thing left** — A human decides whether to adopt a suggested change. Fully reversible; nothing ships.",
+    ]
+    return "\n".join(lines)
+
+
+def run_tier_calibrate(args, paths):
+    cal = compute_tier_calibration(paths)
+    write_json(paths.operator_intel / "tier-calibration.json", cal)
+    md_path = dated_artifact_path(paths, "tier-calibration")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_tier_calibration_report(cal))
+    render_html(md_path, html_path)
+    return {
+        "records": cal["tiers"],
+        "findings": [],
+        "tiers": cal["tiers"],
+        "thresholds": cal["thresholds"],
+        "written": str(paths.operator_intel / "tier-calibration.json"),
+        "report": str(md_path),
+        "html": str(html_path),
+    }
+
+
 def print_result(result, json_out=False):
     if json_out:
         print(json.dumps(redact_obj(result), indent=2, sort_keys=True))
@@ -5313,7 +5468,7 @@ def build_parser():
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
         "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
-        "pathway-decision", "ingest-review", "pathway-metric", "all"
+        "pathway-decision", "ingest-review", "pathway-metric", "tier-calibrate", "all"
     ])
     parser.add_argument("--claude-home", default=str(DEFAULT_CLAUDE_HOME))
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME))
@@ -5413,6 +5568,8 @@ def main(argv=None):
         result = run_ingest_review(args, paths)
     elif args.subcommand == "pathway-metric":
         result = run_pathway_metric(args, paths)
+    elif args.subcommand == "tier-calibrate":
+        result = run_tier_calibrate(args, paths)
     else:
         result = run_all(args, paths)
     print_result(result, args.json)

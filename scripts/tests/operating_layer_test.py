@@ -1306,6 +1306,58 @@ def test_learning_loop_closed_outcomes_reweight_rankings():
           f"quality={ranked.get('quality',{}).get('score')})")
 
 
+def test_tier_calibration_measures_defaults_from_closed_outcomes():
+    """Gap E (tier calibration): the heuristic tier->pathway map is a guess; closed outcomes are
+    evidence. tier-calibrate measures, per tier, how often each pathway was proved vs marked N/A
+    across closed outcomes, and surfaces where the measured need diverges from the hardcoded
+    default — as ADVICE only (it never mutates the map; the coverage guarantee forbids silent drops)."""
+    reset()
+    wi_path = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    wi_path.parent.mkdir(parents=True, exist_ok=True)
+    # 3 closed "live" outcomes (across different projects — tier defs are global): every default
+    # pathway proved EXCEPT docs (always N/A), plus security (NOT in live's default) always proved.
+    live_default = ["govern", "data", "implementation", "quality", "observability", "release", "docs"]
+    rows = []
+    for i in range(3):
+        itin = [{"pathway": p, "status": ("na" if p == "docs" else "proved")} for p in live_default]
+        itin.append({"pathway": "security", "status": "proved"})
+        if i == 0:
+            itin.append({"pathway": "security", "status": "proved"})  # duplicate entry — must not double-count
+        rows.append({"work_id": f"W-live-{i}", "project_name": f"proj{i}", "status": "closed",
+                     "tier": "live", "itinerary": itin})
+    # 1 closed "demoable" outcome — below the min-outcomes floor, so it earns NO calibration claim.
+    rows.append({"work_id": "W-demo-0", "project_name": "p", "status": "closed", "tier": "demoable",
+                 "itinerary": [{"pathway": "govern", "status": "proved"},
+                               {"pathway": "implementation", "status": "proved"},
+                               {"pathway": "quality", "status": "proved"}]})
+    wi_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    cal, proc = run("tier-calibrate")
+    check(proc.returncode == 0, "tier-calibrate exits 0")
+    tiers = {t["tier"]: t for t in cal.get("tiers", [])}
+    live = tiers.get("live", {})
+    check(live.get("closed_outcomes") == 3, f"live tier counts its 3 closed outcomes (got {live.get('closed_outcomes')})")
+    drop = {d["pathway"] for d in live.get("drop_candidates", [])}
+    add = {a["pathway"] for a in live.get("add_candidates", [])}
+    check("docs" in drop, f"docs (N/A in 3/3 live closes) is a drop candidate (got {drop})")
+    check("security" in add, f"security (proved 3/3, absent from the default) is an add candidate (got {add})")
+    check(live.get("diverges_from_default") is True, "live tier's measured need diverges from the heuristic default")
+    check("implementation" not in drop and "implementation" in set(live.get("measured_required", [])),
+          "consistently-proved defaults are NOT drop candidates and ARE measured-required")
+    # A duplicated itinerary entry (corrupted/hand-edited store) must not push any rate above 1.0.
+    check(all(r <= 1.0 for r in live.get("proved_rate", {}).values())
+          and all(r <= 1.0 for r in live.get("na_rate", {}).values()),
+          f"rates never exceed 1.0 despite a duplicated entry (proved={live.get('proved_rate')})")
+
+    # Falsifiable floor: a tier under the min-outcomes threshold makes NO calibration claim.
+    demo = tiers.get("demoable", {})
+    check(demo.get("sufficient") is False and not demo.get("drop_candidates") and not demo.get("add_candidates"),
+          "a tier below the min-outcomes floor yields no calibration changes (insufficient signal)")
+    # The heuristic map is reported verbatim and the advisory artifact is real on disk.
+    check(live.get("heuristic_default") == live_default, "tier-calibrate reports the heuristic default verbatim")
+    check(Path(cal.get("report", "")).exists(), "tier-calibrate writes an advisory report artifact")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1339,6 +1391,7 @@ def main():
         test_recommendation_follows_evidence_within_itinerary,
         test_suggested_autonomy_tier_gates_on_proof_trust_confidence,
         test_learning_loop_closed_outcomes_reweight_rankings,
+        test_tier_calibration_measures_defaults_from_closed_outcomes,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
