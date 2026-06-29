@@ -123,13 +123,17 @@ re-recommend, do not present a menu.
 
 1. Get the active work ID: `python3 ~/.claude/scripts/operating-layer.py pathway-next --project <project> --json` → read `work_id`.
    - If there is no active work item, switch to START first (ask for the goal if none was given).
-2. The evidence must be a **real file that exists** (a deployed asset, test file, migration,
-   served HTML, report). If the user didn't give one, ask for it — never invent evidence.
+2. Proof needs TWO things — a **real file that exists** (deployed asset, test file, migration,
+   served HTML, report) AND a **named verifier** (`--verified-by`) saying how that artifact was
+   checked (the green test command, the measured delta, the closed-finding link). A bare file is
+   presence, not sufficiency: a pathway only flips to `proved` when both are present. Never invent
+   either — if the user didn't give an artifact, ask for it.
 3. Run:
    ```bash
    python3 ~/.claude/scripts/operating-layer.py work-log \
      --work-id <work_id> --pathway <pathway> --kind verify \
-     --gate <pathway>-gate --evidence <abs-evidence-path> --result pass
+     --gate <pathway>-gate --evidence <abs-evidence-path> --result pass \
+     --proof-type artifact --verified-by "<how the artifact was verified>"
    ```
 4. Re-run ASK so the user sees the new next-best pathway after this one closed out.
 
