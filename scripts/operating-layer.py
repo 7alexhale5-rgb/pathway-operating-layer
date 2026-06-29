@@ -3418,6 +3418,27 @@ def active_work_for_project(paths, project_path, project_name):
 # Distinct from the module-level SEVERITY_WEIGHT (compare/improvement) — this one is pathway-scoring only.
 PATHWAY_SEVERITY_WEIGHT = {"critical": 40, "error": 40, "warn": 5, "info": 1}
 
+# Gap D (learning loop): each closed outcome that proved a pathway dampens that pathway's
+# future urgency by LEARN_DAMPEN_PER_CLOSE, capped at LEARN_DAMPEN_CAP distinct closes. Bounded
+# so it nudges ties and moderate stacks but never overrides a real finding (40), a foundation
+# gate (80/100), or an open control (50) — learning shifts the ranking, it does not hijack it.
+LEARN_DAMPEN_PER_CLOSE = 3
+LEARN_DAMPEN_CAP = 3
+
+
+def learned_pathway_closures(paths, project_name, project_path):
+    """Gap D learning signal: map each pathway to the set of THIS project's closed work_ids
+    that proved it. Sourced from the learning candidates persisted at work-close, so the loop
+    has no effect until the project has real closure history (keeps the scorer a no-op cold)."""
+    closures = {}
+    for cand in read_ndjson(paths.learning_candidates_path):
+        if cand.get("project") != project_name and cand.get("project_path") != project_path:
+            continue
+        work_id = cand.get("work_id", "")
+        for pathway in cand.get("pathways_seen", []) or []:
+            closures.setdefault(pathway, set()).add(work_id)
+    return closures
+
 
 def score_pathways(paths, project_path, project_name, scoped_findings, work_summaries):
     """Score each of the 11 pathways by how much it is the current constraint.
@@ -3474,6 +3495,17 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
     for p in PATHWAY_ORDER:
         if p not in seen and p not in ("research", "govern"):
             bump(p, 4, "Pathway has no run for this project's active work yet.")
+
+    # Learning loop (Gap D): closed outcomes reweight the ranking. A pathway this project has
+    # repeatedly proved-and-closed is, by that demonstrated track record, less likely to be the
+    # current constraint — dampen it so the recommender surfaces pathways not yet demonstrated.
+    # No-op until the project has closure history; bounded so it never overrides a real signal.
+    for pathway, closed_ids in learned_pathway_closures(paths, project_name, project_path).items():
+        n = min(len(closed_ids), LEARN_DAMPEN_CAP)
+        if n and pathway in scores:
+            bump(pathway, -LEARN_DAMPEN_PER_CLOSE * n,
+                 f"Demonstrated: {len(closed_ids)} closed outcome(s) proved {pathway} — "
+                 "deprioritized in favor of pathways not yet demonstrated.")
 
     ranked = sorted(scores.values(), key=lambda s: (-s["score"], PATHWAY_ORDER.index(s["pathway"])))
     return ranked
