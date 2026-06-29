@@ -3869,7 +3869,15 @@ def run_pathway_next(args, paths):
     card = karpathy_card(recommended["pathway"], project_name, args.goal)
     trust = load_pathway_trust_summary(paths)
     has_context = bool(scoped_findings or work_items)
-    confidence = recommendation_confidence(ranked, has_context, trust)
+    # Confidence must reflect the ACTUALLY recommended pathway and the field it competes
+    # in. For a tracked outcome the router chooses among the open-required itinerary, so
+    # confidence compares within that set (recommended is its highest-scored member) — not
+    # against out-of-itinerary foundations. Otherwise why_this/evidence come from the wrong
+    # pathway (e.g. research's foundation reason on an observability pick).
+    ranked_for_confidence = (
+        [r for r in ranked if r["pathway"] in itinerary_open] if itinerary_open else ranked
+    )
+    confidence = recommendation_confidence(ranked_for_confidence, has_context, trust)
     recommendations = read_ndjson(paths.recommendations_path)
     recommendation_id = f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}"
 
