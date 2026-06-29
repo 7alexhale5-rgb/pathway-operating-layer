@@ -1141,6 +1141,31 @@ def test_recommendation_confidence_reflects_evidence():
     check(lvl3 == "high", f"three real signals lift confidence to high (got {lvl3})")
 
 
+def test_recommendation_follows_evidence_within_itinerary():
+    """Gap B part 2: within the open-required itinerary, the next pick follows live
+    evidence (a routed finding) rather than fixed canonical order — once foundations are
+    covered. An error finding on a late-canonical pathway wins over canonical-first."""
+    reset()
+    proj = ROOT / "projects" / "evproj"
+    (proj / ".planning").mkdir(parents=True, exist_ok=True)
+    (proj / "package.json").write_text('{"name":"evproj"}\n', encoding="utf-8")
+    ev = ROOT / "ev.txt"
+    ev.write_text("artifact", encoding="utf-8")
+    # An error finding routed to observability (a late-canonical pathway in the live tier).
+    (proj / ".planning" / "findings.json").write_text(
+        json.dumps([{"id": "obs-gap", "message": "critical journeys carry no traces",
+                     "severity": "error", "pathway": "observability"}]),
+        encoding="utf-8")
+    data, _ = run("work-start", ["--project", str(proj), "--goal", "evidence ordering test", "--tier", "live"])
+    wid = data["work_id"]
+    # Cover the foundation (govern) so foundations no longer force the pick.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "pass", "--proof-type", "artifact", "--verified-by", "test"])
+    rec, _ = run("pathway-next", ["--project", str(proj)])
+    check(rec.get("recommended_pathway") == "observability",
+          f"an error finding steers the next pick to observability over canonical-first data (got {rec.get('recommended_pathway')})")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1171,6 +1196,7 @@ def main():
         test_itinerary_coverage_guarantee,
         test_proof_requires_verifier_not_just_presence,
         test_recommendation_confidence_reflects_evidence,
+        test_recommendation_follows_evidence_within_itinerary,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
