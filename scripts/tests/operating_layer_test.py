@@ -1172,6 +1172,85 @@ def test_recommendation_follows_evidence_within_itinerary():
           f"an error-finding-backed pick is not low confidence (got {conf.get('level')})")
 
 
+def test_suggested_autonomy_tier_gates_on_proof_trust_confidence():
+    """Gap C (autonomy unlock): pathway-next computes ONE field — suggested_autonomy_tier —
+    so the /pathway loop reads it instead of re-deriving the Tier-2 rule from three signals
+    each turn. 'execute-safe' unlocks ONLY when proof rate >= the gate AND trust = pass AND
+    the pick is high-confidence; every other combination fails closed to 'recommend'."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("opl_autonomy_under_test", CLI)
+    opl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(opl)
+
+    # --- Unit truth table: the pure gate (each signal is load-bearing) ---
+    hi, passing = {"level": "high"}, {"status": "pass"}
+    check(opl.suggest_autonomy_tier(0.6, passing, hi)["tier"] == "execute-safe",
+          "proof>=gate + trust pass + high confidence -> execute-safe")
+    check(opl.suggest_autonomy_tier(0.5, passing, hi)["tier"] == "execute-safe",
+          "proof exactly at the 0.5 gate clears it (>=, not >)")
+    check(opl.suggest_autonomy_tier(0.49, passing, hi)["tier"] == "recommend",
+          "proof below gate -> recommend (fail-closed on the metric)")
+    check(opl.suggest_autonomy_tier(0.9, {"status": "fail"}, hi)["tier"] == "recommend",
+          "trust fail -> recommend even with proof + high confidence")
+    check(opl.suggest_autonomy_tier(0.9, passing, {"level": "medium"})["tier"] == "recommend",
+          "medium confidence -> recommend (Tier 2 needs high)")
+    check(opl.suggest_autonomy_tier(0.9, {}, hi)["tier"] == "recommend",
+          "unknown trust -> recommend (fail-closed)")
+
+    # --- Integration: the field is wired into pathway-next and computed from real state ---
+    reset()
+    proj = ROOT / "projects" / "autoproj"
+    (proj / ".planning").mkdir(parents=True, exist_ok=True)
+    (proj / "package.json").write_text('{"name":"autoproj"}\n', encoding="utf-8")
+    (proj / "src").mkdir(parents=True, exist_ok=True)
+    (proj / "src" / "index.ts").write_text("export const x = 1;\n", encoding="utf-8")
+    ev = ROOT / "auto-ev.txt"
+    ev.write_text("artifact", encoding="utf-8")
+    # Three error findings routed to quality -> a high-confidence pick once govern is covered.
+    (proj / ".planning" / "findings.json").write_text(
+        json.dumps([
+            {"id": "q1", "message": "flaky e2e suite", "severity": "error", "pathway": "quality"},
+            {"id": "q2", "message": "no coverage gate in CI", "severity": "error", "pathway": "quality"},
+            {"id": "q3", "message": "lint disabled on merge", "severity": "error", "pathway": "quality"},
+        ]),
+        encoding="utf-8")
+    trust, _ = run("pathway-trust", ["--project", str(proj)])
+    check(trust.get("status") == "pass", f"trust passes for the test project (got {trust.get('status')})")
+    start, _ = run("work-start", ["--project", str(proj), "--goal", "harden the quality bar", "--tier", "demoable"])
+    wid = start["work_id"]
+
+    # Fresh project: no proof track record yet -> fail-closed to recommend.
+    first, _ = run("pathway-next", ["--project", str(proj)])
+    check(first.get("suggested_autonomy_tier") == "recommend",
+          f"no proof history -> recommend (got {first.get('suggested_autonomy_tier')})")
+    check(first.get("recommended_pathway") == "govern",
+          f"foundation govern is recommended first (got {first.get('recommended_pathway')})")
+    gov_rec = first["recommendation_id"]
+
+    # Prove the govern recommendation -> the proof track record now clears the 0.5 gate.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact",
+                     "--verified-by", "python3 tests (green)", "--recommendation-id", gov_rec])
+
+    # Next determine turn: govern covered -> quality (3 error findings) is the high-confidence
+    # pick; the single prior recommendation is proved -> proved_rate 1.0; trust pass.
+    # All three signals clear -> execute-safe.
+    second, _ = run("pathway-next", ["--project", str(proj)])
+    check(second.get("recommended_pathway") == "quality",
+          f"after govern, evidence steers the pick to quality (got {second.get('recommended_pathway')})")
+    check(second.get("recommendation_confidence", {}).get("level") == "high",
+          f"three error findings make quality high-confidence (got {second.get('recommendation_confidence', {}).get('level')})")
+    check(second.get("suggested_autonomy_tier") == "execute-safe",
+          f"proof>=gate + trust pass + high confidence -> execute-safe (got {second.get('suggested_autonomy_tier')})")
+    rat = second.get("autonomy_rationale", {})
+    check(rat.get("proved_rate", 0) >= 0.5 and rat.get("trust_status") == "pass" and rat.get("confidence_level") == "high",
+          f"rationale exposes the three deciding inputs (got {rat})")
+    check(rat.get("fresh") is True, "autonomy rationale is computed fresh this determine turn")
+    report_text = Path(second["report"]).read_text(encoding="utf-8")
+    check("## Suggested Autonomy" in report_text and "execute-safe" in report_text,
+          "pathway-next report renders the suggested autonomy tier")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1203,6 +1282,7 @@ def main():
         test_proof_requires_verifier_not_just_presence,
         test_recommendation_confidence_reflects_evidence,
         test_recommendation_follows_evidence_within_itinerary,
+        test_suggested_autonomy_tier_gates_on_proof_trust_confidence,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")

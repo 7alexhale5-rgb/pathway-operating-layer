@@ -3539,7 +3539,49 @@ def recommendation_confidence(ranked, has_context, trust):
     }
 
 
-def render_pathway_next_report(paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources=None, trust=None, confidence=None):
+def suggest_autonomy_tier(proved_rate, trust, confidence, gate_target=0.5):
+    """Engine-side computation of the LOOP autonomy tier (see commands/pathway.md), so the
+    /pathway skill reads ONE field instead of re-deriving the Tier-2 rule from three signals
+    every turn. Tier-2 `execute-safe` unlocks ONLY when the proof track record clears the gate
+    AND trust passes AND the pick is high-confidence; every other combination stays Tier-1
+    `recommend`. Tier-3 `execute-build` is never suggested by the engine — it requires an
+    explicit per-session human grant. Fail-closed: any missing/ambiguous signal -> recommend.
+
+    Computed at determine time inside pathway-next, so the tier is fresh by construction —
+    this is exactly the staleness fail-closed the skill warns about, now enforced in code.
+    """
+    rate = proved_rate if isinstance(proved_rate, (int, float)) else 0.0
+    trust_status = (trust or {}).get("status", "unknown")
+    level = (confidence or {}).get("level", "low")
+    proved_ok = rate >= gate_target
+    trust_ok = trust_status == "pass"
+    conf_ok = level == "high"
+    tier = "execute-safe" if (proved_ok and trust_ok and conf_ok) else "recommend"
+    blockers = []
+    if not proved_ok:
+        blockers.append(f"proof rate {rate} is below the {gate_target} gate")
+    if not trust_ok:
+        blockers.append(f"trust is {trust_status}, not pass")
+    if not conf_ok:
+        blockers.append(f"confidence is {level}, not high")
+    why = (
+        "proof rate, trust, and confidence all clear the Tier-2 bar — the loop may auto-run the "
+        "local, reversible portion of the safe pathways without waiting for a go"
+        if tier == "execute-safe"
+        else "stays in recommend (Tier 1) because " + "; ".join(blockers)
+    )
+    return {
+        "tier": tier,
+        "proved_rate": rate,
+        "trust_status": trust_status,
+        "confidence_level": level,
+        "gate_target": gate_target,
+        "fresh": True,
+        "why": why,
+    }
+
+
+def render_pathway_next_report(paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources=None, trust=None, confidence=None, autonomy=None):
     sources = sources or {}
     trust = trust or {"status": "unknown", "summary": "pathway-trust has not run yet"}
     confidence = confidence or recommendation_confidence(ranked, has_context, trust)
@@ -3588,6 +3630,17 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
     if missing:
         lines += ["", "Missing evidence:"]
         lines.extend(f"- {item}" for item in missing)
+    if autonomy:
+        lines += [
+            "",
+            "## Suggested Autonomy",
+            "",
+            f"- **Tier:** `{autonomy.get('tier', 'recommend')}`",
+            f"- **Why:** {autonomy.get('why', '')}",
+            f"- **Inputs:** proof rate {autonomy.get('proved_rate', 0)} · trust "
+            f"`{autonomy.get('trust_status', 'unknown')}` · confidence "
+            f"`{autonomy.get('confidence_level', 'unknown')}` (gate {autonomy.get('gate_target', 0.5)})",
+        ]
     lines += [
         "",
         "## The 1% operator move",
@@ -3878,6 +3931,13 @@ def run_pathway_next(args, paths):
         [r for r in ranked if r["pathway"] in itinerary_open] if itinerary_open else ranked
     )
     confidence = recommendation_confidence(ranked_for_confidence, has_context, trust)
+    # Gap C (autonomy unlock): the engine — not the skill — computes the LOOP autonomy tier,
+    # from the proof track record (fresh this turn), trust, and the recommended pick's
+    # confidence. The /pathway loop reads `suggested_autonomy_tier` instead of re-deriving the
+    # Tier-2 rule. proved_rate is measured over PRIOR recommendations (this run's rec is logged
+    # below, after), so it reflects the established track record, never the just-issued pick.
+    autonomy = suggest_autonomy_tier(
+        compute_pathway_metric(paths).get("proved_rate", 0.0), trust, confidence)
     recommendations = read_ndjson(paths.recommendations_path)
     recommendation_id = f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}"
 
@@ -3902,7 +3962,8 @@ def run_pathway_next(args, paths):
     md_path = dated_artifact_path(paths, f"pathway-next-{safe_slug(project_name)}")
     html_path = md_path.with_suffix(".html")
     write_text(md_path, render_pathway_next_report(
-        paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources, trust, confidence))
+        paths, project_name, recommended, ranked, card, work_id, next_command, has_context,
+        sources, trust, confidence, autonomy))
     render_html(md_path, html_path)
 
     # Log the recommendation so pathway-metric can measure follow-through (govern metric).
@@ -3915,6 +3976,7 @@ def run_pathway_next(args, paths):
         "runner_up_pathway": confidence.get("runner_up_pathway", ""),
         "why_this": confidence.get("why_this", ""),
         "why_not_runner_up": confidence.get("why_not_runner_up", ""),
+        "suggested_autonomy_tier": autonomy["tier"],
         "timestamp": iso_now(),
     })
     write_ndjson(paths.recommendations_path, recommendations)
@@ -3944,6 +4006,8 @@ def run_pathway_next(args, paths):
         "pathway_trust": trust,
         "recommendation_id": recommendation_id,
         "recommendation_confidence": confidence,
+        "suggested_autonomy_tier": autonomy["tier"],
+        "autonomy_rationale": autonomy,
         "itinerary": (active_summary or {}).get("itinerary", []) if active_summary else [],
         "itinerary_coverage": (active_summary or {}).get("itinerary_coverage", {}) if active_summary else {},
         "report": str(md_path),
@@ -4136,12 +4200,13 @@ def run_ingest_review(args, paths):
     }
 
 
-def run_pathway_metric(args, paths):
-    """Recommendation-action rate (the pathway system's govern metric):
-    of pathway-next recommendations, the fraction that got a matching work-log run
-    (same project+pathway) within --window-days. <gate-target means dashboard, not operating layer."""
-    window_days = args.window_days if args.window_days is not None else 1
-    gate_target = args.gate_target if args.gate_target is not None else 0.5
+def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
+    """Pure computation of the recommendation action+proof metric — no file write.
+
+    Of pathway-next recommendations, the fraction that got a matching work-log run
+    (acted_on) and the fraction proved (a linked proof record) within --window-days.
+    Shared by run_pathway_metric (which persists it) and run_pathway_next (which reads
+    proved_rate to suggest an autonomy tier — fresh by construction, computed this turn)."""
     recs = read_ndjson(paths.recommendations_path)
     runs = read_ndjson(paths.pathway_runs_path)
     proofs = read_ndjson(paths.proofs_path)
@@ -4226,9 +4291,19 @@ def run_pathway_metric(args, paths):
         "proof_gate_pass": (total > 0 and proved_rate >= gate_target),
         "by_pathway": by_pathway,
     }
+    return metric
+
+
+def run_pathway_metric(args, paths):
+    """Recommendation-action rate (the pathway system's govern metric):
+    of pathway-next recommendations, the fraction that got a matching work-log run
+    (same project+pathway) within --window-days. <gate-target means dashboard, not operating layer."""
+    window_days = args.window_days if args.window_days is not None else 1
+    gate_target = args.gate_target if args.gate_target is not None else 0.5
+    metric = compute_pathway_metric(paths, window_days, gate_target)
     write_json(paths.operator_intel / "pathway-metric.json", metric)
     return {
-        "records": recs,
+        "records": read_ndjson(paths.recommendations_path),
         "findings": [],
         "metric": metric,
         "written": str(paths.operator_intel / "pathway-metric.json"),
