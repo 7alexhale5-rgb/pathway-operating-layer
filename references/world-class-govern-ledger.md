@@ -1,0 +1,35 @@
+# Govern Ledger — /pathway → world-class
+
+**Outcome:** W-20260629-pathway-operating-layer-elevate-pathway-to-world-2819f3
+**Decision:** What falsifiable metric does the "world-class" upgrade move, and what is the gate number?
+
+## The metric that matters (Gap A — the keystone)
+
+**Today's failure:** `proved` means a proof *file exists*, not that a *verification passed*. A pathway
+is marked covered by logging any artifact. Coverage is presence, not sufficiency.
+
+**The world-class bar:** `proved` requires a **recorded verifier result**, not just an evidence file.
+
+**Falsifiable gate (red→green):**
+- `work-log --evidence <real file>` with **no** verifier recorded → pathway stays `required`
+  (a bare artifact is NOT proof).
+- `work-log --evidence <real file> --verified-by "<cmd>"` (a named verification) → pathway flips `proved`.
+- A regression test asserts both, **fails on the pre-upgrade engine** (presence-only proves) and
+  **passes after** the change. The native runner stays 100% green.
+
+**Cost/risk:** Low. Extends the existing proof system (`--verified-by` / proof records) rather than
+adding machinery; backward-compatible (bare `work-start` without a tier stays loose-tracking). No
+external surface, no deploy.
+
+## Backlog metrics (later loop iterations, recorded so they aren't lost)
+
+- **Gap B — evidence-grounded recommender:** confidence rises from `low` when a repo carries live
+  signals (seed a project with an open finding → `pathway-next` confidence ≠ `low`). Falsifiable.
+- **Gap C — autonomy unlock:** follows B (no separate metric — it is gated on B's confidence).
+- **Gap D — learning loop:** closed outcomes reweight rankings; measurable as ranking shift after N closes.
+- **Gap E — tier calibration:** replace the heuristic tier→pathway map with measured defaults.
+
+## Scope locked for THIS loop
+
+Ship **Gap A end-to-end with proof** (the one move from the eval). B–E are recorded above and
+deferred to later loop turns. One thing, end-to-end, against a falsifiable number — Karpathy ladder.

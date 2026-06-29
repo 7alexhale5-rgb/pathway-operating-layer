@@ -2293,6 +2293,12 @@ def work_status_summary(paths, work_id):
     pathways_seen = sorted(set(r.get("pathway") for r in runs if r.get("pathway")))
     missing_core_pathways = [p for p in PATHWAY_ORDER if p not in pathways_seen]
     covered, total, itinerary_open = itinerary_coverage(item)
+    # Observability (Gap A): a required pathway that already has a run logged is "logged
+    # but unverified" — evidence was recorded without a named verifier, so it didn't meet
+    # the sufficiency bar. Surfacing it tells the operator WHY a pathway isn't proved
+    # rather than leaving it indistinguishable from never-started.
+    run_pathways = {r.get("pathway") for r in runs}
+    unverified = [p for p in itinerary_open if p in run_pathways]
     # The coverage gate: an outcome is NOT ready while any itinerary pathway is still
     # owed proof. work-close reads this readiness, so it inherits the refusal for free.
     ready = bool(item and runs and not open_controls and not missing_evidence and not stale and not itinerary_open)
@@ -2303,7 +2309,7 @@ def work_status_summary(paths, work_id):
         "controls": controls,
         "tier": (item or {}).get("tier", ""),
         "itinerary": (item or {}).get("itinerary", []),
-        "itinerary_coverage": {"covered": covered, "total": total, "open": itinerary_open},
+        "itinerary_coverage": {"covered": covered, "total": total, "open": itinerary_open, "logged_unverified": unverified},
         "pathway_coverage": {
             "seen": pathways_seen,
             "missing_core": missing_core_pathways,
@@ -3074,11 +3080,13 @@ def run_work_log(args, paths):
         write_proof_report(paths, read_ndjson(paths.proofs_path))
     if item:
         updates = {"last_pathway": args.pathway, "last_run_id": run_id}
-        # Mark the itinerary entry proved ONLY when this log carries a real artifact
-        # that exists on disk. A path string alone (or a bare result=pass) must never
-        # satisfy the gate — otherwise `--evidence /does/not/exist` could fake coverage
-        # and let work-close succeed without proof (Codex P0). Proof = a real file.
-        proved = bool(evidence_path) and Path(evidence_path).is_file()
+        # Mark the itinerary entry proved ONLY when this log carries BOTH (a) a real
+        # artifact that exists on disk AND (b) a recorded verifier — a proof record naming
+        # HOW the artifact was checked (--verified-by / --proof-type). A bare file is
+        # presence, not sufficiency; coverage means a named verification passed, not that
+        # something was attached. This is the Gap-A world-class bar (and it subsumes the
+        # earlier Codex P0: a fake path yields no proof record, so it can never prove).
+        proved = bool(proof) and bool(evidence_path) and Path(evidence_path).is_file()
         itinerary = item.get("itinerary") or []
         if proved and itinerary:
             for entry in itinerary:

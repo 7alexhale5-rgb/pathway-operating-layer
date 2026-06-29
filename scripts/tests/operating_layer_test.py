@@ -1047,8 +1047,8 @@ def test_itinerary_coverage_guarantee():
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st["govern"] == "required", "fake/nonexistent evidence path does not mark a pathway proved")
 
-    # A real on-disk artifact proves it.
-    run("work-log", ["--work-id", demo_wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass"])
+    # A real on-disk artifact + a named verifier proves it (Gap A sufficiency bar).
+    run("work-log", ["--work-id", demo_wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier"])
     data, _ = run("work-status", ["--work-id", demo_wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st["govern"] == "proved", "a real on-disk artifact marks the pathway proved")
@@ -1074,11 +1074,35 @@ def test_itinerary_coverage_guarantee():
     check(data.get("closed") is True, "work-close succeeds once every pathway is proved or N/A")
 
     # Fix (Codex + GLM): a tier downgrade retains earned proof.
-    run("work-log", ["--work-id", secure_wid, "--pathway", "security", "--kind", "verify", "--evidence", str(ev), "--result", "pass"])
+    run("work-log", ["--work-id", secure_wid, "--pathway", "security", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier"])
     run("work-start", ["--project", str(proj), "--goal", "production secure dashboard ui", "--tier", "demoable"])
     data, _ = run("work-status", ["--work-id", secure_wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st.get("security") == "proved", "tier downgrade retains earned proof (security stays proved)")
+
+
+def test_proof_requires_verifier_not_just_presence():
+    """Gap A (world-class bar): a pathway is `proved` only by a NAMED verifier (a proof
+    record) plus a real artifact. A bare evidence file is presence, not sufficiency."""
+    reset()
+    proj = ROOT / "projects" / "suff-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    ev = ROOT / "suff-evidence.txt"
+    ev.write_text("artifact", encoding="utf-8")
+    data, _ = run("work-start", ["--project", str(proj), "--goal", "sufficiency bar test", "--tier", "demoable"])
+    wid = data["work_id"]
+
+    # Bare evidence, NO named verifier -> records a run but does NOT prove the pathway.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass"])
+    data, _ = run("work-status", ["--work-id", wid])
+    st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
+    check(st["govern"] == "required", "a bare evidence file with no named verifier does not prove a pathway")
+
+    # Same artifact WITH a named verifier -> proves it.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "pytest -q (green)"])
+    data, _ = run("work-status", ["--work-id", wid])
+    st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
+    check(st["govern"] == "proved", "a real artifact plus a named verifier proves the pathway")
 
 
 def main():
@@ -1109,6 +1133,7 @@ def main():
         test_project_scoping_no_substring_bleed,
         test_pathway_execution_profile_invariants,
         test_itinerary_coverage_guarantee,
+        test_proof_requires_verifier_not_just_presence,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
