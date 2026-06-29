@@ -1105,6 +1105,42 @@ def test_proof_requires_verifier_not_just_presence():
     check(st["govern"] == "proved", "a real artifact plus a named verifier proves the pathway")
 
 
+def test_recommendation_confidence_reflects_evidence():
+    """Gap B: confidence reflects EVIDENCE strength, not only score separation. A pick
+    backed by a real live signal is not 'low' even when a runner-up sits close; a pick
+    carrying only scaffolding reasons (foundation gate / lowest-coverage) stays 'low' on
+    a small gap."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("opl_under_test", CLI)
+    opl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(opl)
+    trust_pass = {"status": "pass"}
+
+    # Small gap (3), but the top pick carries a real finding -> not low.
+    ranked_evidence = [
+        {"pathway": "security", "score": 5, "reasons": ["warn finding [local:x]: anon read exposed"]},
+        {"pathway": "data", "score": 2, "reasons": []},
+    ]
+    lvl = opl.recommendation_confidence(ranked_evidence, True, trust_pass)["level"]
+    check(lvl != "low", f"an evidence-backed pick with a small gap is not low (got {lvl})")
+
+    # Same small gap, but only scaffolding reasons -> stays low (no false confidence).
+    ranked_scaffold = [
+        {"pathway": "research", "score": 5, "reasons": ["Foundation gate: no verified research dossier"]},
+        {"pathway": "govern", "score": 2, "reasons": []},
+    ]
+    lvl2 = opl.recommendation_confidence(ranked_scaffold, True, trust_pass)["level"]
+    check(lvl2 == "low", f"a pick with only scaffolding reasons stays low on a small gap (got {lvl2})")
+
+    # Three real signals -> high (when nothing is missing).
+    ranked_strong = [
+        {"pathway": "security", "score": 12, "reasons": ["error finding a", "error finding b", "warn finding c"]},
+        {"pathway": "data", "score": 10, "reasons": []},
+    ]
+    lvl3 = opl.recommendation_confidence(ranked_strong, True, trust_pass)["level"]
+    check(lvl3 == "high", f"three real signals lift confidence to high (got {lvl3})")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1134,6 +1170,7 @@ def main():
         test_pathway_execution_profile_invariants,
         test_itinerary_coverage_guarantee,
         test_proof_requires_verifier_not_just_presence,
+        test_recommendation_confidence_reflects_evidence,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")

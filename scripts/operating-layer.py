@@ -3505,7 +3505,21 @@ def recommendation_confidence(ranked, has_context, trust):
     trust_status = (trust or {}).get("status", "unknown")
     if trust_status != "pass":
         missing.append(f"pathway-trust status is {trust_status}.")
-    level = "high" if score_gap >= 25 and not missing else "medium" if score_gap >= 8 else "low"
+    # Gap B: confidence reflects EVIDENCE STRENGTH, not only score separation. A pick
+    # backed by real live signals (findings/controls routed to it) is trustworthy even
+    # when a runner-up sits close; a pick with no backing evidence is low even with a gap.
+    # Foundation-gate and default "lowest-coverage" reasons are scaffolding, not evidence.
+    top_reasons = recommended.get("reasons") or []
+    evidence_reasons = [
+        r for r in top_reasons
+        if not r.startswith("Foundation gate:") and "lowest-coverage" not in r
+    ]
+    evidence_count = len(evidence_reasons)
+    level = (
+        "high" if (score_gap >= 25 or evidence_count >= 3) and not missing
+        else "medium" if score_gap >= 8 or evidence_count >= 1
+        else "low"
+    )
     if trust_status == "fail":
         level = "low"
     top_reason = (recommended.get("reasons") or ["lowest-coverage pathway"])[0]
