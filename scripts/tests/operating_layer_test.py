@@ -1164,6 +1164,12 @@ def test_recommendation_follows_evidence_within_itinerary():
     rec, _ = run("pathway-next", ["--project", str(proj)])
     check(rec.get("recommended_pathway") == "observability",
           f"an error finding steers the next pick to observability over canonical-first data (got {rec.get('recommended_pathway')})")
+    # Confidence must describe the RECOMMENDED pathway, not an out-of-itinerary foundation.
+    conf = rec.get("recommendation_confidence", {})
+    check("Foundation gate" not in conf.get("why_this", ""),
+          f"confidence why_this reflects the recommended pathway, not a foundation (got: {conf.get('why_this','')[:50]})")
+    check(conf.get("level") != "low",
+          f"an error-finding-backed pick is not low confidence (got {conf.get('level')})")
 
 
 def main():
