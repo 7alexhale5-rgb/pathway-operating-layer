@@ -1251,6 +1251,61 @@ def test_suggested_autonomy_tier_gates_on_proof_trust_confidence():
           "pathway-next report renders the suggested autonomy tier")
 
 
+def test_learning_loop_closed_outcomes_reweight_rankings():
+    """Gap D (learning loop): closed outcomes reweight future rankings. A pathway the project
+    has repeatedly proved-and-closed is dampened — by that track record it is less likely to be
+    the current constraint — so the recommender shifts toward pathways the project has not yet
+    demonstrated. Measurable as a ranking shift after N closes, and project-scoped (no global bleed)."""
+    reset()
+    proj = ROOT / "projects" / "learnproj"
+    (proj / ".planning").mkdir(parents=True, exist_ok=True)
+    (proj / "package.json").write_text('{"name":"learnproj"}\n', encoding="utf-8")
+    ev = ROOT / "learn-ev.txt"
+    ev.write_text("artifact", encoding="utf-8")
+
+    start, _ = run("work-start", ["--project", str(proj), "--goal", "ship the core slice", "--tier", "demoable"])
+    wid = start["work_id"]
+    # Cover the govern foundation so the next pick is chosen among non-foundation pathways.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact", "--verified-by", "test"])
+
+    # BEFORE any closes: implementation and quality both sit on the completeness nudge; canonical
+    # order puts implementation first. No learning history yet -> the reweight is a no-op.
+    before, _ = run("pathway-next", ["--project", str(proj)])
+    check(before.get("recommended_pathway") == "implementation",
+          f"baseline pick is implementation (canonical-first among tied nudges) (got {before.get('recommended_pathway')})")
+
+    # Simulate prior closes (shape mirrors extract_learning_candidate): 2 learnproj outcomes proved
+    # implementation; 3 OTHER-project outcomes proved quality (must NOT bleed into learnproj).
+    lc_path = ROOT / "out" / "operator-intelligence" / "learning-candidates.ndjson"
+    lc_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"learning_id": f"L-impl-{i}", "work_id": f"W-closed-impl-{i}", "project": "learnproj",
+         "project_path": str(proj), "pathways_seen": ["govern", "implementation"]}
+        for i in range(2)
+    ] + [
+        {"learning_id": f"L-other-{i}", "work_id": f"W-other-q-{i}", "project": "otherproj",
+         "project_path": str(ROOT / "projects" / "otherproj"), "pathways_seen": ["quality"]}
+        for i in range(3)
+    ]
+    lc_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    # AFTER: implementation is dampened below quality -> the pick shifts. quality is undampened
+    # because its closes belong to a DIFFERENT project (if scoping bled, quality would sink lowest
+    # and implementation would win again — so recommended==quality proves both shift AND scoping).
+    after, _ = run("pathway-next", ["--project", str(proj)])
+    check(after.get("recommended_pathway") == "quality",
+          f"after 2 closes proving implementation, the pick shifts to quality (got {after.get('recommended_pathway')})")
+    ranked = {r["pathway"]: r for r in after.get("ranked", [])}
+    check(any("Demonstrated" in reason for reason in ranked.get("implementation", {}).get("reasons", [])),
+          "the dampened pathway carries the learning reason (shift is attributable)")
+    check(not any("Demonstrated" in reason for reason in ranked.get("quality", {}).get("reasons", [])),
+          "quality is NOT dampened by another project's closes (learning is project-scoped)")
+    check(ranked.get("implementation", {}).get("score", 0) < ranked.get("quality", {}).get("score", 0),
+          f"implementation now scores below quality (got impl={ranked.get('implementation',{}).get('score')}, "
+          f"quality={ranked.get('quality',{}).get('score')})")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1283,6 +1338,7 @@ def main():
         test_recommendation_confidence_reflects_evidence,
         test_recommendation_follows_evidence_within_itinerary,
         test_suggested_autonomy_tier_gates_on_proof_trust_confidence,
+        test_learning_loop_closed_outcomes_reweight_rankings,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
