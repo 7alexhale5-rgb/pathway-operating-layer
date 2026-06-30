@@ -3614,7 +3614,12 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
     # No-op until the project has closure history; bounded so it never overrides a real signal.
     for pathway, closed_ids in learned_pathway_closures(paths, project_name, project_path).items():
         n = min(len(closed_ids), LEARN_DAMPEN_CAP)
-        if n and pathway in scores:
+        # Safety (audit P1): never dampen a pathway that carries a LIVE finding or open control this
+        # turn. Past demonstration must not suppress current risk — an always-needed pathway like
+        # security with a fresh warning has to stay surfaced, not get buried by old closures.
+        has_live_signal = any(
+            "finding [" in r or "Open control [" in r for r in scores.get(pathway, {}).get("reasons", []))
+        if n and pathway in scores and not has_live_signal:
             bump(pathway, -LEARN_DAMPEN_PER_CLOSE * n,
                  f"Demonstrated: {len(closed_ids)} closed outcome(s) proved {pathway} — "
                  "deprioritized in favor of pathways not yet demonstrated.")

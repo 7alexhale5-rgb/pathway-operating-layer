@@ -93,17 +93,23 @@ therefore standing on sand, and the whole thing was validated only by dogfooding
   `test_recommender_engages_findings_over_foundation_on_untracked_project`. 321/321.
   **→ NEXT: the remaining P1/P2 below (trivial verifiers, store concurrency, statistical thresholds,
   learning-loop pathology, module split) and a larger external-precision sample (n=3 is a start, not proof).**
-- **P1 · trivial verifier** — `--verify-cmd true` still proves; the engine can't tell a real test from
-  a no-op. Surface `verify_command` in the cockpit for human audit; flag known-trivial patterns.
-- **P1 · store robustness** — NDJSON `open("w")` full-rewrite, no lock/atomicity; concurrent writes
-  lose updates, a killed process truncates the ledger. Move to tempfile+`os.replace`+`flock` or sqlite3.
-- **P1 · arbitrary thresholds** — `0.5` gate + min-2-closes have no statistical basis (n=2 Wilson CI
-  ≈ [7%,93%]). Use confidence-interval gating; require n≥10; publish sample size.
-- **P1 · learning-loop pathology** — proven-pathway dampening (−9) can push an always-needed pathway
-  (security) below a moderate live warning. Dampen finding-classes not pathways; never dampen
-  tier-mandatory safety; decay old closes.
-- **P2** — split the 5,600-line module into packages; derive paths from env (no hardcoded `/Users/alexhale`);
-  entropy-based secret redaction; per-test isolation (`check()` should raise under pytest).
+- **P1 · store robustness — DONE.** All store writes go through `_atomic_write` (tempfile + fsync +
+  `os.replace`), so a killed process can no longer truncate the NDJSON store. (Lost-update races from
+  two concurrent read-modify-write cycles remain out of scope for single-operator use.)
+- **P2 · portability — DONE.** Defaults derive from `$HOME`/env; no hardcoded username. An existing
+  install keeps its legacy store via auto-detection; a fresh clone gets `~/.pathway-operating-layer`.
+- **P1 · learning-loop pathology — DONE.** The dampener now never suppresses a pathway carrying a live
+  finding/control this turn (security with a fresh warning stays surfaced). Test
+  `test_learning_dampener_never_suppresses_a_pathway_with_live_findings`.
+
+### Fast-follow (after the public ship — agreed sequencing)
+- **trivial verifier** — `--verify-cmd true` still proves; flag known-trivial patterns + surface
+  `verify_command` in the cockpit for human audit.
+- **statistical thresholds** — replace the `0.5` point-estimate autonomy gate + min-2 calibration floor
+  with a Wilson lower bound and a real minimum sample; publish sample size with every claim.
+- **module split** — the 5,600-line module → packages (single-file is fine to ship; split for contributors).
+- **larger external-precision sample** — n=3 (0/3 → 3/3) is a start, not proof; judge ~15+ external picks.
+- **misc** — entropy-based secret redaction; per-test isolation (`check()` should raise under pytest).
 
 ## Original scope (Gap A loop)
 

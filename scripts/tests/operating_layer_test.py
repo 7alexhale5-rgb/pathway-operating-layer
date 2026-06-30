@@ -1495,6 +1495,31 @@ def test_recommender_engages_findings_over_foundation_on_untracked_project():
           f"zero project signal must yield LOW confidence, never medium (got {rec2.get('recommendation_confidence', {}).get('level')})")
 
 
+def test_learning_dampener_never_suppresses_a_pathway_with_live_findings():
+    """Learning-loop safety (audit P1): a pathway proved-and-closed before is dampened — UNLESS it
+    carries a live finding/control THIS turn. An always-needed pathway like security with a current
+    warning must never be pushed down the ranking by past closures."""
+    reset()
+    proj = ROOT / "projects" / "secproj"
+    (proj / ".planning").mkdir(parents=True, exist_ok=True)
+    (proj / "package.json").write_text('{"name":"secproj"}\n', encoding="utf-8")
+    (proj / ".planning" / "findings.json").write_text(json.dumps([
+        {"id": "sec-warn", "message": "anon policy too broad on a tenant table", "severity": "warn", "pathway": "security"},
+    ]), encoding="utf-8")
+    # 3 prior closes proved BOTH security and docs (both are dampening candidates, -9 each).
+    lc = ROOT / "out" / "operator-intelligence" / "learning-candidates.ndjson"
+    lc.parent.mkdir(parents=True, exist_ok=True)
+    lc.write_text("".join(json.dumps({
+        "learning_id": f"L-{i}", "work_id": f"W-{i}", "project": "secproj",
+        "project_path": str(proj), "pathways_seen": ["security", "docs"]}) + "\n" for i in range(3)), encoding="utf-8")
+    rec, _ = run("pathway-next", ["--project", str(proj)])
+    ranked = {r["pathway"]: r for r in rec.get("ranked", [])}
+    sec_dampened = any("Demonstrated" in x for x in ranked.get("security", {}).get("reasons", []))
+    docs_dampened = any("Demonstrated" in x for x in ranked.get("docs", {}).get("reasons", []))
+    check(not sec_dampened, "security (carries a live finding) is NOT dampened by past closures")
+    check(docs_dampened, "docs (no live finding) IS still dampened — the guard is selective, not a blanket off-switch")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1533,6 +1558,7 @@ def main():
         test_autonomy_metric_counts_only_verified_proofs,
         test_pathway_evaluate_records_independent_verdicts_and_precision,
         test_recommender_engages_findings_over_foundation_on_untracked_project,
+        test_learning_dampener_never_suppresses_a_pathway_with_live_findings,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
