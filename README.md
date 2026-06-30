@@ -43,6 +43,36 @@ act. This one closes the loop and enforces the parts that are easy to fake:
   independent judge's verdict per recommendation and reports **precision** — so the
   tool's accuracy is a number you can falsify, not a claim it makes about itself.
 
+## How the loop works
+
+```mermaid
+flowchart TD
+    A([pathway-next<br/>“what should I do next?”]) --> B{work tracked?}
+    B -- no --> S[work-start<br/>open an outcome, sized by a ‘done’ tier<br/>→ seeds the coverage itinerary]
+    S --> A
+    B -- yes --> D[Determine<br/>recommended pathway: foundation-first,<br/>then evidence-driven from live findings]
+    D --> T{suggested_autonomy_tier<br/>proof-rate · trust · confidence}
+    T -- recommend --> H[stage the move,<br/>human presses go]
+    T -- execute-safe --> R[auto-run the local,<br/>reversible portion]
+    H --> E[Execute the pathway]
+    R --> E
+    E --> P{Prove<br/>engine RE-RUNS --verify-cmd · exit 0?}
+    P -- "free-text / --reviewer / exit≠0" --> X[stays ‘required’<br/>attestation is not proof]
+    P -- "exit 0" --> V[flips to ‘proved’<br/>real artifact + recorded receipt]
+    X --> A
+    V --> C{Coverage<br/>every itinerary pathway proved or N/A?}
+    C -- no --> A
+    C -- yes --> CL([work-close<br/>outcome closes])
+    CL --> L[Learning loop<br/>closed outcomes reweight future rankings]
+    L -.feeds back.-> D
+    CL --> EV[pathway-evaluate<br/>independent verdict → precision]
+```
+
+The spine is **coverage** (an outcome can’t close until every pathway is proved-with-artifact
+or N/A-with-reason); the gate is **real proof** (a verifier the engine re-runs, not a claim);
+the throttle is the **autonomy tier** (earned, never assumed); and the flywheel is the
+**learning loop** plus independent **evaluation** that keeps the recommendations honest.
+
 ## The method it embodies
 
 This is Andrej Karpathy's spec → verify → build, made operational:
@@ -60,6 +90,20 @@ This is Andrej Karpathy's spec → verify → build, made operational:
 The ranking follows the **Karpathy ladder**: one thing end-to-end against a number, no
 phase collapse, throwaway-v1 first, stop at the threshold. A generic primer on the method
 lives in [`docs/karpathy-method.md`](docs/karpathy-method.md).
+
+### Add the Karpathy skill
+
+The method is also packaged as a drop-in **skill** ([`skills/karpathy/SKILL.md`](skills/karpathy/SKILL.md))
+with three modes — `spec`, `verify`, `audit`. To install it in Claude Code (or any
+agent that loads Markdown skills from a folder):
+
+```bash
+# Claude Code: skills live in ~/.claude/skills/
+cp -r skills/karpathy ~/.claude/skills/karpathy
+# then invoke it: /karpathy spec — <what you're starting>
+```
+
+It is self-contained and references no private tooling, so it works in any environment.
 
 ## Quickstart
 
