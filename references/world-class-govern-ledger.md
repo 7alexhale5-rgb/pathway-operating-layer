@@ -102,14 +102,20 @@ therefore standing on sand, and the whole thing was validated only by dogfooding
   finding/control this turn (security with a fresh warning stays surfaced). Test
   `test_learning_dampener_never_suppresses_a_pathway_with_live_findings`.
 
-### Fast-follow (after the public ship — agreed sequencing)
-- **trivial verifier** — `--verify-cmd true` still proves; flag known-trivial patterns + surface
-  `verify_command` in the cockpit for human audit.
-- **statistical thresholds** — replace the `0.5` point-estimate autonomy gate + min-2 calibration floor
-  with a Wilson lower bound and a real minimum sample; publish sample size with every claim.
-- **module split** — the 5,600-line module → packages (single-file is fine to ship; split for contributors).
-- **larger external-precision sample** — n=3 (0/3 → 3/3) is a start, not proof; judge ~15+ external picks.
-- **misc** — entropy-based secret redaction; per-test isolation (`check()` should raise under pytest).
+### Fast-follow — now research-backed (see [`docs/research/fast-follow-dossiers.md`](../docs/research/fast-follow-dossiers.md))
+Four targeted research dossiers turned the vague items into exact specs (and cut one):
+- **autonomy gate** — implement **Wilson score LB (z=1.96) ≥ 0.5 with a hard floor n ≥ 10** (n=10→k≥8,
+  n=20→k≥14, n=50→k≥31). Replaces the `0.5` point estimate; closed-form, one line, Jeffreys cross-check
+  in tests. *This is the next move — fully specified.*
+- **trivial verifier** — emit a per-proof **verifier receipt**: `verifier_source_sha256` (denylist
+  `true`/`exit 0`/`echo`), `stdout_sha256` + byte floor, coverage∩diff > 0, assertion_count > 0, and a
+  **canary mutant** (flip a byte in a changed line, re-run; a real verifier must now fail) — the keystone check.
+- **evaluation** — a **3-family LLM jury + a ~20-pick Cohen's/Fleiss' κ check** before any precision
+  claim; same-family judges don't count. (n=3 / one judge is not a number.)
+- **bandit — CUT.** Research verdict: not justified at this data scale (need ~thousands of trials for 11
+  arms). Instead *instrument the heuristic* — log score-vector + outcome, surface a rolling per-pathway
+  win-rate, make the dampener an explicit ε-greedy knob; revisit only after ~100 logged outcomes.
+- **still open** — module split; entropy-based secret redaction; per-test isolation (`check()` raises under pytest).
 
 ## Original scope (Gap A loop)
 
