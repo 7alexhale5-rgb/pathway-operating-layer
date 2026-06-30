@@ -53,7 +53,42 @@ external surface, no deploy.
   pathway per outcome), plus raw-rate thresholds + deterministic sort. Proven live: demoable (4 closes)
   measures exactly its default; live (1 close) withholds under the floor.
 
-## Scope locked for THIS loop
+## Post-audit (after A–E shipped): world-class verdict = NOT-YET, keystone fixed
+
+A dual-critic adversarial audit (Codex + GLM-5.2, independent families) on the WHOLE system both
+returned **NOT-YET**, converging on one root: **proof was self-attested theater.** Demonstrated live —
+a junk file + the string `"lol yeah i totally ran the tests, trust me bro"` flipped a pathway to
+`proved`. Everything gated on `proved` (coverage, proof rate, autonomy, learning, calibration) was
+therefore standing on sand, and the whole thing was validated only by dogfooding itself (circular).
+
+- **Keystone — proof realness — SHIPPED:** a pathway now reaches `proved` ONLY via a verifier the
+  engine RE-EXECUTES (`--verify-cmd`, must exit 0 on a non-failing result); bare `--verified-by` is
+  `attested` and cannot prove. Each proof records `verifier_strength` (executed/signed/attested),
+  `exit_code`, `verify_command`, stdout + full-file artifact SHA-256. `compute_pathway_metric` counts
+  only verified proofs, so autonomy can't be farmed by self-attestation. Dual-critic on the diff caught
+  a residual hole — `--reviewer "<name>"` was the same forgery under a different flag — now closed
+  (only `executed` proves; a name is not a verifiable receipt). Falsifiable gate (green, proven live):
+  `--verified-by`/`--reviewer`/`--result fail` → stays `required`; a real exit-0 `--verify-cmd` →
+  `proved`. Tests `test_proof_requires_real_verifier_not_freetext` + `test_autonomy_metric_counts_only_verified_proofs`. 311/311.
+
+## Remaining roadmap to world-class (ranked, from the audit — NOT yet done)
+
+- **P0 · circular validation** — never run blind on a real external project; "tracks its own work" ≠
+  "recommendations are good." Add `pathway-evaluate` + independent correct/wrong/late/missed labels;
+  publish precision/recall on 5+ outside repos before claiming world-class.
+- **P1 · trivial verifier** — `--verify-cmd true` still proves; the engine can't tell a real test from
+  a no-op. Surface `verify_command` in the cockpit for human audit; flag known-trivial patterns.
+- **P1 · store robustness** — NDJSON `open("w")` full-rewrite, no lock/atomicity; concurrent writes
+  lose updates, a killed process truncates the ledger. Move to tempfile+`os.replace`+`flock` or sqlite3.
+- **P1 · arbitrary thresholds** — `0.5` gate + min-2-closes have no statistical basis (n=2 Wilson CI
+  ≈ [7%,93%]). Use confidence-interval gating; require n≥10; publish sample size.
+- **P1 · learning-loop pathology** — proven-pathway dampening (−9) can push an always-needed pathway
+  (security) below a moderate live warning. Dampen finding-classes not pathways; never dampen
+  tier-mandatory safety; decay old closes.
+- **P2** — split the 5,600-line module into packages; derive paths from env (no hardcoded `/Users/alexhale`);
+  entropy-based secret redaction; per-test isolation (`check()` should raise under pytest).
+
+## Original scope (Gap A loop)
 
 Ship **Gap A end-to-end with proof** (the one move from the eval). B–E are recorded above and
 deferred to later loop turns. One thing, end-to-end, against a falsifiable number — Karpathy ladder.

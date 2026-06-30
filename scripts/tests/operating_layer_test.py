@@ -375,7 +375,7 @@ def test_work_close_extracts_learning_candidate():
     run("work-log", [
         "--work-id", work_id, "--pathway", "quality", "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--gate", "quality-gate",
-        "--proof-type", "artifact", "--verified-by", "python3 quality-guard.py",
+        "--proof-type", "artifact", "--verified-by", "python3 quality-guard.py", "--verify-cmd", "true",
     ])
     closed, proc = run("work-close", ["--work-id", work_id])
     check(proc.returncode == 0 and closed.get("closed") is True, "work-close closes ready work")
@@ -595,7 +595,7 @@ def test_pfos_cockpit_snapshot_export_is_browser_safe():
     run("work-log", [
         "--work-id", start["work_id"], "--pathway", rec["recommended_pathway"], "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--gate", "pfos-cockpit-gate",
-        "--proof-type", "artifact", "--verified-by", "python3 /Users/alexhale/.claude/scripts/quality-guard.py",
+        "--proof-type", "artifact", "--verified-by", "python3 /Users/alexhale/.claude/scripts/quality-guard.py", "--verify-cmd", "true",
         "--recommendation-id", rec["recommendation_id"],
     ])
 
@@ -836,7 +836,7 @@ def test_proof_registry_and_proved_metric():
     logged, _proc = run("work-log", [
         "--work-id", work_id, "--pathway", pathway, "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--gate", f"{pathway}-gate",
-        "--proof-type", "artifact", "--verified-by", "python3 tests", "--recommendation-id", recommendation_id,
+        "--proof-type", "artifact", "--verified-by", "python3 tests", "--verify-cmd", "true", "--recommendation-id", recommendation_id,
     ])
     check(any(r.get("proof_id") for r in logged.get("records", [])), "work-log writes linked proof metadata")
     proofs_path = ROOT / "out" / "operator-intelligence" / "proofs.ndjson"
@@ -1048,7 +1048,7 @@ def test_itinerary_coverage_guarantee():
     check(st["govern"] == "required", "fake/nonexistent evidence path does not mark a pathway proved")
 
     # A real on-disk artifact + a named verifier proves it (Gap A sufficiency bar).
-    run("work-log", ["--work-id", demo_wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier"])
+    run("work-log", ["--work-id", demo_wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier", "--verify-cmd", "true"])
     data, _ = run("work-status", ["--work-id", demo_wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st["govern"] == "proved", "a real on-disk artifact marks the pathway proved")
@@ -1074,7 +1074,7 @@ def test_itinerary_coverage_guarantee():
     check(data.get("closed") is True, "work-close succeeds once every pathway is proved or N/A")
 
     # Fix (Codex + GLM): a tier downgrade retains earned proof.
-    run("work-log", ["--work-id", secure_wid, "--pathway", "security", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier"])
+    run("work-log", ["--work-id", secure_wid, "--pathway", "security", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier", "--verify-cmd", "true"])
     run("work-start", ["--project", str(proj), "--goal", "production secure dashboard ui", "--tier", "demoable"])
     data, _ = run("work-status", ["--work-id", secure_wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
@@ -1099,7 +1099,7 @@ def test_proof_requires_verifier_not_just_presence():
     check(st["govern"] == "required", "a bare evidence file with no named verifier does not prove a pathway")
 
     # Same artifact WITH a named verifier -> proves it.
-    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "pytest -q (green)"])
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "pytest -q (green)", "--verify-cmd", "true"])
     data, _ = run("work-status", ["--work-id", wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st["govern"] == "proved", "a real artifact plus a named verifier proves the pathway")
@@ -1160,7 +1160,7 @@ def test_recommendation_follows_evidence_within_itinerary():
     wid = data["work_id"]
     # Cover the foundation (govern) so foundations no longer force the pick.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--proof-type", "artifact", "--verified-by", "test"])
+                     "--result", "pass", "--proof-type", "artifact", "--verified-by", "test", "--verify-cmd", "true"])
     rec, _ = run("pathway-next", ["--project", str(proj)])
     check(rec.get("recommended_pathway") == "observability",
           f"an error finding steers the next pick to observability over canonical-first data (got {rec.get('recommended_pathway')})")
@@ -1230,7 +1230,7 @@ def test_suggested_autonomy_tier_gates_on_proof_trust_confidence():
     # Prove the govern recommendation -> the proof track record now clears the 0.5 gate.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
                      "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact",
-                     "--verified-by", "python3 tests (green)", "--recommendation-id", gov_rec])
+                     "--verified-by", "python3 tests (green)", "--verify-cmd", "true", "--recommendation-id", gov_rec])
 
     # Next determine turn: govern covered -> quality (3 error findings) is the high-confidence
     # pick; the single prior recommendation is proved -> proved_rate 1.0; trust pass.
@@ -1267,7 +1267,7 @@ def test_learning_loop_closed_outcomes_reweight_rankings():
     wid = start["work_id"]
     # Cover the govern foundation so the next pick is chosen among non-foundation pathways.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact", "--verified-by", "test"])
+                     "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact", "--verified-by", "test", "--verify-cmd", "true"])
 
     # BEFORE any closes: implementation and quality both sit on the completeness nudge; canonical
     # order puts implementation first. No learning history yet -> the reweight is a no-op.
@@ -1358,6 +1358,83 @@ def test_tier_calibration_measures_defaults_from_closed_outcomes():
     check(Path(cal.get("report", "")).exists(), "tier-calibrate writes an advisory report artifact")
 
 
+def test_proof_requires_real_verifier_not_freetext():
+    """Keystone: a pathway reaches `proved` ONLY via a re-executed verifier that exits 0, or a
+    human sign-off with a hashed artifact. Bare free-text --verified-by is attestation, not
+    verification — it cannot prove (this is what kills the forgery the world-class audit caught)."""
+    reset()
+    proj = ROOT / "projects" / "kproj"
+    proj.mkdir(parents=True, exist_ok=True)
+    ev = ROOT / "k-ev.txt"
+    ev.write_text("artifact", encoding="utf-8")
+    data, _ = run("work-start", ["--project", str(proj), "--goal", "keystone proof test", "--tier", "demoable"])
+    wid = data["work_id"]
+
+    def gov_status():
+        d, _ = run("work-status", ["--work-id", wid])
+        return {e["pathway"]: e["status"] for e in d["summary"]["itinerary"]}["govern"]
+
+    # 1. FORGERY BLOCKED — junk file + garbage free-text, no real verifier -> stays required.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "pass", "--proof-type", "artifact", "--verified-by", "lol trust me bro"])
+    check(gov_status() == "required", "free-text attestation alone does NOT prove a pathway (forgery blocked)")
+
+    # 2. FAILING VERIFIER BLOCKED — a command that exits non-zero cannot prove.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "exit 1"])
+    check(gov_status() == "required", "a verifier command that exits non-zero does not prove")
+
+    # 3. REAL VERIFIER PROVES — an executed command that exits 0 flips to proved, records the receipt.
+    out, _ = run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "true"])
+    check(gov_status() == "proved", "a re-executed verifier exiting 0 proves the pathway")
+    proof = [r for r in out.get("records", []) if r.get("verifier_strength")]
+    check(bool(proof) and proof[0]["verifier_strength"] == "executed" and proof[0]["exit_code"] == 0,
+          f"the proof records executed strength + exit code 0 (got {proof[0] if proof else None})")
+
+    # 4. BARE HUMAN ATTESTATION DOES NOT PROVE — a --reviewer NAME is recorded for accountability
+    # (with the artifact hash) but is not a verifiable receipt, so it cannot flip to proved on its
+    # own. (A dual-critic pass caught --reviewer as the same forgery the keystone killed under a
+    # different flag.) Only a re-executed verifier proves; verifiable human sign-off is future work.
+    out2, _ = run("work-log", ["--work-id", wid, "--pathway", "quality", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "pass", "--proof-type", "artifact", "--reviewer", "god"])
+    d, _ = run("work-status", ["--work-id", wid])
+    qstat = {e["pathway"]: e["status"] for e in d["summary"]["itinerary"]}["quality"]
+    sproof = [r for r in out2.get("records", []) if r.get("verifier_strength")]
+    check(qstat == "required", "a bare reviewer name does NOT prove (a name is not a verifiable receipt)")
+    check(bool(sproof) and sproof[0]["verifier_strength"] == "signed" and bool(sproof[0].get("artifact_sha256")),
+          "the reviewer attestation is still recorded (signed strength + artifact hash) for accountability")
+
+
+def test_autonomy_metric_counts_only_verified_proofs():
+    """Keystone (independence): the proof rate that gates autonomy counts ONLY verified proofs.
+    A free-text attestation cannot raise proved_rate, so execute-safe can't be farmed by self-
+    attesting trivial recommendations."""
+    reset()
+    write("projects/consult-ops/README.md", "# ConsultOps\n")
+    evidence = write("out/operator-artifacts/k-proof.md", "proof\n")
+    project_path = str(ROOT / "projects" / "consult-ops")
+
+    rec, _ = run("pathway-next", ["--project", project_path])
+    rid, pathway = rec["recommendation_id"], rec["recommended_pathway"]
+    start, _ = run("work-start", ["--project", project_path, "--goal", "metric independence"])
+    wid = start["work_id"]
+
+    # Attested-only proof (free text) — must NOT count toward the autonomy proof rate.
+    run("work-log", ["--work-id", wid, "--pathway", pathway, "--kind", "verify", "--evidence", str(evidence),
+                     "--result", "pass", "--proof-type", "artifact", "--verified-by", "trust me", "--recommendation-id", rid])
+    m_attested, _ = run("pathway-metric", ["--gate-target", "0.5"])
+    check(m_attested["metric"]["proved"] == 0,
+          f"a free-text attestation does not count as a proved recommendation (got {m_attested['metric']['proved']})")
+
+    # A re-executed verifier (exit 0) — counts.
+    run("work-log", ["--work-id", wid, "--pathway", pathway, "--kind", "verify", "--evidence", str(evidence),
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "true", "--recommendation-id", rid])
+    m_verified, _ = run("pathway-metric", ["--gate-target", "0.5"])
+    check(m_verified["metric"]["proved"] >= 1,
+          "a re-executed verifier counts as a proved recommendation")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1392,6 +1469,8 @@ def main():
         test_suggested_autonomy_tier_gates_on_proof_trust_confidence,
         test_learning_loop_closed_outcomes_reweight_rankings,
         test_tier_calibration_measures_defaults_from_closed_outcomes,
+        test_proof_requires_real_verifier_not_freetext,
+        test_autonomy_metric_counts_only_verified_proofs,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
