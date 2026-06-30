@@ -23,10 +23,28 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-DEFAULT_CLAUDE_HOME = Path("/Users/alexhale/.claude")
-DEFAULT_CODEX_HOME = Path("/Users/alexhale/.codex")
-DEFAULT_PROJECTS_ROOT = Path("/Users/alexhale/Projects")
-DEFAULT_OUTPUT_ROOT = Path("/Users/alexhale/Projects/memory-vault")
+# Portable defaults — derived from $HOME (and overridable by env), never a hardcoded username, so
+# the tool runs for anyone who clones it. Every default is also overridable by a CLI flag.
+_HOME = Path(os.environ.get("PATHWAY_HOME") or Path.home())
+DEFAULT_CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME") or (_HOME / ".claude"))
+DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or (_HOME / ".codex"))
+DEFAULT_PROJECTS_ROOT = Path(os.environ.get("PROJECTS_ROOT") or (_HOME / "Projects"))
+
+
+def _default_output_root():
+    """Where the operator-intelligence store lives. Override with $OPERATING_LAYER_OUTPUT_ROOT.
+    Otherwise reuse an existing legacy store if present (preserves continuity for an existing
+    install) and fall back to a clean, neutral per-user location for a fresh clone."""
+    env = os.environ.get("OPERATING_LAYER_OUTPUT_ROOT")
+    if env:
+        return Path(env)
+    legacy = _HOME / "Projects" / "memory-vault"
+    if (legacy / "operator-intelligence").exists():
+        return legacy
+    return _HOME / ".pathway-operating-layer"
+
+
+DEFAULT_OUTPUT_ROOT = _default_output_root()
 RENDERER = DEFAULT_CLAUDE_HOME / "scripts" / "operator-md-to-html.py"
 
 PRUNE_DIRS = {
@@ -514,25 +532,42 @@ def unique_findings(findings):
     return out
 
 
+def _atomic_write(path, write_fn):
+    """Write atomically: fill a tempfile in the same directory, fsync, then os.replace onto the
+    target. A process killed mid-write leaves the original intact instead of truncating the store
+    to zero records (the corruption mode a dual-critic audit flagged). os.replace is atomic on the
+    same filesystem. Note: this prevents corruption/torn writes, not lost updates from two
+    concurrent read-modify-write cycles — single-operator use, so that race is out of scope here."""
+    p = Path(path)
+    mkdir(p.parent)
+    tmp = p.parent / f".{p.name}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            write_fn(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def append_records(path, records):
-    mkdir(Path(path).parent)
-    with open(path, "w", encoding="utf-8") as fh:
+    def _w(fh):
         for rec in records:
-            line = json.dumps(redact_obj(rec), sort_keys=True)
-            fh.write(line + "\n")
+            fh.write(json.dumps(redact_obj(rec), sort_keys=True) + "\n")
+    _atomic_write(path, _w)
 
 
 def write_json(path, obj):
-    mkdir(Path(path).parent)
-    with open(path, "w", encoding="utf-8") as fh:
+    def _w(fh):
         json.dump(redact_obj(obj), fh, indent=2, sort_keys=True)
         fh.write("\n")
+    _atomic_write(path, _w)
 
 
 def write_text(path, text):
-    mkdir(Path(path).parent)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(redact(text))
+    _atomic_write(path, lambda fh: fh.write(redact(text)))
 
 
 def redact_obj(value):
