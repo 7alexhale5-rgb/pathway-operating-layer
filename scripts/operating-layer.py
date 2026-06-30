@@ -749,6 +749,47 @@ def upsert_proof(paths, proof):
     return proofs
 
 
+def proof_is_verified(proof):
+    """Keystone: a proof counts as REAL verification ONLY when a re-executed verifier exited 0
+    on a non-failing result. Free-text attestation (a --verified-by string) and bare human
+    attestation (a --reviewer name) are claims, not verifications — a name is not a verifiable
+    receipt, so it cannot prove on its own (a dual-critic pass caught --reviewer as the same
+    forgery under a different flag). Only `executed` proves; `signed`/`attested` are recorded for
+    accountability but never flip a pathway to `proved` or raise the autonomy proof rate. This is
+    what makes `proved` mean a verification actually passed. (Verifiable human sign-off — a real
+    signature/approval receipt — is a future strengthening of the `signed` tier.)"""
+    if not isinstance(proof, dict):
+        return False
+    if str(proof.get("result", "")).strip().lower() in ("fail", "failed", "error", "missing_evidence"):
+        return False
+    return proof.get("verifier_strength") == "executed" and proof.get("exit_code") == 0
+
+
+def sha256_file(path):
+    """Full-file SHA-256 (streamed), so the recorded artifact_sha256 binds the WHOLE artifact."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def run_verifier_command(command, cwd, timeout=120):
+    """Re-execute an operator-supplied verifier command; return (exit_code, stdout_sha256). The
+    command comes from the operator/agent at the CLI — the same trust boundary as running it in
+    their own shell — so shell=True is acceptable; it is never fed untrusted input. Fail-closed:
+    a command we cannot run returns a non-zero code, so it cannot prove."""
+    try:
+        proc = subprocess.run(command, shell=True, cwd=cwd or None, capture_output=True,
+                              text=True, timeout=timeout)
+        return proc.returncode, hashlib.sha256((proc.stdout or "").encode("utf-8", "replace")).hexdigest()
+    except Exception:
+        return 1, ""
+
+
 def build_proof_record(args, work_item=None, run_id="", measurement_id_value=""):
     evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
     if not evidence_path or not Path(evidence_path).exists():
@@ -768,6 +809,18 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
     if work_item:
         project_path = work_item.get("project", project_path)
         project_name = work_item.get("project_name", project_name)
+    # Keystone: classify HOW the artifact was verified. `executed` = a re-run command (record its
+    # exit code + stdout hash); `signed` = a named human reviewer over a hashed artifact; otherwise
+    # `attested` = a bare --verified-by string, which is a claim, not a verification.
+    reviewer = (getattr(args, "reviewer", None) or "").strip()
+    verify_cmd = getattr(args, "verify_cmd", None)
+    artifact_sha256 = sha256_file(evidence_path)
+    verifier_strength, exit_code, verify_stdout_sha256, verify_command = "attested", None, "", ""
+    if verify_cmd:
+        verifier_strength, verify_command = "executed", verify_cmd
+        exit_code, verify_stdout_sha256 = run_verifier_command(verify_cmd, project_path or str(Path(evidence_path).parent))
+    elif reviewer:
+        verifier_strength = "signed"
     proof = {
         "proof_id": proof_id_for(evidence_path, args.work_id or "", args.pathway or "", proof_type, args.recommendation_id or ""),
         "timestamp": iso_now(),
@@ -780,6 +833,12 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
         "result": args.result or "present",
         "stale_after_days": args.stale_after_days,
         "verified_by": args.verified_by or "",
+        "verifier_strength": verifier_strength,
+        "verify_command": verify_command,
+        "exit_code": exit_code,
+        "verify_stdout_sha256": verify_stdout_sha256,
+        "artifact_sha256": artifact_sha256,
+        "reviewer": reviewer,
         "recommendation_id": args.recommendation_id or "",
         "run_id": run_id,
         "measurement_id": measurement_id_value,
@@ -3034,7 +3093,7 @@ def run_work_log(args, paths):
         "controls_seen": [c.get("control_id") for c in records["controls"] if c.get("work_id") == args.work_id and c.get("status", "open") != "resolved"],
     }
     proof = None
-    if args.proof_type or args.verified_by or args.recommendation_id:
+    if args.proof_type or args.verified_by or args.recommendation_id or getattr(args, "verify_cmd", None) or getattr(args, "reviewer", None):
         proof, proof_finding = build_proof_record(args, work_item=item, run_id=run_id, measurement_id_value=measurement["measurement_id"])
         if proof_finding:
             findings.append(proof_finding)
@@ -3080,13 +3139,14 @@ def run_work_log(args, paths):
         write_proof_report(paths, read_ndjson(paths.proofs_path))
     if item:
         updates = {"last_pathway": args.pathway, "last_run_id": run_id}
-        # Mark the itinerary entry proved ONLY when this log carries BOTH (a) a real
-        # artifact that exists on disk AND (b) a recorded verifier — a proof record naming
-        # HOW the artifact was checked (--verified-by / --proof-type). A bare file is
-        # presence, not sufficiency; coverage means a named verification passed, not that
-        # something was attached. This is the Gap-A world-class bar (and it subsumes the
-        # earlier Codex P0: a fake path yields no proof record, so it can never prove).
-        proved = bool(proof) and bool(evidence_path) and Path(evidence_path).is_file()
+        # Mark the itinerary entry proved ONLY when this log carries (a) a real artifact on disk
+        # AND (b) a proof that is genuinely VERIFIED — a re-executed verifier that exited 0, or a
+        # named human sign-off over a hashed artifact (proof_is_verified). A bare --verified-by
+        # string is attestation, not verification, and can no longer prove. This is the keystone
+        # that makes `proved` — and everything gated on it (coverage, proof rate, autonomy,
+        # learning, calibration) — mean a verification actually passed, not that a string was typed.
+        proved = (bool(proof) and bool(evidence_path) and Path(evidence_path).is_file()
+                  and proof_is_verified(proof))
         itinerary = item.get("itinerary") or []
         if proved and itinerary:
             for entry in itinerary:
@@ -4264,6 +4324,8 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
     def proved(rec):
         rec_ts = parse_ts(rec.get("timestamp"))
         for proof in proofs:
+            if not proof_is_verified(proof):
+                continue  # keystone: attested (free-text) proofs never raise the autonomy proof rate
             proof_rec = proof.get("recommendation_id")
             if proof_rec:
                 if proof_rec != rec.get("recommendation_id"):
@@ -4650,7 +4712,10 @@ def latest_recommendation_proof_status(latest_rec, proofs):
             matches.append(proof)
     if not matches:
         return "missing"
-    return "stale" if all(proof_is_stale(p) for p in matches) else "proved"
+    verified = [p for p in matches if proof_is_verified(p)]
+    if not verified:
+        return "unverified"  # keystone: attested-only proofs don't read as proved in the cockpit
+    return "stale" if all(proof_is_stale(p) for p in verified) else "proved"
 
 
 def safe_latest_recommendation(latest_rec, proofs):
@@ -5490,7 +5555,9 @@ def build_parser():
     parser.add_argument("--reason", help="pathway-decision rationale.")
     parser.add_argument("--proof-id", help="pathway-decision proof id for proof-backed closeout.")
     parser.add_argument("--proof-type", help="Proof type to record with proof-add or work-log.")
-    parser.add_argument("--verified-by", help="Command, tool, or reviewer that verified the proof artifact.")
+    parser.add_argument("--verified-by", help="Free-text label for the verification (attestation only — does NOT prove on its own).")
+    parser.add_argument("--verify-cmd", help="Verifier command the engine RE-EXECUTES; the pathway proves only if it exits 0 (executed proof).")
+    parser.add_argument("--reviewer", help="Named human reviewer signing off over the hashed artifact (signed proof).")
     parser.add_argument("--recommendation-id", help="pathway-next recommendation_id this proof satisfies.")
     parser.add_argument("--control-risk", help="Create a control from this pathway risk.")
     parser.add_argument("--control-id", help="Existing control id to update.")
