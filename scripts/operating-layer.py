@@ -3486,6 +3486,16 @@ PATHWAY_SEVERITY_WEIGHT = {"critical": 40, "error": 40, "warn": 5, "info": 1}
 LEARN_DAMPEN_PER_CLOSE = 3
 LEARN_DAMPEN_CAP = 3
 
+# On an UNTRACKED project (no active work item) a foundation gate is a tiebreaker, not a dominator:
+# big enough to beat a `warn` (5) so a bare project still leans foundation-first, but yielding to a
+# single `error` (40) so real findings drive the pick. (Recommender fix for the 0/3 external miss.)
+UNTRACKED_FOUNDATION_NUDGE = 8
+
+# Reasons that are SCAFFOLDING, not real evidence — they must never count toward recommendation
+# confidence, or a content-free pick gets inflated above `low`. One list so the next scaffolding
+# reason can't silently leak in (a dual-critic caught the completeness-nudge + learning reasons leaking).
+SCAFFOLDING_REASON_MARKERS = ("Foundation gate:", "lowest-coverage", "Pathway has no run", "Demonstrated:")
+
 
 def learned_pathway_closures(paths, project_name, project_path):
     """Gap D learning signal: map each pathway to the set of THIS project's closed work_ids
@@ -3527,11 +3537,17 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
         stale_count += len(summary.get("stale_measurements", []))
         missing_evidence_count += len(summary.get("missing_evidence", []))
 
-    # Foundation gates first.
+    # Foundation gates. For an ACTIVE tracked outcome, govern/research genuinely come first (don't
+    # plan from vague context) — they dominate so the itinerary walks foundations before building.
+    # But on an UNTRACKED project (a cold ASK), defaulting to a foundation gate BURIES the project's
+    # real findings — the measured 0/3 external-precision failure (consult-ops had 36 findings and
+    # got "pin a metric"). So the gate only dominates with active work; untracked, it is a small
+    # tiebreaker and live findings drive the pick.
+    has_active_work = bool(work_summaries)
     if "research" not in seen:
-        bump("research", 100, "Foundation gate: no verified research dossier for this project — cannot plan from vague context.")
+        bump("research", 100 if has_active_work else UNTRACKED_FOUNDATION_NUDGE, "Foundation gate: no verified research dossier for this project — cannot plan from vague context.")
     if "govern" not in seen:
-        bump("govern", 80, "Foundation gate: no recorded decision/metric for this project's active work.")
+        bump("govern", 80 if has_active_work else UNTRACKED_FOUNDATION_NUDGE, "Foundation gate: no recorded decision/metric for this project's active work.")
 
     # Open controls are an explicit downstream-to-upstream signal.
     for c in open_controls:
@@ -3605,14 +3621,19 @@ def recommendation_confidence(ranked, has_context, trust):
     top_reasons = recommended.get("reasons") or []
     evidence_reasons = [
         r for r in top_reasons
-        if not r.startswith("Foundation gate:") and "lowest-coverage" not in r
+        if not any(marker in r for marker in SCAFFOLDING_REASON_MARKERS)
     ]
     evidence_count = len(evidence_reasons)
-    level = (
-        "high" if (score_gap >= 25 or evidence_count >= 3) and not missing
-        else "medium" if score_gap >= 8 or evidence_count >= 1
-        else "low"
-    )
+    # Confidence tracks EVIDENCE, not raw score separation. A foundation gate inflates score_gap
+    # without adding real signal, which used to grant `medium` to a content-free pick on a project
+    # with zero findings (prettyfly-os: research@medium, 0 signals). No real context, or a pick
+    # backed only by scaffolding -> low, always. `high` needs ≥3 real signals and nothing missing.
+    if not has_context or evidence_count == 0:
+        level = "low"
+    elif evidence_count >= 3 and not missing:
+        level = "high"
+    else:
+        level = "medium"
     if trust_status == "fail":
         level = "low"
     top_reason = (recommended.get("reasons") or ["lowest-coverage pathway"])[0]
