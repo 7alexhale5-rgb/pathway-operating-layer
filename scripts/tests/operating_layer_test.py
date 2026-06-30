@@ -1466,6 +1466,35 @@ def test_pathway_evaluate_records_independent_verdicts_and_precision():
     check(Path(summ.get("report", "")).exists(), "pathway-evaluate --summary writes a report artifact")
 
 
+def test_recommender_engages_findings_over_foundation_on_untracked_project():
+    """Recommender fix for the 0/3 external-precision failure: on an UNTRACKED project that carries
+    real findings, pathway-next must engage the findings, not bury them under a foundation gate
+    (govern/research). And confidence must be LOW when there is zero project signal — never the
+    content-free medium that the foundation-gate score inflation used to produce."""
+    reset()
+    # A) untracked project WITH real findings -> the finding's pathway wins, not govern/research.
+    proj = ROOT / "projects" / "findproj"
+    (proj / ".planning").mkdir(parents=True, exist_ok=True)
+    (proj / "package.json").write_text('{"name":"findproj"}\n', encoding="utf-8")
+    (proj / ".planning" / "findings.json").write_text(json.dumps([
+        {"id": "sec1", "message": "anon read exposed on a tenant table", "severity": "error", "pathway": "security"},
+        {"id": "sec2", "message": "service-role key shipped in the client bundle", "severity": "error", "pathway": "security"},
+    ]), encoding="utf-8")
+    rec, _ = run("pathway-next", ["--project", str(proj)])
+    check(rec.get("recommended_pathway") == "security",
+          f"an untracked project with error findings recommends the finding's pathway, not a foundation gate (got {rec.get('recommended_pathway')})")
+    check(rec.get("recommendation_confidence", {}).get("level") != "low",
+          "a finding-backed pick is not low confidence")
+
+    # B) untracked project with NO signal -> confidence is LOW (never the content-free medium default).
+    bare = ROOT / "projects" / "bareproj"
+    bare.mkdir(parents=True, exist_ok=True)
+    (bare / "README.md").write_text("# bare\n", encoding="utf-8")
+    rec2, _ = run("pathway-next", ["--project", str(bare)])
+    check(rec2.get("recommendation_confidence", {}).get("level") == "low",
+          f"zero project signal must yield LOW confidence, never medium (got {rec2.get('recommendation_confidence', {}).get('level')})")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1503,6 +1532,7 @@ def main():
         test_proof_requires_real_verifier_not_freetext,
         test_autonomy_metric_counts_only_verified_proofs,
         test_pathway_evaluate_records_independent_verdicts_and_precision,
+        test_recommender_engages_findings_over_foundation_on_untracked_project,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")

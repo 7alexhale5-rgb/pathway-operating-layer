@@ -81,10 +81,18 @@ therefore standing on sand, and the whole thing was validated only by dogfooding
   advisory-board `late`, prettyfly-os `unnecessary` (research at MEDIUM confidence with ZERO signals).
   Test `test_pathway_evaluate_records_independent_verdicts_and_precision`; live report at
   `memory-vault/operator-artifacts/2026-06-30-pathway-evaluations.md`.
-  **→ NEXT P0 (now well-defined by the measurement): fix the recommender.** Root cause: it falls
-  back to foundation gates (govern/research) and buries real project-local findings; on an untracked
-  project it gives the same content-free default regardless of state, and overstates confidence when
-  signals=0. Engage real findings first; gate confidence on signal volume; re-measure precision.
+  **→ Recommender fix — SHIPPED, precision moved 0/3 → 3/3.** `score_pathways`: foundation gates
+  dominate only with active tracked work; on an untracked project they drop to a +8 tiebreaker so real
+  findings drive the pick. `recommendation_confidence`: level tracks evidence (not foundation-inflated
+  score_gap) — zero signal now yields LOW, never the content-free medium. Re-ran the SAME 3 external
+  projects, independently re-judged (Codex): **3/3 correct** — advisory-board `research/late → quality`
+  (engages the AI-eval gap), prettyfly-os `research/medium → research/low` (honest zero-signal default),
+  consult-ops `govern` confirmed correct (tracked outcome, govern-backed by real governance gaps).
+  Dual-critic: Codex timed out (single-pass noted); GLM found a scaffolding-leak (completeness-nudge +
+  learning reasons counted as evidence) — fixed via one `SCAFFOLDING_REASON_MARKERS` list. Test
+  `test_recommender_engages_findings_over_foundation_on_untracked_project`. 321/321.
+  **→ NEXT: the remaining P1/P2 below (trivial verifiers, store concurrency, statistical thresholds,
+  learning-loop pathology, module split) and a larger external-precision sample (n=3 is a start, not proof).**
 - **P1 · trivial verifier** — `--verify-cmd true` still proves; the engine can't tell a real test from
   a no-op. Surface `verify_command` in the cockpit for human audit; flag known-trivial patterns.
 - **P1 · store robustness** — NDJSON `open("w")` full-rewrite, no lock/atomicity; concurrent writes
