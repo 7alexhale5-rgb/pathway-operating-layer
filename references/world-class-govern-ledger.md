@@ -73,9 +73,18 @@ therefore standing on sand, and the whole thing was validated only by dogfooding
 
 ## Remaining roadmap to world-class (ranked, from the audit — NOT yet done)
 
-- **P0 · circular validation** — never run blind on a real external project; "tracks its own work" ≠
-  "recommendations are good." Add `pathway-evaluate` + independent correct/wrong/late/missed labels;
-  publish precision/recall on 5+ outside repos before claiming world-class.
+- **P0 · circular validation — INSTRUMENTED, and the first signal is damning.** Built
+  `pathway-evaluate` (records an independent judge's verdict per recommendation → precision, counts
+  external/non-self projects). Ran `pathway-next` blind on 3 real external projects (consult-ops,
+  advisory-board, prettyfly-os); an independent judge (Codex/GPT-5) scored the picks: **precision 0.0
+  (0/3)** — consult-ops `wrong` (36 real findings buried under a generic govern/metric gate),
+  advisory-board `late`, prettyfly-os `unnecessary` (research at MEDIUM confidence with ZERO signals).
+  Test `test_pathway_evaluate_records_independent_verdicts_and_precision`; live report at
+  `memory-vault/operator-artifacts/2026-06-30-pathway-evaluations.md`.
+  **→ NEXT P0 (now well-defined by the measurement): fix the recommender.** Root cause: it falls
+  back to foundation gates (govern/research) and buries real project-local findings; on an untracked
+  project it gives the same content-free default regardless of state, and overstates confidence when
+  signals=0. Engage real findings first; gate confidence on signal volume; re-measure precision.
 - **P1 · trivial verifier** — `--verify-cmd true` still proves; the engine can't tell a real test from
   a no-op. Surface `verify_command` in the cockpit for human audit; flag known-trivial patterns.
 - **P1 · store robustness** — NDJSON `open("w")` full-rewrite, no lock/atomicity; concurrent writes

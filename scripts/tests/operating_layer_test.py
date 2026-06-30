@@ -1435,6 +1435,37 @@ def test_autonomy_metric_counts_only_verified_proofs():
           "a re-executed verifier counts as a proved recommendation")
 
 
+def test_pathway_evaluate_records_independent_verdicts_and_precision():
+    """Breaks circular validation: pathway-evaluate records an INDEPENDENT judge's verdict on each
+    recommendation (correct/wrong/...), and --summary reports precision (correct/total) — the first
+    non-self signal that the picks are actually good, not just that the tool tracked its own work."""
+    reset()
+    write("projects/consult-ops/README.md", "# ConsultOps\n")
+    proj = str(ROOT / "projects" / "consult-ops")
+    rec, _ = run("pathway-next", ["--project", proj])
+    rid, pathway = rec["recommendation_id"], rec["recommended_pathway"]
+
+    out, proc = run("pathway-evaluate", ["--recommendation-id", rid, "--project", "consult-ops",
+                    "--pathway", pathway, "--verdict", "correct", "--judge", "glm-5.2",
+                    "--counterfactual", pathway, "--note", "matches the senior-engineer pick"])
+    check(proc.returncode == 0, "pathway-evaluate exits 0")
+    check(any(r.get("verdict") == "correct" for r in out.get("records", [])), "pathway-evaluate records the verdict")
+
+    # A bad verdict is rejected (only the known verdict vocabulary is accepted).
+    bad, _ = run("pathway-evaluate", ["--project", "consult-ops", "--pathway", "docs", "--verdict", "meh", "--judge", "x"])
+    check("pathway-evaluate-bad-verdict" in ids(bad), "an unknown verdict is rejected")
+
+    # Second (independent) verdict: wrong.
+    run("pathway-evaluate", ["--project", "consult-ops", "--pathway", "docs", "--verdict", "wrong",
+                             "--judge", "glm-5.2", "--counterfactual", "security", "--note", "missed the real blocker"])
+    summ, _ = run("pathway-evaluate", ["--summary"])
+    m = summ["summary"]
+    check(m["total"] == 2 and m["correct"] == 1, f"summary counts the recorded verdicts (got {m})")
+    check(abs(m["precision"] - 0.5) < 1e-9, f"precision = correct/total (got {m['precision']})")
+    check(m["external_projects_judged"] >= 1, "external (non-self) projects are counted")
+    check(Path(summ.get("report", "")).exists(), "pathway-evaluate --summary writes a report artifact")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1471,6 +1502,7 @@ def main():
         test_tier_calibration_measures_defaults_from_closed_outcomes,
         test_proof_requires_real_verifier_not_freetext,
         test_autonomy_metric_counts_only_verified_proofs,
+        test_pathway_evaluate_records_independent_verdicts_and_precision,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
