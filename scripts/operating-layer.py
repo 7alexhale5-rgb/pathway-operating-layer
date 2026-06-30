@@ -664,6 +664,7 @@ class Paths:
         self.pathway_run_plans_path = self.operator_intel / "pathway-run-plans.ndjson"
         self.pathway_decisions_path = self.operator_intel / "pathway-decisions.ndjson"
         self.learning_candidates_path = self.operator_intel / "learning-candidates.ndjson"
+        self.evaluations_path = self.operator_intel / "pathway-evaluations.ndjson"
         self.portfolio_next_path = self.operator_intel / "portfolio-next.json"
         self.rule_map_path = self.operator_intel / "rule-map.json"
         self.cockpit_path = self.operator_intel / "cockpit.json"
@@ -5514,6 +5515,101 @@ def run_tier_calibrate(args, paths):
     }
 
 
+# Circular-validation fix: an INDEPENDENT judge records whether a recommendation was the right
+# next move. This is the only non-self signal that the picks are good — distinct from proved_rate
+# (which only measures self-follow-through). Verdict vocabulary kept small and checkable.
+SELF_PROJECT = "pathway-operating-layer"
+VALID_VERDICTS = ("correct", "wrong", "late", "missed_blocker", "unnecessary")
+
+
+def render_evaluations_report(summary, evals):
+    by_verdict = summary.get("by_verdict", {})
+    lines = [
+        "# Pathway Recommendation Evaluation — independent verdicts",
+        "",
+        f"Generated: {summary.get('generated_at', '')}",
+        "",
+        "Independent judges scoring whether `pathway-next` picked the RIGHT next move — the first",
+        "non-self signal that the recommendations are good, not merely that the tool tracked its own work.",
+        "",
+        f"- **Precision (correct / judged):** {summary.get('precision', 0)} "
+        f"({summary.get('correct', 0)}/{summary.get('total', 0)})",
+        f"- **External projects judged (not the tool itself):** {summary.get('external_projects_judged', 0)}",
+        f"- **Verdict mix:** " + (", ".join(f"{k}={v}" for k, v in by_verdict.items()) or "—"),
+        "",
+        "| Project | Recommended | Verdict | Counterfactual | Judge | Note |",
+        "|---|---|---|---|---|---|",
+    ]
+    for e in evals[-50:]:
+        lines.append("| {p} | `{rp}` | {v} | {cf} | {j} | {n} |".format(
+            p=e.get("project", ""), rp=e.get("pathway", ""), v=e.get("verdict", ""),
+            cf=e.get("counterfactual", "") or "—", j=e.get("judge", ""),
+            n=safe_display_text(e.get("note", ""), 60)))
+    if summary.get("external_projects_judged", 0) == 0:
+        lines += ["", "> No EXTERNAL project judged yet — every verdict so far is on the tool itself, which is "
+                  "still circular. Judge `pathway-next` on real outside projects to earn a non-self signal."]
+    return "\n".join(lines)
+
+
+def run_pathway_evaluate(args, paths):
+    evals = read_ndjson(paths.evaluations_path)
+    if getattr(args, "summary", False):
+        total = len(evals)
+        correct = sum(1 for e in evals if e.get("verdict") == "correct")
+        by_verdict = {}
+        for e in evals:
+            by_verdict[e.get("verdict", "?")] = by_verdict.get(e.get("verdict", "?"), 0) + 1
+        external = {e.get("project") for e in evals if e.get("project") and e.get("project") != SELF_PROJECT}
+        summary = {
+            "metric": "recommendation precision (independent judgments)",
+            "generated_at": iso_now(),
+            "total": total,
+            "correct": correct,
+            "precision": round(correct / total, 3) if total else 0.0,
+            "by_verdict": by_verdict,
+            "external_projects_judged": len(external),
+        }
+        write_json(paths.operator_intel / "pathway-evaluations-summary.json", summary)
+        md_path = dated_artifact_path(paths, "pathway-evaluations")
+        html_path = md_path.with_suffix(".html")
+        write_text(md_path, render_evaluations_report(summary, evals))
+        render_html(md_path, html_path)
+        return {"records": evals, "findings": [], "summary": summary, "report": str(md_path), "html": str(html_path)}
+
+    verdict = (args.verdict or "").strip().lower()
+    if verdict not in VALID_VERDICTS:
+        return {"findings": [finding(
+            "pathway-evaluate-bad-verdict", "pathway-evaluate", "warn",
+            f"Verdict must be one of {', '.join(VALID_VERDICTS)} (got {args.verdict!r}).",
+            [line_evidence(paths.evaluations_path)],
+            "Record a verdict: --verdict correct|wrong|late|missed_blocker|unnecessary --judge <who>.",
+            "static", "high")], "records": []}
+    if not (args.judge or "").strip():
+        return {"findings": [finding(
+            "pathway-evaluate-missing-judge", "pathway-evaluate", "warn",
+            "An evaluation needs an independent --judge (who judged the recommendation).",
+            [line_evidence(paths.evaluations_path)],
+            "Pass --judge <identity> — ideally NOT the agent that produced the recommendation.",
+            "static", "high")], "records": []}
+    project = Path(args.project).name if args.project else ""
+    record = {
+        "evaluation_id": f"EVAL-{safe_slug(project)}-{safe_slug(args.pathway or '')}-{len(evals) + 1:04d}",
+        "timestamp": iso_now(),
+        "recommendation_id": args.recommendation_id or "",
+        "project": project,
+        "pathway": args.pathway or "",
+        "verdict": verdict,
+        "counterfactual": getattr(args, "counterfactual", None) or "",
+        "judge": args.judge.strip(),
+        "note": getattr(args, "note", None) or "",
+        "is_self": project == SELF_PROJECT,
+        "source": "operating-layer pathway-evaluate",
+    }
+    evals.append(record)
+    write_ndjson(paths.evaluations_path, evals)
+    return {"records": [record], "findings": [], "evaluation_id": record["evaluation_id"]}
+
+
 def print_result(result, json_out=False):
     if json_out:
         print(json.dumps(redact_obj(result), indent=2, sort_keys=True))
@@ -5533,7 +5629,7 @@ def build_parser():
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
         "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
-        "pathway-decision", "ingest-review", "pathway-metric", "tier-calibrate", "all"
+        "pathway-decision", "ingest-review", "pathway-metric", "tier-calibrate", "pathway-evaluate", "all"
     ])
     parser.add_argument("--claude-home", default=str(DEFAULT_CLAUDE_HOME))
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME))
@@ -5558,6 +5654,11 @@ def build_parser():
     parser.add_argument("--verified-by", help="Free-text label for the verification (attestation only — does NOT prove on its own).")
     parser.add_argument("--verify-cmd", help="Verifier command the engine RE-EXECUTES; the pathway proves only if it exits 0 (executed proof).")
     parser.add_argument("--reviewer", help="Named human reviewer signing off over the hashed artifact (signed proof).")
+    parser.add_argument("--verdict", help="pathway-evaluate verdict: correct|wrong|late|missed_blocker|unnecessary.")
+    parser.add_argument("--judge", help="pathway-evaluate: who independently judged the recommendation.")
+    parser.add_argument("--counterfactual", help="pathway-evaluate: the pathway the judge would have picked instead.")
+    parser.add_argument("--note", help="pathway-evaluate: short free-text rationale for the verdict.")
+    parser.add_argument("--summary", action="store_true", help="pathway-evaluate: report precision across recorded verdicts.")
     parser.add_argument("--recommendation-id", help="pathway-next recommendation_id this proof satisfies.")
     parser.add_argument("--control-risk", help="Create a control from this pathway risk.")
     parser.add_argument("--control-id", help="Existing control id to update.")
@@ -5637,6 +5738,8 @@ def main(argv=None):
         result = run_pathway_metric(args, paths)
     elif args.subcommand == "tier-calibrate":
         result = run_tier_calibrate(args, paths)
+    elif args.subcommand == "pathway-evaluate":
+        result = run_pathway_evaluate(args, paths)
     else:
         result = run_all(args, paths)
     print_result(result, args.json)
