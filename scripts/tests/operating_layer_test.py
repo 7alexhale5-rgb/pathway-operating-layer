@@ -585,7 +585,7 @@ def test_pfos_cockpit_snapshot_export_is_browser_safe():
     reset()
     write("projects/app/.git/HEAD", "ref: refs/heads/main\n")
     write("projects/app/README.md", "# App\n")
-    evidence = write("out/operator-artifacts/proof.md", "proof body with /Users/alexhale/private/source.ts\n")
+    evidence = write("out/operator-artifacts/proof.md", "proof body with /home/dev/private/source.ts\n")
     project_path = str(ROOT / "projects" / "app")
 
     trust, _proc = run("pathway-trust", ["--project", project_path])
@@ -595,7 +595,7 @@ def test_pfos_cockpit_snapshot_export_is_browser_safe():
     run("work-log", [
         "--work-id", start["work_id"], "--pathway", rec["recommended_pathway"], "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--gate", "pfos-cockpit-gate",
-        "--proof-type", "artifact", "--verified-by", "python3 /Users/alexhale/.claude/scripts/quality-guard.py", "--verify-cmd", "true",
+        "--proof-type", "artifact", "--verified-by", "python3 /home/dev/.claude/scripts/quality-guard.py", "--verify-cmd", "true",
         "--recommendation-id", rec["recommendation_id"],
     ])
 
@@ -605,7 +605,7 @@ def test_pfos_cockpit_snapshot_export_is_browser_safe():
         "proof_id": "P-stale",
         "timestamp": "2020-01-01T00:00:00Z",
         "proof_type": "artifact",
-        "evidence_path": "/Users/alexhale/private/raw-evidence.md",
+        "evidence_path": "/home/dev/private/raw-evidence.md",
         "work_id": start["work_id"],
         "pathway": "quality",
         "result": "pass",
@@ -621,7 +621,7 @@ def test_pfos_cockpit_snapshot_export_is_browser_safe():
     approved, approved_proc = run("pathway-decision", [
         "--action", "approve", "--project", project_path, "--pathway", rec["recommended_pathway"],
         "--recommendation-id", rec["recommendation_id"],
-        "--reason", "Approve after python3 /Users/alexhale/private/check.py proved it.",
+        "--reason", "Approve after python3 /home/dev/private/check.py proved it.",
     ])
     check(approved_proc.returncode == 0 and approved.get("decision", {}).get("action") == "approve",
           "pathway-decision records approval")
@@ -644,7 +644,7 @@ def test_pfos_cockpit_snapshot_export_is_browser_safe():
         "id": "tools-auth-broken",
         "workflow": "tools",
         "severity": "warn",
-        "message": "npm run auth-check failed for /Users/alexhale/.env.local",
+        "message": "npm run auth-check failed for /home/dev/.env.local",
     }) + "\n", encoding="utf-8")
 
     run("portfolio-next")
