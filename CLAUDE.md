@@ -20,3 +20,7 @@ the symlinks make changes live immediately.
 ## Design
 
 See `references/pathway-operating-layer.md`.
+
+Per-pathway proof gates (concrete engineering acceptance criteria a critic can fail you on):
+`references/system-design-proof-gates.md`. It also flags where `llm-agent-eval` proof must come
+from elsewhere (agent-output quality is not covered by system-design theory).
