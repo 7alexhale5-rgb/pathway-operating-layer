@@ -12,11 +12,14 @@ import ast
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -67,7 +70,9 @@ MAX_SCAN_FILES = 20_000
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"sk-proj-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"(?i)(?:xai-|xai_api_|gsk_|ghp_|github_pat_|sk-ant-|sk-or-v1-)[A-Za-z0-9_\-]{16,}"),
     re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"(?i)authorization\s*:\s*bearer\s+[^\s,;]+"),
     re.compile(r"\b[A-Za-z0-9_-]{64,}={0,2}\b"),
 ]
 FALSE_PAUSE_RE = re.compile(
@@ -117,19 +122,40 @@ HIGH_LEVERAGE_SKILLS = {
     "pfos-standard-protocol",
 }
 SEVERITY_WEIGHT = {"info": 1, "warn": 3, "critical": 5}
-PATHWAY_ORDER = [
-    "research",
+
+# Canonical execution order is the single source of truth for recommendation tie-breaks
+# and itinerary walking. `field` is an extension pathway: first-class when triggered, but
+# not part of the 11 core pathways or base tier defaults.
+CORE_PATHWAYS = [
     "govern",
+    "research",
     "data",
     "security",
-    "release",
+    "design",
     "implementation",
     "quality",
     "observability",
     "techdebt",
-    "design",
+    "release",
     "docs",
 ]
+EXTENSION_PATHWAYS = ["field"]
+PATHWAY_CANON_ORDER = [
+    "govern",
+    "research",
+    "data",
+    "security",
+    "design",
+    "implementation",
+    "quality",
+    "field",
+    "observability",
+    "techdebt",
+    "release",
+    "docs",
+]
+PATHWAY_ORDER = list(PATHWAY_CANON_ORDER)
+CANONICAL_PATHWAY_CATALOG = "govern, research, data, security, design, implementation, quality, field, observability, techdebt, release, docs"
 
 # === Itinerary: coverage by construction =====================================
 # A "done" tier sizes the set of engineering pathways an outcome MUST cover before
@@ -152,20 +178,279 @@ PATHWAY_KEYWORD_GATES = {
     "design": r"\b(ui|ux|screen|component|page|frontend|front-end|layout|form|dashboard|design|css|tailwind|figma)\b",
     "research": r"\b(new|evaluate|spike|investigate|unknown|unfamiliar|should we|which|compare|explore)\b",
     "data": r"\b(schema|migration|migrate|db|database|table|supabase|postgres|sql|index|column|boundary|tenant)\b",
+    "field": r"\b(client|customer|stakeholder|feedback|approval|review packet|operator validation|field|send-ready|sent)\b",
 }
-
-# Canonical execution order: foundation-first, dependencies before dependents. The
-# router walks the itinerary in this order so govern precedes the slice, research/data
-# precede what builds on them — no skipped foundations.
-PATHWAY_CANON_ORDER = [
-    "govern", "research", "data", "security", "design", "implementation",
-    "quality", "observability", "techdebt", "release", "docs",
-]
 
 DEFAULT_ITINERARY_TIER = "live"
 
+OUTCOME_PROFILES = [
+    {
+        "id": "customer-field-review",
+        "label": "Customer field review",
+        "pattern": r"\b(client|customer|stakeholder|feedback|approval|review packet|send-ready|sent|outreach|field)\b",
+        "default_tier": "live",
+        "required_pathways": ["govern", "field"],
+        "overlays": ["human-gate"],
+    },
+    {
+        "id": "production-secure-launch",
+        "label": "Production-secure launch",
+        "pattern": r"\b(production|prod|public|launch|deploy|external|compliance|tenant|auth|rls|pii|secret)\b",
+        "default_tier": "production-secure",
+        "required_pathways": ["security", "observability", "release"],
+        "overlays": ["production-mutation", "rollback"],
+    },
+    {
+        "id": "data-integration",
+        "label": "Data integration",
+        "pattern": r"\b(schema|migration|migrate|database|db|supabase|postgres|sql|sftp|api|webhook|integration|import|export)\b",
+        "default_tier": "live",
+        "required_pathways": ["data", "security", "quality"],
+        "overlays": ["tenant-authz"],
+    },
+    {
+        "id": "agent-automation",
+        "label": "Agent automation",
+        "pattern": r"\b(agent|llm|prompt|tool call|automation|autonomy|rag|memory|a2a|mcp|eval)\b",
+        "default_tier": "live",
+        "required_pathways": ["security", "quality", "observability"],
+        "overlays": ["llm-agent-eval"],
+    },
+    {
+        "id": "ui-slice",
+        "label": "UI slice",
+        "pattern": r"\b(ui|ux|screen|component|page|frontend|front-end|layout|form|dashboard|a11y|accessibility|responsive|visual)\b",
+        "default_tier": "live",
+        "required_pathways": ["design", "implementation", "quality"],
+        "overlays": ["ui-proof"],
+    },
+    {
+        "id": "tiny-fix",
+        "label": "Tiny fix",
+        "pattern": r"\b(typo|copy edit|tiny fix|small fix|one-line|one line|trivial)\b",
+        "default_tier": "demoable",
+        "required_pathways": ["govern", "quality"],
+        "overlays": [],
+    },
+    {
+        "id": "standard-bugfix",
+        "label": "Standard bugfix",
+        "pattern": r"\b(bug|fix|regression|broken|failure|failing|crash|error)\b",
+        "default_tier": "live",
+        "required_pathways": ["govern", "implementation", "quality"],
+        "overlays": [],
+    },
+]
 
-def compute_itinerary(tier, goal):
+DEFAULT_OUTCOME_PROFILE = {
+    "id": "internal-live-feature",
+    "label": "Internal live feature",
+    "default_tier": DEFAULT_ITINERARY_TIER,
+    "required_pathways": [],
+    "overlays": [],
+}
+
+RISK_OVERLAYS = {
+    "tenant-authz": {
+        "title": "Tenant authorization",
+        "pattern": r"\b(rls|tenant|multi-tenant|authz|authorization|role|membership|client portal|anon|policy|row level)\b",
+        "required_pathways": ["data", "security"],
+    },
+    "privacy-evidence": {
+        "title": "Privacy and evidence hygiene",
+        "pattern": r"\b(pii|phi|hipaa|customer data|client data|screenshot|log|redact|secret|credential|password)\b",
+        "required_pathways": ["security", "docs"],
+    },
+    "production-mutation": {
+        "title": "Production mutation",
+        "pattern": r"\b(production|prod|migration|migrate|deploy|database write|destructive|drop table|delete data|feature flag|flag)\b",
+        "required_pathways": ["data", "security", "release"],
+    },
+    "rollback": {
+        "title": "Rollback",
+        "pattern": r"\b(rollback|release|deploy|canary|rollout|feature flag|flag)\b",
+        "required_pathways": ["release", "observability"],
+    },
+    "supply-chain": {
+        "title": "Supply chain",
+        "pattern": r"\b(dependency|dependencies|lockfile|package|npm audit|cve|sbom|osv|license)\b",
+        "required_pathways": ["security", "techdebt"],
+    },
+    "incident-response": {
+        "title": "Incident response",
+        "pattern": r"\b(incident|sev|alert|runbook|outage|paging|pager|postmortem)\b",
+        "required_pathways": ["observability", "docs", "release"],
+    },
+    "ui-proof": {
+        "title": "Rendered UI proof",
+        "pattern": r"\b(ui|ux|screen|component|page|frontend|front-end|layout|form|dashboard|a11y|accessibility|responsive|visual)\b",
+        "required_pathways": ["design", "quality"],
+    },
+    "llm-agent-eval": {
+        "title": "LLM/agent evaluation",
+        "pattern": r"\b(llm|agent|prompt|tool call|automation|autonomy|hallucination|eval|rag|memory|mcp|a2a)\b",
+        "required_pathways": ["quality", "security", "observability"],
+    },
+    "human-gate": {
+        "title": "Human/customer gate",
+        "pattern": r"\b(client|customer|stakeholder|feedback|approval|review packet|send-ready|sent|outreach|field)\b",
+        "required_pathways": ["field", "govern"],
+    },
+}
+
+
+def pathway_sort_key(pathway):
+    return PATHWAY_CANON_ORDER.index(pathway) if pathway in PATHWAY_CANON_ORDER else 99
+
+
+def _signal_text(*parts):
+    chunks = []
+    for part in parts:
+        if isinstance(part, dict):
+            chunks.extend(str(v) for v in part.values())
+        elif isinstance(part, list):
+            chunks.extend(_signal_text(p) for p in part)
+        elif part:
+            chunks.append(str(part))
+    return " ".join(chunks).lower()
+
+
+def finding_signal_text(scoped_findings):
+    bits = []
+    for item in scoped_findings or []:
+        bits.extend([
+            item.get("id", ""),
+            item.get("message", ""),
+            item.get("workflow", ""),
+            item.get("pathway", ""),
+            item.get("severity", ""),
+        ])
+    return _signal_text(bits)
+
+
+def carry_forward_signal_text(carry_forward):
+    if not carry_forward:
+        return ""
+    bits = [
+        carry_forward.get("summary", ""),
+        carry_forward.get("pathway", ""),
+        carry_forward.get("what_changed", []),
+        carry_forward.get("more_relevant", []),
+        carry_forward.get("less_relevant", []),
+        carry_forward.get("next_pathway_must_use", []),
+        carry_forward.get("do_not_do_yet", []),
+        carry_forward.get("open_decisions", []),
+        carry_forward.get("active_risk_overlays", []),
+    ]
+    return _signal_text(bits)
+
+
+def carry_forward_positive_signal_text(carry_forward):
+    """Signals that can safely classify current work.
+
+    Deferrals (`less_relevant`, `do_not_do_yet`, conditional `next_pathway_must_use`,
+    and open decisions) are constraints, not evidence that a risk is active now. Scanning
+    them as normal text turns "do not add A2A yet" into an active A2A/agent overlay.
+    """
+    if not carry_forward:
+        return ""
+    bits = [
+        carry_forward.get("summary", ""),
+        carry_forward.get("pathway", ""),
+        carry_forward.get("what_changed", []),
+        carry_forward.get("more_relevant", []),
+        carry_forward.get("active_risk_overlays", []),
+    ]
+    return _signal_text(bits)
+
+
+def carry_forward_active_overlay_ids(carry_forward):
+    if not carry_forward:
+        return []
+    return [
+        str(overlay_id).strip()
+        for overlay_id in carry_forward.get("active_risk_overlays", []) or []
+        if str(overlay_id).strip()
+    ]
+
+
+def carry_forward_next_pathways(carry_forward):
+    """Return pathways the baton explicitly says to run/use next.
+
+    This intentionally does not treat every pathway name in the baton as a directive:
+    lines like "if the next recommendation is design" or "future A2A work must re-open
+    security" are guardrails, not current next-pathway orders.
+    """
+    refs = set()
+    for item in carry_forward.get("next_pathway_must_use", []) if carry_forward else []:
+        text = str(item).strip().lower()
+        if not text:
+            continue
+        if re.match(r"^(if|when|any future|future|do not|don't|decide later)\b", text):
+            continue
+        if "when deciding whether" in text or "if the next" in text:
+            continue
+        for pathway in PATHWAY_ORDER:
+            escaped = re.escape(pathway)
+            if re.search(rf"\b{escaped}\b\s+must\s+use\b", text):
+                refs.add(pathway)
+            elif re.search(rf"\b(next|run|recommend|route|handoff|proceed|start|feed)\b[^.:\n]{{0,100}}\b{escaped}\b", text):
+                refs.add(pathway)
+    return sorted(refs, key=pathway_sort_key)
+
+
+def classify_outcome_profile(goal="", project_name="", scoped_findings=None, carry_forward=None):
+    """Choose the outcome shape before scoring pathways.
+
+    Profiles are intentionally coarse. They do not replace proof state; they only seed a
+    better itinerary and make the recommendation explain which kind of development cycle
+    this work appears to be.
+    """
+    text = _signal_text(goal, project_name, carry_forward_positive_signal_text(carry_forward))
+    for profile in OUTCOME_PROFILES:
+        if re.search(profile["pattern"], text):
+            return {k: v for k, v in profile.items() if k != "pattern"}
+    return dict(DEFAULT_OUTCOME_PROFILE)
+
+
+def detect_risk_overlays(goal="", project_name="", scoped_findings=None, carry_forward=None, profile=None):
+    """Detect advisory-but-binding risk overlays.
+
+    Overlays are not new pathway categories; they are reasons to pull existing pathways
+    into the itinerary. The ledger/proof layer remains authoritative for status.
+    """
+    text = _signal_text(goal, project_name, finding_signal_text(scoped_findings),
+                        carry_forward_positive_signal_text(carry_forward))
+    wanted = set((profile or {}).get("overlays", []) or [])
+    wanted.update(carry_forward_active_overlay_ids(carry_forward))
+    for overlay_id, overlay in RISK_OVERLAYS.items():
+        if re.search(overlay["pattern"], text):
+            wanted.add(overlay_id)
+    overlays = []
+    for overlay_id in sorted(wanted, key=lambda oid: list(RISK_OVERLAYS).index(oid) if oid in RISK_OVERLAYS else 99):
+        overlay = RISK_OVERLAYS.get(overlay_id)
+        if not overlay:
+            continue
+        overlays.append({
+            "id": overlay_id,
+            "title": overlay["title"],
+            "required_pathways": list(overlay.get("required_pathways", [])),
+            "reason": "matched profile or risk signal",
+        })
+    return overlays
+
+
+def outcome_contract(goal="", project_path="", project_name="", scoped_findings=None, carry_forward=None, explicit_tier=None):
+    project_label = project_name or (Path(project_path).name if project_path else "")
+    profile = classify_outcome_profile(goal, project_label, scoped_findings, carry_forward)
+    overlays = detect_risk_overlays(goal, project_label, scoped_findings, carry_forward, profile)
+    tier = (explicit_tier or profile.get("default_tier") or DEFAULT_ITINERARY_TIER).lower()
+    if tier not in PATHWAY_TIERS:
+        tier = DEFAULT_ITINERARY_TIER
+    return {"outcome_profile": profile, "risk_overlays": overlays, "tier": tier}
+
+
+def compute_itinerary(tier, goal, outcome_profile=None, risk_overlays=None):
     """Return the ordered required-pathway itinerary for an outcome.
 
     `tier` sizes the cumulative base set; keyword gates pull in design/research/data
@@ -178,6 +463,13 @@ def compute_itinerary(tier, goal):
     for pathway, pattern in PATHWAY_KEYWORD_GATES.items():
         if re.search(pattern, text):
             base.add(pathway)
+    for pathway in (outcome_profile or {}).get("required_pathways", []) or []:
+        if pathway in PATHWAY_CANON_ORDER:
+            base.add(pathway)
+    for overlay in risk_overlays or []:
+        for pathway in overlay.get("required_pathways", []) or []:
+            if pathway in PATHWAY_CANON_ORDER:
+                base.add(pathway)
     ordered = [p for p in PATHWAY_CANON_ORDER if p in base]
     return [{"pathway": p, "status": "required", "reason": "", "proved_by_run": ""} for p in ordered]
 
@@ -201,7 +493,7 @@ def merge_itinerary(old, new):
     for pathway, prev in prior.items():
         if pathway not in new_pathways and prev.get("status") in ("proved", "na"):
             merged.append(prev)
-    merged.sort(key=lambda e: PATHWAY_CANON_ORDER.index(e["pathway"]) if e.get("pathway") in PATHWAY_CANON_ORDER else 99)
+    merged.sort(key=lambda e: pathway_sort_key(e.get("pathway")))
     return merged
 
 
@@ -214,7 +506,7 @@ def itinerary_coverage(item):
     itin = (item or {}).get("itinerary") or []
     covered = [e for e in itin if e.get("status") in ("proved", "na")]
     open_required = [e.get("pathway") for e in itin if e.get("status", "required") == "required"]
-    open_required.sort(key=lambda p: PATHWAY_CANON_ORDER.index(p) if p in PATHWAY_CANON_ORDER else 99)
+    open_required.sort(key=pathway_sort_key)
     return len(covered), len(itin), open_required
 
 
@@ -288,6 +580,15 @@ PATHWAY_DOCTRINE = {
         "move": "Add the one test/eval that would have caught the last failure, wire it as a gate.",
         "skill": "/review-stack",
     },
+    "field": {
+        "title": "Field — operator/customer validation",
+        "foundation": False,
+        "decision": "Did a real operator or customer review the right artifact, and what changed because of it?",
+        "good": "Reviewer, artifact shown, feedback, blockers, send state, and next-pathway impact are recorded.",
+        "artifact": "field packet or feedback note with reviewed artifact hash and unresolved blockers",
+        "move": "Show the proof packet to the real reviewer, record what changed, and keep send-ready separate from sent.",
+        "skill": "/review-gap-ideation",
+    },
     "observability": {
         "title": "Observability — see it in prod",
         "foundation": False,
@@ -359,6 +660,10 @@ PATHWAY_EXECUTION = {
         "stack": ["/review-stack (primary)", "/regression-test golden set", "eval-harness for LLM paths", "second-model critic before merge"],
         "tools": ["tester agent", "coverage gate (quality-guard)", "Langfuse / Promptfoo evals"],
     },
+    "field": {
+        "stack": ["operator/customer review packet", "/review-gap-ideation", "feedback-to-carry-forward", "send-ready versus sent audit"],
+        "tools": ["memory-vault decisions/", "client feedback artifact", "stakeholder-reviewer agent"],
+    },
     "observability": {
         "stack": ["/planning-stack --tech (primary)", "wire the one signal that exposes the top failure", "alert on the failure mode", "runbook delta"],
         "tools": ["betterstack MCP", "sentry MCP + sentry-cli + seer", "Langfuse LLM traces"],
@@ -377,9 +682,93 @@ PATHWAY_EXECUTION = {
     },
 }
 
+TEAM_ROLE_BY_PATHWAY = {
+    "govern": {
+        "lead": "Product governor",
+        "critic": "Premortem / stakeholder reviewer",
+        "proof_gate": "Decision, target metric, tier, and stop condition are recorded.",
+        "human_gate": "Alex approves the metric, tier, and business tradeoff before broad execution.",
+    },
+    "research": {
+        "lead": "Research lead",
+        "critic": "Devil's advocate",
+        "proof_gate": "Cited dossier classifies unknowns as blocker, warn, or info.",
+        "human_gate": "Alex reviews unresolved blocker assumptions before build decisions depend on them.",
+    },
+    "data": {
+        "lead": "Data architect",
+        "critic": "Database reviewer",
+        "proof_gate": "Schema, migration, lineage, and real-row boundary proof exist.",
+        "human_gate": "Alex approves production data mutations and tenant-boundary risk.",
+    },
+    "security": {
+        "lead": "Security reviewer",
+        "critic": "Adversarial reviewer",
+        "proof_gate": "Trust boundaries, secrets, authz, and highest-risk exposure are verified closed.",
+        "human_gate": "Alex approves any residual security risk or N/A security claim.",
+    },
+    "design": {
+        "lead": "Product designer",
+        "critic": "UX/a11y critic",
+        "proof_gate": "Rendered UI proof covers workflow, responsive states, keyboard path, and a11y.",
+        "human_gate": "Alex reviews visible UX changes before customer-facing release.",
+    },
+    "implementation": {
+        "lead": "Implementer",
+        "critic": "Code reviewer",
+        "proof_gate": "Smallest end-to-end slice works on the user-visible artifact.",
+        "human_gate": "Alex approves scope expansion beyond the governed slice.",
+    },
+    "quality": {
+        "lead": "QA / eval engineer",
+        "critic": "Second-model reviewer",
+        "proof_gate": "Golden path, regression, or eval gate catches the relevant failure mode.",
+        "human_gate": "Alex reviews failed gates, accepted risk, or test scope reductions.",
+    },
+    "field": {
+        "lead": "Field reviewer",
+        "critic": "Stakeholder reviewer",
+        "proof_gate": "Reviewer, artifact shown, feedback, blockers, and send state are recorded.",
+        "human_gate": "Alex controls external sends, customer commitments, and feedback disposition.",
+    },
+    "observability": {
+        "lead": "SRE / observability engineer",
+        "critic": "Incident reviewer",
+        "proof_gate": "Critical journey signal, alert, and runbook delta exist.",
+        "human_gate": "Alex approves alert noise, SLO tradeoffs, and incident-response ownership.",
+    },
+    "techdebt": {
+        "lead": "Simplifier",
+        "critic": "Refactor reviewer",
+        "proof_gate": "Highest-cost duplication/dependency/dead path is removed or bounded.",
+        "human_gate": "Alex approves risky refactors and abstraction expansion.",
+    },
+    "release": {
+        "lead": "Release captain",
+        "critic": "Rollback reviewer",
+        "proof_gate": "Rollout, canary/flag, production proof, and rollback evidence exist.",
+        "human_gate": "Alex controls deploys, prod flags, rollbacks, and external sends.",
+    },
+    "docs": {
+        "lead": "Docs steward",
+        "critic": "Operator reviewer",
+        "proof_gate": "ADR, runbook, or handoff matches the current code/artifact state.",
+        "human_gate": "Alex reviews strategic claims and customer-facing documentation.",
+    },
+}
+
+HUMAN_GATE_OVERLAYS = {
+    "human-gate",
+    "production-mutation",
+    "rollback",
+    "privacy-evidence",
+    "tenant-authz",
+}
+
 # Keyword -> pathway routing for findings. First match wins, scanned in order.
 FINDING_PATHWAY_KEYWORDS = [
     ("security", ["secret", "rls", "anon-read", "anon_read", "auth", "ssrf", "leak", "credential", "exposure", "vuln", "service_role", "service-role"]),
+    ("field", ["field", "customer", "client", "stakeholder", "feedback", "review packet", "send-ready", "sent", "approval", "operator validation"]),
     ("observability", ["slo", "trace", "metric", "log", "observ", "ingest", "http=4", "http=5", "invalid_payload", "alert", "telemetry"]),
     ("quality", ["test", "eval", "coverage", "verify", "verification", "regress", "flake", "calibration", "false-positive", "false_positive"]),
     ("data", ["migration", "schema", "boundary", "lineage", "retention", "cross-client", "cross_client", "drift", "data-boundary"]),
@@ -402,6 +791,7 @@ GUARD_PREFIX_PATHWAY = {
     "td-": "techdebt",
     "ff-": "research",
     "rs-": "research",
+    "field-": "field",
 }
 
 # Scan-workflow -> pathway fallback when no keyword matches.
@@ -461,6 +851,56 @@ def redact(value):
 
 def is_secret_like(text):
     return any(pattern.search(str(text)) for pattern in SECRET_PATTERNS)
+
+
+RELEASE_RECEIPT_STATES = {
+    "preview_status": {"not-run", "ready", "failed"},
+    "canary_status": {"not-run", "ready", "active", "failed"},
+    "production_status": {"not-deployed", "deployed", "failed"},
+    "rollback_status": {"not-needed", "ready", "rehearsed", "executed", "failed"},
+    "external_send_state": {"not-sent", "send-ready", "sent", "blocked"},
+    "feature_flag_state": {"not-used", "disabled", "enabled"},
+}
+RELEASE_RECEIPT_ARTIFACT_FIELDS = ("deploy_artifact", "verification_artifact", "rollback_artifact")
+
+
+def validate_release_receipt(receipt):
+    """Validate a local release receipt without performing a release.
+
+    A receipt can prove preview readiness while production stays `not-deployed`.
+    Production and external-send claims have stronger, explicit evidence requirements.
+    """
+    errors = []
+    if not isinstance(receipt, dict):
+        return ["receipt must be an object"]
+    for field, allowed in RELEASE_RECEIPT_STATES.items():
+        value = receipt.get(field)
+        if value not in allowed:
+            errors.append(f"{field} must be one of: {', '.join(sorted(allowed))}")
+    production = receipt.get("production_status")
+    rollback = receipt.get("rollback_status")
+    external = receipt.get("external_send_state")
+    approval = str(receipt.get("human_approval") or "").strip()
+    if receipt.get("preview_status") == "ready" and not str(receipt.get("verification_artifact") or "").strip():
+        errors.append("preview-ready requires verification_artifact")
+    if production == "deployed":
+        if not approval:
+            errors.append("production deployment requires human_approval")
+        if rollback not in {"rehearsed", "executed"}:
+            errors.append("production deployment requires rehearsed or executed rollback_status")
+        for field in RELEASE_RECEIPT_ARTIFACT_FIELDS:
+            if not str(receipt.get(field) or "").strip():
+                errors.append(f"production deployment requires {field}")
+    if external == "sent" and not approval:
+        errors.append("external send requires human_approval")
+    if external == "send-ready" and receipt.get("claimed_external_send") is True:
+        errors.append("send-ready cannot be claimed as sent")
+    return errors
+
+
+def release_receipt_supports_send(receipt):
+    """A narrow predicate for callers that need proof of an actual external send."""
+    return not validate_release_receipt(receipt) and receipt.get("external_send_state") == "sent"
 
 
 def safe_read_text(path, max_bytes=MAX_TEXT_BYTES):
@@ -570,10 +1010,18 @@ def write_text(path, text):
     _atomic_write(path, lambda fh: fh.write(redact(text)))
 
 
+def _is_sha256_digest(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-fA-F]{64}", value))
+
+
 def redact_obj(value):
     if isinstance(value, dict):
         generated_id_keys = {"work_id", "run_id", "measurement_id", "control_id", "evidence_id", "created_by_run_id", "resolved_by_run_id", "resolution_evidence_id"}
-        return {k: (v if k in generated_id_keys else redact_obj(v)) for k, v in value.items()}
+        # A value that IS a 64-hex digest is a content hash (artifact/transcript/verifier-source
+        # binding), never a secret — exempt it, or the entropy redactor scrubs the proof's hash to
+        # "[REDACTED]" and silently breaks the binding. Value-based, not key-based: a secret that
+        # happens to sit in a *_sha256-named key is still scrubbed.
+        return {k: (v if (k in generated_id_keys or _is_sha256_digest(v)) else redact_obj(v)) for k, v in value.items()}
     if isinstance(value, list):
         return [redact_obj(v) for v in value]
     if isinstance(value, str):
@@ -696,8 +1144,11 @@ class Paths:
         self.recommendations_path = self.operator_intel / "pathway-recommendations.ndjson"
         self.pathway_trust_path = self.operator_intel / "pathway-trust.json"
         self.proofs_path = self.operator_intel / "proofs.ndjson"
+        self.carry_forward_path = self.operator_intel / "pathway-carry-forward.ndjson"
         self.pathway_run_plans_path = self.operator_intel / "pathway-run-plans.ndjson"
         self.pathway_decisions_path = self.operator_intel / "pathway-decisions.ndjson"
+        self.pathway_pilots_path = self.operator_intel / "pathway-pilots.ndjson"
+        self.pathway_pilot_latest_path = self.operator_intel / "pathway-pilot-latest.json"
         self.learning_candidates_path = self.operator_intel / "learning-candidates.ndjson"
         self.evaluations_path = self.operator_intel / "pathway-evaluations.ndjson"
         self.portfolio_next_path = self.operator_intel / "portfolio-next.json"
@@ -798,7 +1249,318 @@ def proof_is_verified(proof):
         return False
     if str(proof.get("result", "")).strip().lower() in ("fail", "failed", "error", "missing_evidence"):
         return False
-    return proof.get("verifier_strength") == "executed" and proof.get("exit_code") == 0
+    return (
+        proof.get("verifier_strength") == "executed"
+        and proof.get("exit_code") == 0
+        and not proof.get("trivial_verifier")
+        and proof.get("canary_mutant_failed") is not False
+    )
+
+
+CARRY_FORWARD_LIST_FIELDS = [
+    "what_changed",
+    "more_relevant",
+    "less_relevant",
+    "next_pathway_must_use",
+    "do_not_do_yet",
+    "open_decisions",
+    "active_risk_overlays",
+]
+CARRY_FORWARD_REQUIRED_FIELDS = [
+    "carry_forward_id",
+    "work_id",
+    "project",
+    "pathway",
+    "source_artifact",
+    "summary",
+    *CARRY_FORWARD_LIST_FIELDS,
+    "artifact_sha256",
+    "created_at",
+]
+VERIFIER_TEMPLATES = {
+    "govern": {"required_artifact_terms": ("decision", "verifier"), "recommended_command": "python3 <govern-verifier.py>"},
+    "research": {"required_artifact_terms": ("question", "sources"), "recommended_command": "python3 <research-verifier.py>"},
+    "data": {"required_artifact_terms": ("lineage", "verification"), "recommended_command": "python3 <data-verifier.py>"},
+    "security": {"required_artifact_terms": ("threat", "verification"), "recommended_command": "python3 <security-verifier.py>"},
+    "design": {"required_artifact_terms": ("workflow", "verification"), "recommended_command": "python3 <design-verifier.py>"},
+    "implementation": {"required_artifact_terms": ("delivered", "verification"), "recommended_command": "python3 <implementation-verifier.py>"},
+    "quality": {"required_artifact_terms": ("regression", "verification"), "recommended_command": "python3 <quality-verifier.py>"},
+    "field": {"required_artifact_terms": ("reviewer", "send state"), "recommended_command": "python3 <field-verifier.py>"},
+    "observability": {"required_artifact_terms": ("signal", "verification"), "recommended_command": "python3 <observability-verifier.py>"},
+    "techdebt": {"required_artifact_terms": ("decision", "verification"), "recommended_command": "python3 <techdebt-verifier.py>"},
+    "release": {"required_artifact_terms": ("rollback", "verification"), "recommended_command": "python3 <release-verifier.py>"},
+    "docs": {"required_artifact_terms": ("delivered", "verification"), "recommended_command": "python3 <docs-verifier.py>"},
+}
+
+
+def carry_forward_id_for(work_id, pathway, source_artifact, artifact_sha256):
+    return f"CF-{sha_text('|'.join(str(p) for p in (work_id, pathway, source_artifact, artifact_sha256)), 12)}"
+
+
+def _bullet_lines(text):
+    out = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("-", "*")):
+            stripped = stripped[1:].strip()
+        if stripped:
+            out.append(stripped)
+    return out
+
+
+def extract_carry_forward_sections(text):
+    """Best-effort parser for human evidence artifacts.
+
+    The store is authoritative and structured; this parser only lets an artifact provide better
+    values than the safe defaults. It recognizes markdown headings such as `## What Changed` and
+    keeps the rest deterministic/stdlib-only.
+    """
+    aliases = {
+        "summary": "summary",
+        "what changed": "what_changed",
+        "what_changed": "what_changed",
+        "more relevant": "more_relevant",
+        "more_relevant": "more_relevant",
+        "less relevant": "less_relevant",
+        "less_relevant": "less_relevant",
+        "next pathway must use": "next_pathway_must_use",
+        "next_pathway_must_use": "next_pathway_must_use",
+        "do not do yet": "do_not_do_yet",
+        "do_not_do_yet": "do_not_do_yet",
+        "open decisions": "open_decisions",
+        "open_decisions": "open_decisions",
+        "active risk overlays": "active_risk_overlays",
+        "active_risk_overlays": "active_risk_overlays",
+    }
+    sections, current = {}, None
+    for line in (text or "").splitlines():
+        m = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if m:
+            label = re.sub(r"[^a-z0-9_ ]+", "", m.group(1).strip().lower())
+            current = aliases.get(label)
+            if current:
+                sections.setdefault(current, [])
+            continue
+        if current:
+            sections[current].append(line)
+    parsed = {}
+    if "summary" in sections:
+        summary = " ".join(_bullet_lines("\n".join(sections["summary"])))[:500]
+        if summary:
+            parsed["summary"] = summary
+    for field in CARRY_FORWARD_LIST_FIELDS:
+        if field in sections:
+            items = _bullet_lines("\n".join(sections[field]))[:12]
+            if items:
+                parsed[field] = items
+    return parsed
+
+
+def verifier_template_for(pathway):
+    template = VERIFIER_TEMPLATES.get(pathway)
+    if not template:
+        return {}
+    return {
+        "id": f"{pathway}-v1",
+        "pathway": pathway,
+        "required_artifact_terms": list(template["required_artifact_terms"]),
+        "required_carry_forward_fields": list(CARRY_FORWARD_LIST_FIELDS),
+        "recommended_command": template["recommended_command"],
+    }
+
+
+def check_verifier_template(pathway, evidence_text):
+    """Report whether an artifact has the pathway's minimum proof shape.
+
+    This is intentionally additive: executed verification remains the only way to prove an
+    itinerary entry, while this check makes hollow artifacts visible to the operator.
+    """
+    template = verifier_template_for(pathway)
+    if not template:
+        return {"valid": False, "template_id": "", "missing": ["unknown pathway template"]}
+    text = evidence_text or ""
+    normalized = text.lower()
+    missing = [term for term in template["required_artifact_terms"] if term not in normalized]
+    sections = extract_carry_forward_sections(text)
+    missing += [field for field in CARRY_FORWARD_LIST_FIELDS if field not in sections]
+    return {
+        "valid": not missing,
+        "template_id": template["id"],
+        "missing": missing,
+        "required_artifact_terms": template["required_artifact_terms"],
+        "required_carry_forward_fields": template["required_carry_forward_fields"],
+        "recommended_command": template["recommended_command"],
+    }
+
+
+def first_nonempty_snippet(text, limit=260):
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped[:limit]
+    return ""
+
+
+def build_carry_forward_record(proof, work_item=None):
+    if not proof or not proof_is_verified(proof):
+        return None
+    source_artifact = proof.get("evidence_path", "")
+    artifact_sha256 = proof.get("artifact_sha256") or sha256_file(source_artifact)
+    pathway = proof.get("pathway", "")
+    work_id = proof.get("work_id", "")
+    project_path = proof.get("project_path") or (work_item or {}).get("project", "")
+    project_name = proof.get("project") or (work_item or {}).get("project_name", "") or Path(project_path).name
+    evidence_text = safe_read_text(source_artifact, max_bytes=64_000) if source_artifact else ""
+    extracted = extract_carry_forward_sections(evidence_text)
+    fallback_summary = first_nonempty_snippet(evidence_text) or f"{pathway} produced proof artifact {Path(source_artifact).name}."
+    record = {
+        "carry_forward_id": carry_forward_id_for(work_id, pathway, source_artifact, artifact_sha256),
+        "work_id": work_id,
+        "project": project_name,
+        "project_path": project_path,
+        "pathway": pathway,
+        "source_artifact": source_artifact,
+        "summary": extracted.get("summary") or fallback_summary,
+        "what_changed": extracted.get("what_changed") or [
+            f"{pathway} completed with verified evidence at {source_artifact}."
+        ],
+        "more_relevant": extracted.get("more_relevant") or [
+            f"Use the {pathway} proof before ranking or executing the next pathway."
+        ],
+        "less_relevant": extracted.get("less_relevant") or [],
+        "next_pathway_must_use": extracted.get("next_pathway_must_use") or [
+            f"Read {source_artifact} before acting on the next recommendation."
+        ],
+        "do_not_do_yet": extracted.get("do_not_do_yet") or [],
+        "open_decisions": extracted.get("open_decisions") or [],
+        "active_risk_overlays": extracted.get("active_risk_overlays") or [
+            o.get("id", "") for o in (work_item or {}).get("risk_overlays", []) if o.get("id")
+        ],
+        "artifact_sha256": artifact_sha256,
+        "proof_id": proof.get("proof_id", ""),
+        "run_id": proof.get("run_id", ""),
+        "recommendation_id": proof.get("recommendation_id", ""),
+        "created_at": iso_now(),
+        "source": "operating-layer carry-forward",
+    }
+    return record if carry_forward_is_valid(record) else None
+
+
+def carry_forward_is_valid(record):
+    if not isinstance(record, dict):
+        return False
+    if any(field not in record for field in CARRY_FORWARD_REQUIRED_FIELDS):
+        return False
+    for field in ("carry_forward_id", "work_id", "pathway", "source_artifact", "summary", "artifact_sha256", "created_at"):
+        if not str(record.get(field, "")).strip():
+            return False
+    return all(isinstance(record.get(field), list) for field in CARRY_FORWARD_LIST_FIELDS)
+
+
+def upsert_carry_forward(paths, record):
+    if not carry_forward_is_valid(record):
+        return read_ndjson(paths.carry_forward_path)
+    records = [r for r in read_ndjson(paths.carry_forward_path) if r.get("carry_forward_id") != record.get("carry_forward_id")]
+    records.append(record)
+    write_ndjson(paths.carry_forward_path, records)
+    return records
+
+
+def carry_forwards_for_work(paths, work_id):
+    return [r for r in read_ndjson(paths.carry_forward_path)
+            if r.get("work_id") == work_id and carry_forward_is_valid(r)]
+
+
+def latest_carry_forward_for_work(paths, work_id):
+    records = carry_forwards_for_work(paths, work_id)
+    if not records:
+        return {}
+    # NDJSON append order is the deterministic tie-breaker when multiple proofs land inside
+    # the same timestamp second. The most recently written baton must win continuity.
+    return max(enumerate(records), key=lambda item: (item[1].get("created_at", ""), item[0]))[1]
+
+
+def carry_forward_effect(carry_forward, recommended_pathway):
+    if not carry_forward:
+        return "No prior carry-forward record exists for this active work item yet."
+    must_use = "; ".join(carry_forward.get("next_pathway_must_use", [])[:2]) or "use the source artifact"
+    changed = "; ".join(carry_forward.get("what_changed", [])[:2])
+    overlays = ", ".join(carry_forward.get("active_risk_overlays", [])[:4])
+    changed_part = f" It changed: {changed}." if changed else ""
+    overlay_part = f" Active overlays remain: {overlays}." if overlays else ""
+    return (
+        f"Latest `{carry_forward.get('pathway')}` output says: {carry_forward.get('summary')} "
+        f"{changed_part}{overlay_part} Therefore `{recommended_pathway}` must use: {must_use}."
+    )
+
+
+def pathways_referenced_by_text(text):
+    haystack = (text or "").lower()
+    found = []
+    for pathway in PATHWAY_ORDER:
+        if re.search(rf"\b{re.escape(pathway)}\b", haystack):
+            found.append(pathway)
+    if not found:
+        pseudo = {
+            "customer": "field",
+            "feedback": "field",
+            "approval": "field",
+            "send": "field",
+            "human-gate": "field",
+            "rls": "security",
+            "authz": "security",
+            "tenant": "security",
+            "tenant-authz": "security",
+            "privacy-evidence": "security",
+            "migration": "data",
+            "schema": "data",
+            "rollback": "release",
+            "production-mutation": "release",
+            "deploy": "release",
+            "ui-proof": "design",
+            "a11y": "design",
+            "responsive": "design",
+            "llm-agent-eval": "quality",
+            "eval": "quality",
+            "trace": "observability",
+            "alert": "observability",
+        }
+        for token, pathway in pseudo.items():
+            if token in haystack and pathway not in found:
+                found.append(pathway)
+    return sorted(found, key=pathway_sort_key)
+
+
+def proved_pathways_from_proofs(work_id, proofs):
+    """Evidence side of the itinerary join: every pathway carrying at least one genuinely-verified
+    proof (`proof_is_verified` — a re-executed verifier that exited 0) for this work item, mapped
+    to the run_id (or proof_id) that earned it. A verified proof proves its pathway no matter which
+    command recorded it — an inline work-log, a later `proof-add`, or an earlier ledger row. Without
+    this join, verification logged through `proof-add` never reached the itinerary and coverage
+    stalled at `logged_unverified` even after a verifier had passed."""
+    proved = {}
+    for proof in proofs or []:
+        if not isinstance(proof, dict) or proof.get("work_id") != work_id:
+            continue
+        pathway = proof.get("pathway")
+        if pathway and pathway not in proved and proof_is_verified(proof):
+            proved[pathway] = proof.get("run_id") or proof.get("proof_id") or ""
+    return proved
+
+
+def apply_proof_coverage(itinerary, proved_map):
+    """Flip every still-`required` itinerary entry that now has a verified proof to `proved`
+    (mutating entries in place); return True if anything changed. Never downgrades an explicit
+    `na` or an already-`proved` entry — it only closes the join the verifier already earned. This
+    mirrors the inline work-log flip so the two proof paths converge on one rule."""
+    changed = False
+    for entry in itinerary or []:
+        pathway = entry.get("pathway")
+        if entry.get("status", "required") == "required" and pathway in (proved_map or {}):
+            entry["status"] = "proved"
+            entry["proved_by_run"] = proved_map[pathway]
+            changed = True
+    return changed
 
 
 def sha256_file(path):
@@ -813,17 +1575,250 @@ def sha256_file(path):
         return ""
 
 
+# Trivial-verifier receipt (fast-follow dossier item 2). `--verify-cmd true` exits 0 but proves
+# nothing — three cheap, recognizable signals expose a no-op verifier: a denylisted command source,
+# a stdout transcript below a byte floor, and (the keystone) a canary mutant the verifier fails to
+# catch. STDOUT_BYTE_FLOOR is deliberately tiny: `true`/`:`/`exit 0` emit zero bytes, so >=1 byte is
+# the floor a no-op cannot clear. (reproducible-builds.org recognizable-no-op; OWASP CICD-SEC-9.)
+STDOUT_BYTE_FLOOR = 1
+
+
+def verifier_command_is_trivial(command):
+    """A verifier command that cannot prove anything: it exits 0 without exercising the artifact.
+    Denylist of no-ops — true, :, exit 0, echo ... — plus empty. The denylist + the source hash is
+    the recognizable-no-op check; the canary mutant is the stronger, behavior-based signal."""
+    norm = (command or "").strip()
+    if not norm:
+        return True
+    low = norm.lower()
+    if low in ("true", ":", "exit 0", "/bin/true", "/usr/bin/true"):
+        return True
+    first = low.split()[0] if low.split() else ""
+    return first == "echo"
+
+
+# The canary re-runs the verifier on a mutant, so it doubles verifier runtime. Run it only for a
+# verifier the cheap checks have NOT already proved trivial, and only when the first run was fast
+# enough that doubling it is cheap — a multi-minute suite must never be silently run twice.
+CANARY_MAX_VERIFY_SECONDS = 30
+
+
+def _should_run_canary(already_trivial, first_run_secs):
+    return (not already_trivial) and first_run_secs <= CANARY_MAX_VERIFY_SECONDS
+
+
 def run_verifier_command(command, cwd, timeout=120):
-    """Re-execute an operator-supplied verifier command; return (exit_code, stdout_sha256). The
-    command comes from the operator/agent at the CLI — the same trust boundary as running it in
-    their own shell — so shell=True is acceptable; it is never fed untrusted input. Fail-closed:
-    a command we cannot run returns a non-zero code, so it cannot prove."""
+    """Re-execute an operator-supplied verifier command; return (exit_code, stdout_sha256,
+    stdout_bytes). The command comes from the operator/agent at the CLI — the same trust boundary as
+    running it in their own shell — so shell=True is acceptable; it is never fed untrusted input.
+    Fail-closed: a command we cannot run returns a non-zero code, so it cannot prove."""
     try:
         proc = subprocess.run(command, shell=True, cwd=cwd or None, capture_output=True,
                               text=True, timeout=timeout)
-        return proc.returncode, hashlib.sha256((proc.stdout or "").encode("utf-8", "replace")).hexdigest()
+        stdout_bytes = (proc.stdout or "").encode("utf-8", "replace")
+        return proc.returncode, hashlib.sha256(stdout_bytes).hexdigest(), len(stdout_bytes)
     except Exception:
-        return 1, ""
+        return 1, "", 0
+
+
+def _git_diff_text(cwd, extra):
+    try:
+        proc = subprocess.run(["git", "-C", str(cwd), "diff", "--unified=0", "--no-color"] + extra,
+                              capture_output=True, text=True, timeout=30)
+        return proc.stdout if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _git_repo_root(cwd):
+    """Absolute path of the git work-tree root for cwd, or '' if cwd is not in a repo. Diff paths are
+    repo-root-relative, so a changed file must be resolved against this — not cwd, which may be a
+    subdirectory (joining a repo-root-relative path to a subdir points at the wrong file)."""
+    try:
+        proc = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, timeout=30)
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _changed_line_target(cwd, allowed_files=None):
+    """A (relative-path, 1-based new-file line number) of a changed line in cwd's git tree — working
+    tree, then staged, then last commit. `allowed_files` restricts selection to known-relevant
+    repository-relative paths; without it this retains the legacy first-target behavior for callers
+    that need to inspect the diff. Returns None when there is no applicable mutable changed line."""
+    for extra in ([], ["--cached"], ["HEAD~1", "HEAD"]):
+        diff = _git_diff_text(cwd, extra)
+        if not diff:
+            continue
+        rel_file, new_lineno = None, 0
+        for line in diff.splitlines():
+            if line.startswith("+++ b/"):
+                rel_file = line[6:]
+            elif line.startswith("@@"):
+                m = re.search(r"\+(\d+)", line)
+                new_lineno = int(m.group(1)) if m else 0
+            elif line.startswith("+") and not line.startswith("+++"):
+                if (rel_file and (allowed_files is None or rel_file in allowed_files)
+                        and any(c.isalnum() for c in line[1:])):
+                    return rel_file, new_lineno
+                new_lineno += 1
+            elif line.startswith(" "):
+                new_lineno += 1
+            # '-' (removed) lines do not advance the new-file counter
+    return None
+
+
+def _canary_unavailable(reason):
+    return {
+        "canary_target": None,
+        "canary_target_source": "unavailable",
+        "canary_target_reason": reason,
+        "line": 0,
+    }
+
+
+def _resolve_canary_file(cwd, raw_path):
+    """Return a safe repo-relative file name for a user or verifier path, never an absolute path.
+
+    Relative paths are interpreted from the verification cwd. The canary itself later resolves the
+    returned value from the git root, so the receipt and the mutation share the same containment
+    boundary even when the verifier runs in a subdirectory.
+    """
+    root = _git_repo_root(cwd)
+    if not root:
+        return None, "no_git_worktree"
+    try:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(cwd) / candidate
+        if candidate.is_symlink() or not candidate.is_file():
+            return None, "not_regular_file"
+        root_real = os.path.realpath(root)
+        candidate_real = os.path.realpath(candidate)
+        if os.path.commonpath([root_real, candidate_real]) != root_real:
+            return None, "outside_verification_checkout"
+        relative = os.path.relpath(candidate_real, root_real)
+        if relative == "." or relative == ".." or relative.startswith(f"..{os.sep}"):
+            return None, "outside_verification_checkout"
+        return relative.replace(os.sep, "/"), ""
+    except (OSError, ValueError):
+        return None, "unresolvable_target"
+
+
+def select_canary_target(verify_cmd, cwd, canary_target=None):
+    """Select one changed, regular, in-repository file relevant to the verifier.
+
+    Automatic selection examines only direct shell tokens that name an existing file and refuses to
+    fall back to arbitrary dirty worktree files. Explicit input is normalized before persistence and
+    must still name a changed mutable line. The returned dictionary contains only a repo-relative
+    target plus stable provenance; raw command tokens and absolute inputs never leave this helper.
+    """
+    if canary_target:
+        rel_file, reason = _resolve_canary_file(cwd, canary_target)
+        if not rel_file:
+            return _canary_unavailable(f"explicit_target_{reason}")
+        target = _changed_line_target(cwd, {rel_file})
+        if not target:
+            return _canary_unavailable("explicit_target_not_changed_regular_file")
+        return {
+            "canary_target": rel_file,
+            "canary_target_source": "explicit",
+            "canary_target_reason": "explicit_changed_regular_file",
+            "line": target[1],
+        }
+
+    try:
+        tokens = shlex.split(verify_cmd or "")
+    except ValueError:
+        tokens = []
+    for token in reversed(tokens):
+        if not token or token.startswith("-") or token in {"|", "||", "&&", ";"} or "=" in token:
+            continue
+        rel_file, _reason = _resolve_canary_file(cwd, token)
+        if not rel_file:
+            continue
+        target = _changed_line_target(cwd, {rel_file})
+        if target:
+            return {
+                "canary_target": rel_file,
+                "canary_target_source": "verifier_reference",
+                "canary_target_reason": "verifier_named_changed_file",
+                "line": target[1],
+            }
+    return _canary_unavailable("no_relevant_changed_file")
+
+
+def _flip_one_byte(line):
+    """Change the first alnum character in a line to a guaranteed-different one; keep the newline."""
+    for i, ch in enumerate(line):
+        if ch.isdigit():
+            return line[:i] + ("9" if ch != "9" else "8") + line[i + 1:], True
+        if ch.isalpha():
+            return line[:i] + ("X" if ch.lower() != "x" else "Y") + line[i + 1:], True
+    return line, False
+
+
+def _atomic_replace_bytes(path, data):
+    """Write bytes to path atomically — same-directory temp file + os.replace — so a failed or
+    interrupted write can never leave the file truncated, partial, or half-restored."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".canary-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def run_canary_mutant(verify_cmd, cwd, timeout=120, canary_target=None, selection=None):
+    """Keystone anti-gaming check: flip one byte in a changed line, re-run the verifier, restore the
+    file. Returns True if the verifier now FAILS (it actually exercised the change), False if it
+    still passes (a no-op), or None if no canary could be run. The original bytes are ALWAYS restored
+    in a finally — a proof-recording step must never leave the working tree mutated.
+
+    Safety: target selection must identify a relevant changed regular file inside the verification
+    checkout. The canary never falls back to an arbitrary dirty path, follows a symlink, or writes
+    outside the git root."""
+    selection = selection or select_canary_target(verify_cmd, cwd, canary_target)
+    rel_file = selection.get("canary_target")
+    lineno = selection.get("line", 0)
+    if not rel_file or not lineno:
+        return None
+    base = _git_repo_root(cwd)
+    if not base:
+        return None
+    path = Path(base) / rel_file
+    try:
+        base_real = os.path.realpath(base)
+        if path.is_symlink() or not path.is_file():
+            return None
+        if os.path.commonpath([base_real, os.path.realpath(path)]) != base_real:
+            return None  # path escapes the repo root
+        original = path.read_bytes()
+        text = original.decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None  # missing, binary, or unresolvable -> skip
+    lines = text.splitlines(keepends=True)
+    if lineno < 1 or lineno > len(lines):
+        return None
+    mutated_line, ok = _flip_one_byte(lines[lineno - 1])
+    if not ok:
+        return None
+    lines[lineno - 1] = mutated_line
+    mutated = "".join(lines).encode("utf-8")
+    if mutated == original:
+        return None
+    try:
+        _atomic_replace_bytes(path, mutated)
+        exit_code, _, _ = run_verifier_command(verify_cmd, cwd, timeout=timeout)
+        return exit_code != 0
+    finally:
+        _atomic_replace_bytes(path, original)
 
 
 def build_proof_record(args, work_item=None, run_id="", measurement_id_value=""):
@@ -840,7 +1835,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
             "high",
         )
     proof_type = args.proof_type or "artifact"
-    project_path = str(Path(args.project).expanduser()) if getattr(args, "project", None) else ""
+    template_check = check_verifier_template(args.pathway or "", safe_read_text(evidence_path, max_bytes=64_000))
+    cli_project_path = str(Path(args.project).expanduser()) if getattr(args, "project", None) else ""
+    project_path = cli_project_path
     project_name = Path(project_path).name if project_path else ""
     if work_item:
         project_path = work_item.get("project", project_path)
@@ -852,9 +1849,38 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
     verify_cmd = getattr(args, "verify_cmd", None)
     artifact_sha256 = sha256_file(evidence_path)
     verifier_strength, exit_code, verify_stdout_sha256, verify_command = "attested", None, "", ""
+    verify_stdout_bytes, verifier_source_sha256 = 0, ""
+    canary_mutant_failed, trivial_verifier = None, False
+    canary_target, canary_target_source = None, "unavailable"
+    canary_target_reason = "not_executed"
     if verify_cmd:
         verifier_strength, verify_command = "executed", verify_cmd
-        exit_code, verify_stdout_sha256 = run_verifier_command(verify_cmd, project_path or str(Path(evidence_path).parent))
+        verifier_source_sha256 = hashlib.sha256(verify_cmd.strip().encode("utf-8", "replace")).hexdigest()
+        # An explicit --project wins for WHERE the verifier and canary run. Target selection is then
+        # constrained to a changed regular file the verifier directly names, or an explicit caller
+        # target. Unrelated dirt yields an unavailable result instead of a false trivial demotion.
+        verify_cwd = cli_project_path or project_path or str(Path(evidence_path).parent)
+        _t0 = time.monotonic()
+        exit_code, verify_stdout_sha256, verify_stdout_bytes = run_verifier_command(verify_cmd, verify_cwd)
+        first_run_secs = time.monotonic() - _t0
+        # Receipt: a no-op verifier is recognizable by a denylisted source or an empty transcript.
+        trivial_verifier = verifier_command_is_trivial(verify_cmd) or verify_stdout_bytes < STDOUT_BYTE_FLOOR
+        # Keystone: flip a byte in a changed line and re-run — a real verifier now fails; one that
+        # still passes ignored the change. Gated so a known-trivial or slow verifier isn't run twice.
+        if _should_run_canary(trivial_verifier, first_run_secs):
+            selection = select_canary_target(
+                verify_cmd, verify_cwd, getattr(args, "canary_target", None)
+            )
+            canary_target = selection["canary_target"]
+            canary_target_source = selection["canary_target_source"]
+            canary_target_reason = selection["canary_target_reason"]
+            canary_mutant_failed = run_canary_mutant(verify_cmd, verify_cwd, selection=selection)
+            if canary_mutant_failed is False:
+                trivial_verifier = True
+        elif trivial_verifier:
+            canary_target_reason = "canary_skipped_trivial_verifier"
+        else:
+            canary_target_reason = "canary_skipped_slow_verifier"
     elif reviewer:
         verifier_strength = "signed"
     proof = {
@@ -873,7 +1899,15 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
         "verify_command": verify_command,
         "exit_code": exit_code,
         "verify_stdout_sha256": verify_stdout_sha256,
+        "verify_stdout_bytes": verify_stdout_bytes,
+        "verifier_source_sha256": verifier_source_sha256,
+        "canary_target": canary_target,
+        "canary_target_source": canary_target_source,
+        "canary_target_reason": canary_target_reason,
+        "canary_mutant_failed": canary_mutant_failed,
+        "trivial_verifier": trivial_verifier,
         "artifact_sha256": artifact_sha256,
+        "template_check": template_check,
         "reviewer": reviewer,
         "recommendation_id": args.recommendation_id or "",
         "run_id": run_id,
@@ -2029,20 +3063,16 @@ def scan_boundary(args, paths, write_outputs=True):
 
 def scan_agents(args, paths, write_outputs=True):
     sources = []
-    candidates = [
-        paths.projects_root / "agents",
-        paths.projects_root / "mission-control",
-        paths.codex_home / "automations",
-    ]
-    for root in candidates:
-        if not root.exists():
-            continue
-        for p in root.iterdir():
-            if not p.is_dir() or p.name.startswith(".") or p.name in PRUNE_DIRS:
+    profiles_root = paths.projects_root / "agents" / "hermes" / "profiles"
+    if profiles_root.is_dir() and not profiles_root.is_symlink():
+        for profile in profiles_root.iterdir():
+            manifest = profile / "manifest.json"
+            # Active Hermes profiles are the readiness population. Keep the local
+            # root boundary from the security review and require a regular manifest.
+            if (profile.is_symlink() or not profile.is_dir() or profile.name.startswith(".")
+                    or profile.name in PRUNE_DIRS or manifest.is_symlink() or not manifest.is_file()):
                 continue
-            has_profile_doc = any((p / name).exists() for name in ("README.md", "CLAUDE.md", "AGENTS.md", "automation.toml", "memory.md"))
-            if root == paths.codex_home / "automations" or has_profile_doc:
-                sources.append(p)
+            sources.append(profile)
     evidence_records = scan_evidence_records(paths)
     cards = []
     findings = []
@@ -2385,8 +3415,27 @@ def work_status_summary(paths, work_id):
     open_controls = [c for c in controls if c.get("status", "open") != "resolved"]
     missing_evidence = [m for m in measurements if not m.get("evidence_id")]
     stale = stale_measurements(measurements)
-    pathways_seen = sorted(set(r.get("pathway") for r in runs if r.get("pathway")))
-    missing_core_pathways = [p for p in PATHWAY_ORDER if p not in pathways_seen]
+    pathways_seen = sorted(set(r.get("pathway") for r in runs if r.get("pathway")), key=pathway_sort_key)
+    proved_pathway_map = proved_pathways_from_proofs(work_id, read_ndjson(paths.proofs_path))
+    missing_core_pathways = [p for p in CORE_PATHWAYS if p not in pathways_seen]
+    if item:
+        profile = item.get("outcome_profile") or classify_outcome_profile(
+            item.get("goal", ""), item.get("project_name", ""))
+        overlays = item.get("risk_overlays")
+        if overlays is None:
+            overlays = detect_risk_overlays(
+                item.get("goal", ""), item.get("project_name", ""), profile=profile)
+        expected = compute_itinerary(item.get("tier", DEFAULT_ITINERARY_TIER), item.get("goal", ""), profile, overlays)
+        item = dict(item)
+        item["outcome_profile"] = profile
+        item["risk_overlays"] = overlays
+        item["itinerary"] = merge_itinerary(item.get("itinerary") or [], expected)
+    # Read-time credit: coverage must derive from the proof EVIDENCE, not only the persisted entry
+    # status. A verified proof already in the ledger (recorded via proof-add or an earlier run)
+    # flips its still-required pathway here, so coverage is retroactive and never stalls at
+    # logged_unverified. Mutates the in-memory item only (no write); the write paths persist it.
+    if item:
+        apply_proof_coverage(item.get("itinerary") or [], proved_pathway_map)
     covered, total, itinerary_open = itinerary_coverage(item)
     # Observability (Gap A): a required pathway that already has a run logged is "logged
     # but unverified" — evidence was recorded without a named verifier, so it didn't meet
@@ -2407,6 +3456,7 @@ def work_status_summary(paths, work_id):
         "itinerary_coverage": {"covered": covered, "total": total, "open": itinerary_open, "logged_unverified": unverified},
         "pathway_coverage": {
             "seen": pathways_seen,
+            "proved": sorted(proved_pathway_map, key=pathway_sort_key),
             "missing_core": missing_core_pathways,
             "count": len(pathways_seen),
         },
@@ -2828,33 +3878,38 @@ def run_work_start(args, paths):
     existing = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == work_id), None)
     explicit_tier = getattr(args, "tier", None)
     existing_itin = (existing or {}).get("itinerary")
+    project_name = Path(project_path).name
+    scoped_findings = project_scoped_findings(paths, project_path, project_name) + project_local_findings(project_path)[0]
+    contract = outcome_contract(args.goal, project_path, project_name, scoped_findings, explicit_tier=explicit_tier)
     if explicit_tier:
         # A tier was chosen → seed (or resize) the coverage itinerary. The /pathway skill
         # always passes a tier, so the coverage guarantee holds for every tracked outcome.
-        tier = explicit_tier.lower()
-        if tier not in PATHWAY_TIERS:
-            tier = DEFAULT_ITINERARY_TIER
-        itinerary = (merge_itinerary(existing_itin, compute_itinerary(tier, args.goal))
-                     if existing_itin else compute_itinerary(tier, args.goal))
+        tier = contract["tier"]
+        next_itin = compute_itinerary(tier, args.goal, contract["outcome_profile"], contract["risk_overlays"])
+        itinerary = merge_itinerary(existing_itin, next_itin) if existing_itin else next_itin
     elif existing_itin:
-        # Re-START without a tier: preserve the in-progress itinerary and its earned proof.
+        # Re-START without a tier: preserve earned proof, but pull in newly detected profile/overlay
+        # gates so old active work cannot close around a freshly visible risk.
         tier = (existing or {}).get("tier", DEFAULT_ITINERARY_TIER)
-        itinerary = existing_itin
+        next_itin = compute_itinerary(tier, args.goal, contract["outcome_profile"], contract["risk_overlays"])
+        itinerary = merge_itinerary(existing_itin, next_itin)
     else:
-        # No tier chosen and no prior itinerary → loose tracking, no coverage gate
-        # (backward-compatible: bare `work-start` behaves as it did before the feature).
-        tier = (existing or {}).get("tier", "")
-        itinerary = []
+        # No empty-itinerary work: default through the outcome profile so every tracked outcome
+        # has a closeout spine even when a caller omits --tier.
+        tier = (existing or {}).get("tier", contract["tier"]) or contract["tier"]
+        itinerary = compute_itinerary(tier, args.goal, contract["outcome_profile"], contract["risk_overlays"])
     item = update_work_item(
         paths,
         work_id,
         status="active",
         mode="semi-automatic",
         project=project_path,
-        project_name=Path(project_path).name,
+        project_name=project_name,
         goal=args.goal,
         context=context,
         tier=tier,
+        outcome_profile=contract["outcome_profile"],
+        risk_overlays=contract["risk_overlays"],
         itinerary=itinerary,
         closeout_readiness="not_ready",
     )
@@ -2943,7 +3998,7 @@ def run_work_cover(args, paths):
                 "reason": args.reason or "revealed during execution",
                 "proved_by_run": "",
             })
-        itinerary.sort(key=lambda e: PATHWAY_CANON_ORDER.index(e["pathway"]) if e.get("pathway") in PATHWAY_CANON_ORDER else 99)
+        itinerary.sort(key=lambda e: pathway_sort_key(e.get("pathway")))
     else:
         # Default action marks not-applicable, and it REQUIRES a reason — nothing is
         # ever dropped silently. That refusal is the point of the whole mechanism.
@@ -3170,15 +4225,19 @@ def run_work_log(args, paths):
     write_ndjson(paths.pathway_runs_path, all_runs)
     write_ndjson(paths.pathway_measurements_path, all_measurements)
     write_ndjson(paths.controls_path, controls)
+    carry_forward = None
     if proof:
         upsert_proof(paths, proof)
         write_proof_report(paths, read_ndjson(paths.proofs_path))
+        carry_forward = build_carry_forward_record(proof, item)
+        if carry_forward:
+            upsert_carry_forward(paths, carry_forward)
     if item:
         updates = {"last_pathway": args.pathway, "last_run_id": run_id}
         # Mark the itinerary entry proved ONLY when this log carries (a) a real artifact on disk
-        # AND (b) a proof that is genuinely VERIFIED — a re-executed verifier that exited 0, or a
-        # named human sign-off over a hashed artifact (proof_is_verified). A bare --verified-by
-        # string is attestation, not verification, and can no longer prove. This is the keystone
+        # AND (b) a proof that is genuinely VERIFIED — a non-trivial re-executed verifier that
+        # exited 0 (proof_is_verified). A bare --verified-by string is attestation, not
+        # verification, and can no longer prove. This is the keystone
         # that makes `proved` — and everything gated on it (coverage, proof rate, autonomy,
         # learning, calibration) — mean a verification actually passed, not that a string was typed.
         proved = (bool(proof) and bool(evidence_path) and Path(evidence_path).is_file()
@@ -3192,7 +4251,14 @@ def run_work_log(args, paths):
                     updates["itinerary"] = itinerary
         update_work_item(paths, args.work_id, **updates)
     dashboard = build_daily_dashboard(paths)
-    return {"records": [run, measurement] + ([proof] if proof else []) + ([control] if control else []), "findings": findings, "run_id": run_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
+    return {
+        "records": [run, measurement] + ([proof] if proof else []) + ([carry_forward] if carry_forward else []) + ([control] if control else []),
+        "findings": findings,
+        "run_id": run_id,
+        "carry_forward": carry_forward or {},
+        "dashboard": str(paths.daily_dashboard_path),
+        "daily": dashboard,
+    }
 
 
 def run_work_close(args, paths):
@@ -3224,8 +4290,18 @@ def run_work_close(args, paths):
             "high",
         ))
         dashboard = build_daily_dashboard(paths)
-        return {"records": [summary], "findings": findings, "closed": False, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
-    item = update_work_item(paths, args.work_id, status="closed", closed_at=iso_now(), closeout_readiness="ready")
+        return {"records": [summary], "findings": findings, "closed": False, "work_id": args.work_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
+    summary_item = summary.get("work_item") or {}
+    item = update_work_item(
+        paths,
+        args.work_id,
+        status="closed",
+        closed_at=iso_now(),
+        closeout_readiness="ready",
+        itinerary=summary_item.get("itinerary", []),
+        outcome_profile=summary_item.get("outcome_profile", {}),
+        risk_overlays=summary_item.get("risk_overlays", []),
+    )
     learning = extract_learning_candidate(paths, summary, item)
     _candidates, learning_md, learning_html = write_learning_candidate(paths, learning)
     dashboard = build_daily_dashboard(paths)
@@ -3233,9 +4309,12 @@ def run_work_close(args, paths):
         "records": [item, learning],
         "findings": [],
         "closed": True,
+        "work_id": args.work_id,
         "learning": learning,
         "learning_report": str(learning_md),
         "learning_html": str(learning_html),
+        "report": str(learning_md),
+        "html": str(learning_html),
         "dashboard": str(paths.daily_dashboard_path),
         "daily": dashboard,
     }
@@ -3272,14 +4351,32 @@ def run_proof_add(args, paths):
         }
     proofs = upsert_proof(paths, proof)
     md_path, html_path = write_proof_report(paths, proofs)
-    return {
-        "records": [proof],
+    carry_forward = build_carry_forward_record(proof, work_item)
+    if carry_forward:
+        upsert_carry_forward(paths, carry_forward)
+    result = {
+        "records": [proof] + ([carry_forward] if carry_forward else []),
         "findings": [],
         "proof_id": proof["proof_id"],
         "proofs_path": str(paths.proofs_path),
         "report": str(md_path),
         "html": str(html_path),
+        "carry_forward": carry_forward or {},
     }
+    # Close the itinerary join at write time: a proof recorded here that clears the verifier bar
+    # flips its pathway required->proved, so coverage reflects the verification that actually
+    # passed instead of stalling at logged_unverified. Uses the SAME gate as the inline work-log
+    # flip (proof_is_verified), so a bare attestation still cannot prove.
+    if proof.get("work_id"):
+        item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == proof["work_id"]), None)
+        if item:
+            itinerary = list(item.get("itinerary") or [])
+            if apply_proof_coverage(itinerary, proved_pathways_from_proofs(proof["work_id"], proofs)):
+                item = update_work_item(paths, proof["work_id"], itinerary=itinerary)
+            covered, total, open_required = itinerary_coverage(item)
+            result["work_id"] = proof["work_id"]
+            result["itinerary_coverage"] = {"covered": covered, "total": total, "open": open_required}
+    return result
 
 
 def run_proof_report(args, paths):
@@ -3546,8 +4643,9 @@ def learned_pathway_closures(paths, project_name, project_path):
     return closures
 
 
-def score_pathways(paths, project_path, project_name, scoped_findings, work_summaries):
-    """Score each of the 11 pathways by how much it is the current constraint.
+def score_pathways(paths, project_path, project_name, scoped_findings, work_summaries,
+                   outcome_profile=None, risk_overlays=None, latest_carry_forward=None):
+    """Score each pathway by how much it is the current constraint.
 
     Higher score = more urgent to run next. Foundation gates (research, govern)
     get a large boost when no run exists for the project, encoding the Karpathy
@@ -3563,14 +4661,37 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
 
     # Pathways already exercised for this project's active work.
     seen = set()
+    covered_pathways = set()
     open_controls = []
     stale_count = 0
     missing_evidence_count = 0
     for summary in work_summaries:
         seen.update(summary.get("pathway_coverage", {}).get("seen", []))
+        covered_pathways.update(summary.get("pathway_coverage", {}).get("proved", []))
+        covered_pathways.update(
+            e.get("pathway") for e in summary.get("itinerary", [])
+            if e.get("status") in ("proved", "na")
+        )
         open_controls.extend(summary.get("open_controls", []))
         stale_count += len(summary.get("stale_measurements", []))
         missing_evidence_count += len(summary.get("missing_evidence", []))
+
+    def covered_by_active_work(pathway):
+        return pathway in covered_pathways
+
+    profile = outcome_profile or {}
+    if profile.get("id"):
+        for pathway in profile.get("required_pathways", []) or []:
+            if not covered_by_active_work(pathway):
+                bump(pathway, 12, f"Outcome profile `{profile.get('id')}` requires {pathway}.")
+    for overlay in risk_overlays or []:
+        for pathway in overlay.get("required_pathways", []) or []:
+            if not covered_by_active_work(pathway):
+                bump(pathway, 35, f"Risk overlay `{overlay.get('id')}` requires {pathway}: {overlay.get('title', '')}.")
+    if latest_carry_forward:
+        for pathway in carry_forward_next_pathways(latest_carry_forward):
+            if not covered_by_active_work(pathway):
+                bump(pathway, 25, f"Carry-forward `{latest_carry_forward.get('pathway')}` says the next move must use {pathway}.")
 
     # Foundation gates. For an ACTIVE tracked outcome, govern/research genuinely come first (don't
     # plan from vague context) — they dominate so the itinerary walks foundations before building.
@@ -3604,7 +4725,7 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
         bump("quality", 4 * missing_evidence_count, f"{missing_evidence_count} measurement(s) lack evidence.")
 
     # Missing core pathways (never run) get a small completeness nudge.
-    for p in PATHWAY_ORDER:
+    for p in CORE_PATHWAYS:
         if p not in seen and p not in ("research", "govern"):
             bump(p, 4, "Pathway has no run for this project's active work yet.")
 
@@ -3624,7 +4745,7 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
                  f"Demonstrated: {len(closed_ids)} closed outcome(s) proved {pathway} — "
                  "deprioritized in favor of pathways not yet demonstrated.")
 
-    ranked = sorted(scores.values(), key=lambda s: (-s["score"], PATHWAY_ORDER.index(s["pathway"])))
+    ranked = sorted(scores.values(), key=lambda s: (-s["score"], pathway_sort_key(s["pathway"])))
     return ranked
 
 
@@ -3640,6 +4761,7 @@ def karpathy_card(pathway, project_name, goal):
         "skill": doctrine.get("skill", ""),
         "execution_stack": list(PATHWAY_EXECUTION.get(pathway, {}).get("stack", [])),
         "execution_tools": list(PATHWAY_EXECUTION.get(pathway, {}).get("tools", [])),
+        "verifier_template": verifier_template_for(pathway),
         "goal": goal or f"Advance {project_name} via the {pathway} pathway",
     }
 
@@ -3693,6 +4815,39 @@ def recommendation_confidence(ranked, has_context, trust):
     }
 
 
+# Earning autonomy from a success rate at small n (fast-follow dossier item 3). A Wald point
+# estimate (proved/total) is the bug: n=1 at 100% reads 1.0 and wrongly unlocks. The gate instead
+# uses a Wilson score lower bound (z=1.96) behind a hard floor of MIN_AUTONOMY_N proofs — below the
+# floor no streak unlocks; above it, the lower bound proves the RATE, not a lucky run. Wilson beats
+# Clopper-Pearson (over-covers, wastes proofs) and SPRT (needs two hypotheses) for a static gate; a
+# Jeffreys cross-check in the test suite confirms the thresholds are not a single-formula artifact.
+# At z=1.96 the unlock math is n=10->k>=9, n=20->k>=15, n=50->k>=32. (Brown, Cai & DasGupta 2001.)
+MIN_AUTONOMY_N = 10
+
+
+def wilson_lower_bound(k, n, z=1.96):
+    """Lower bound of the Wilson score interval for k successes in n trials — closed-form,
+    deterministic, auditable in one line. Fail-closed to 0.0 on no/invalid evidence (n<=0, or a
+    corrupted count outside 0<=k<=n): a safety gate must never crash on a bad ledger row."""
+    if n <= 0 or k < 0 or k > n:
+        return 0.0
+    p = k / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = p + z2 / (2 * n)
+    margin = z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))
+    return (center - margin) / denom
+
+
+def autonomy_gate_rate(proved, total):
+    """The proof-track-record rate fed to the autonomy gate: the Wilson lower bound of proved/total,
+    but ONLY once total clears MIN_AUTONOMY_N; below the floor it is 0.0, so a handful of low-n
+    successes can never unlock execute-safe. ('A hard minimum n is non-negotiable.')"""
+    if total < MIN_AUTONOMY_N:
+        return 0.0
+    return wilson_lower_bound(proved, total)
+
+
 def suggest_autonomy_tier(proved_rate, trust, confidence, gate_target=0.5):
     """Engine-side computation of the LOOP autonomy tier (see commands/pathway.md), so the
     /pathway skill reads ONE field instead of re-deriving the Tier-2 rule from three signals
@@ -3735,7 +4890,7 @@ def suggest_autonomy_tier(proved_rate, trust, confidence, gate_target=0.5):
     }
 
 
-def render_pathway_next_report(paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources=None, trust=None, confidence=None, autonomy=None):
+def render_pathway_next_report(paths, project_name, recommended, ranked, card, work_id, next_command, has_context, sources=None, trust=None, confidence=None, autonomy=None, latest_carry_forward=None, carry_forward_note="", outcome_profile=None, risk_overlays=None):
     sources = sources or {}
     trust = trust or {"status": "unknown", "summary": "pathway-trust has not run yet"}
     confidence = confidence or recommendation_confidence(ranked, has_context, trust)
@@ -3749,8 +4904,8 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
         "",
         "```mermaid",
         "flowchart LR",
-        '  A["Gather state"] --> B["Score 11 pathways"]',
-        '  B --> C["Apply foundation-first order"]',
+        '  A["Gather state"] --> B["Classify outcome + overlays"]',
+        f'  B --> C["Score {len(PATHWAY_ORDER)} pathways"]',
         f'  C --> D["Run: {rec_pathway}"]',
         '  D --> E["Log measurement against work_id"]',
         "```",
@@ -3760,9 +4915,27 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
         f"- **Spec (the decision):** {card['spec_decision']}",
         f"- **Verifier (what good looks like):** {card['verifier_good']}",
         f"- **Real artifact (proof):** {card['real_artifact']}",
+        f"- **Verifier template:** `{card.get('verifier_template', {}).get('id', 'none')}`",
         f"- **Skill to run:** `{card['skill']}`",
         f"- **Best-execution stack:** {' → '.join(card.get('execution_stack', [])) or card['skill']}",
         f"- **Env / plugins / MCP:** {', '.join(card.get('execution_tools', [])) or '—'}",
+        "",
+        "## Outcome Profile And Risk Overlays",
+        "",
+        f"- **Outcome profile:** `{(outcome_profile or {}).get('id', 'internal-live-feature')}` — {(outcome_profile or {}).get('label', '')}",
+        f"- **Profile tier default:** `{(outcome_profile or {}).get('default_tier', DEFAULT_ITINERARY_TIER)}`",
+        f"- **Required by profile:** {', '.join((outcome_profile or {}).get('required_pathways', []) or []) or '—'}",
+        "",
+        "| Overlay | Pulls In | Why It Matters |",
+        "|---|---|---|",
+    ]
+    for overlay in risk_overlays or []:
+        lines.append(
+            f"| `{overlay.get('id')}` | {', '.join(overlay.get('required_pathways', [])) or '—'} | {overlay.get('title', '')} |"
+        )
+    if not risk_overlays:
+        lines.append("| — | — | No risk overlay matched the current signals. |")
+    lines += [
         "",
         "## Pathway Trust",
         "",
@@ -3784,6 +4957,22 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
     if missing:
         lines += ["", "Missing evidence:"]
         lines.extend(f"- {item}" for item in missing)
+    cf = latest_carry_forward or {}
+    lines += [
+        "",
+        "## What Previous Work Changed",
+        "",
+        f"- **Carry-forward:** {carry_forward_note or carry_forward_effect(cf, rec_pathway)}",
+    ]
+    if cf:
+        lines += [
+            f"- **Source artifact:** `{cf.get('source_artifact', '')}`",
+            f"- **What changed:** {'; '.join(cf.get('what_changed', [])[:3]) or '—'}",
+            f"- **More relevant now:** {'; '.join(cf.get('more_relevant', [])[:3]) or '—'}",
+            f"- **Less relevant / deferred:** {'; '.join(cf.get('less_relevant', [])[:3]) or '—'}",
+            f"- **Next must use:** {'; '.join(cf.get('next_pathway_must_use', [])[:3]) or '—'}",
+            f"- **Active risk overlays:** {', '.join(cf.get('active_risk_overlays', [])[:6]) or '—'}",
+        ]
     if autonomy:
         lines += [
             "",
@@ -3791,7 +4980,8 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
             "",
             f"- **Tier:** `{autonomy.get('tier', 'recommend')}`",
             f"- **Why:** {autonomy.get('why', '')}",
-            f"- **Inputs:** proof rate {autonomy.get('proved_rate', 0)} · trust "
+            f"- **Inputs:** proof gate-rate {round(autonomy.get('proved_rate', 0), 3)} "
+            f"(Wilson LB, n>={MIN_AUTONOMY_N}) · trust "
             f"`{autonomy.get('trust_status', 'unknown')}` · confidence "
             f"`{autonomy.get('confidence_level', 'unknown')}` (gate {autonomy.get('gate_target', 0.5)})",
         ]
@@ -4053,7 +5243,25 @@ def run_pathway_next(args, paths):
     sources = {"operating_layer": len(ol_findings), "project_local": len(local_findings)}
     work_items = active_work_for_project(paths, project_path, project_name)
     work_summaries = [work_status_summary(paths, w.get("work_id")) for w in work_items]
-    ranked = score_pathways(paths, project_path, project_name, scoped_findings, work_summaries)
+    active_summary = work_summaries[0] if work_summaries else None
+    work_id = work_items[0].get("work_id") if work_items else None
+    active_item = (active_summary or {}).get("work_item") or (work_items[0] if work_items else {})
+    latest_carry_forward = latest_carry_forward_for_work(paths, work_id) if work_id else {}
+    goal_for_contract = args.goal or active_item.get("goal") or f"Advance {project_name} via /pathway"
+    if active_item.get("outcome_profile") or active_item.get("risk_overlays"):
+        outcome_profile = active_item.get("outcome_profile") or classify_outcome_profile(
+            goal_for_contract, project_name, scoped_findings, latest_carry_forward)
+        risk_overlays = active_item.get("risk_overlays") or detect_risk_overlays(
+            goal_for_contract, project_name, scoped_findings, latest_carry_forward, outcome_profile)
+        contract_tier = active_item.get("tier", DEFAULT_ITINERARY_TIER)
+    else:
+        contract = outcome_contract(goal_for_contract, project_path, project_name, scoped_findings, latest_carry_forward)
+        outcome_profile = contract["outcome_profile"]
+        risk_overlays = contract["risk_overlays"]
+        contract_tier = contract["tier"]
+    ranked = score_pathways(
+        paths, project_path, project_name, scoped_findings, work_summaries,
+        outcome_profile, risk_overlays, latest_carry_forward)
     recommended = ranked[0]
     # Itinerary override: when the active outcome still owes required pathways, the next
     # move comes from the committed itinerary (so coverage is never silently skipped) —
@@ -4063,8 +5271,12 @@ def run_pathway_next(args, paths):
     # highest-scored one (ranked is score-sorted, with findings/controls already routed to
     # pathways), so the next move bends toward current risk instead of canonical order.
     # (Gap B part 2: coverage guarantee + evidence-grounded ordering, together.)
-    active_summary = work_summaries[0] if work_summaries else None
     itinerary_open = (active_summary or {}).get("itinerary_coverage", {}).get("open", []) if active_summary else []
+    itinerary_total = (active_summary or {}).get("itinerary_coverage", {}).get("total", 0) if active_summary else 0
+    # Ready-to-close routing: a tracked outcome whose itinerary is fully covered has no
+    # next pathway owed — the honest next move is work-close, and the result must say so
+    # explicitly instead of pointing the operator at another work-log.
+    ready_to_close = bool(work_id and itinerary_total and not itinerary_open)
     if itinerary_open:
         FOUNDATIONS = ("govern", "research")
         open_foundations = [p for p in itinerary_open if p in FOUNDATIONS]
@@ -4085,24 +5297,32 @@ def run_pathway_next(args, paths):
         [r for r in ranked if r["pathway"] in itinerary_open] if itinerary_open else ranked
     )
     confidence = recommendation_confidence(ranked_for_confidence, has_context, trust)
-    # Gap C (autonomy unlock): the engine — not the skill — computes the LOOP autonomy tier,
-    # from the proof track record (fresh this turn), trust, and the recommended pick's
-    # confidence. The /pathway loop reads `suggested_autonomy_tier` instead of re-deriving the
-    # Tier-2 rule. proved_rate is measured over PRIOR recommendations (this run's rec is logged
-    # below, after), so it reflects the established track record, never the just-issued pick.
+    # Gap C (autonomy unlock): the engine — not the skill — computes the LOOP autonomy tier from the
+    # proof track record (fresh this turn), trust, and the recommended pick's confidence. The track
+    # record is gated through autonomy_gate_rate: a Wilson lower bound behind the MIN_AUTONOMY_N
+    # floor, so a single proved pick (n=1 at 100%) can no longer unlock execute-safe — only a
+    # demonstrated RATE over >=10 prior recommendations can. Measured over PRIOR recommendations
+    # (this run's rec is logged below, after), so it reflects the track record, never the new pick.
+    metric = compute_pathway_metric(paths)
     autonomy = suggest_autonomy_tier(
-        compute_pathway_metric(paths).get("proved_rate", 0.0), trust, confidence)
+        autonomy_gate_rate(metric.get("proved", 0), metric.get("total_recommendations", 0)),
+        trust, confidence)
     recommendations = read_ndjson(paths.recommendations_path)
     recommendation_id = f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}"
 
-    work_id = work_items[0].get("work_id") if work_items else None
-    if work_id:
+    carry_forward_note = carry_forward_effect(latest_carry_forward, recommended["pathway"])
+    if ready_to_close:
+        next_command = (
+            f"python3 ~/.claude/scripts/operating-layer.py work-close \\\n"
+            f"  --work-id {work_id} --json"
+        )
+    elif work_id:
         next_command = (
             f"python3 ~/.claude/scripts/operating-layer.py work-log \\\n"
             f"  --work-id {work_id} \\\n"
             f"  --pathway {recommended['pathway']} --kind verify \\\n"
-            f"  --evidence <path-to-real-artifact> --gate {recommended['pathway']}-gate \\\n"
-            f"  --proof-type artifact --verified-by \"<verification-command>\" \\\n"
+            f"  --evidence <path-to-real-artifact> --gate {recommended['pathway']}-gate --result pass \\\n"
+            f"  --proof-type artifact --verify-cmd \"<verification-command>\" \\\n"
             f"  --recommendation-id {recommendation_id}"
         )
     else:
@@ -4110,39 +5330,50 @@ def run_pathway_next(args, paths):
         next_command = (
             f"python3 ~/.claude/scripts/operating-layer.py work-start \\\n"
             f"  --project {project_path} \\\n"
-            f"  --goal \"{goal_text}\""
+            f"  --goal \"{goal_text}\" \\\n"
+            f"  --tier {contract_tier}"
         )
 
     md_path = dated_artifact_path(paths, f"pathway-next-{safe_slug(project_name)}")
     html_path = md_path.with_suffix(".html")
     write_text(md_path, render_pathway_next_report(
         paths, project_name, recommended, ranked, card, work_id, next_command, has_context,
-        sources, trust, confidence, autonomy))
+        sources, trust, confidence, autonomy, latest_carry_forward, carry_forward_note,
+        outcome_profile, risk_overlays))
     render_html(md_path, html_path)
 
     # Log the recommendation so pathway-metric can measure follow-through (govern metric).
-    recommendations.append({
-        "recommendation_id": recommendation_id,
-        "project": project_name,
-        "pathway": recommended["pathway"],
-        "work_id": work_id or "",
-        "confidence": confidence.get("level", ""),
-        "runner_up_pathway": confidence.get("runner_up_pathway", ""),
-        "why_this": confidence.get("why_this", ""),
-        "why_not_runner_up": confidence.get("why_not_runner_up", ""),
-        "suggested_autonomy_tier": autonomy["tier"],
-        "timestamp": iso_now(),
-    })
-    write_ndjson(paths.recommendations_path, recommendations)
+    # Skipped when ready_to_close: no pathway is being recommended, and logging one here
+    # would seed a follow-through entry that can never be proved (the outcome closes).
+    if not ready_to_close:
+        recommendations.append({
+            "recommendation_id": recommendation_id,
+            "project": project_name,
+            "pathway": recommended["pathway"],
+            "work_id": work_id or "",
+            "confidence": confidence.get("level", ""),
+            "runner_up_pathway": confidence.get("runner_up_pathway", ""),
+            "why_this": confidence.get("why_this", ""),
+            "why_not_runner_up": confidence.get("why_not_runner_up", ""),
+            "carry_forward_id": latest_carry_forward.get("carry_forward_id", ""),
+            "outcome_profile": outcome_profile.get("id", ""),
+            "risk_overlays": [o.get("id") for o in risk_overlays],
+            "suggested_autonomy_tier": autonomy["tier"],
+            "timestamp": iso_now(),
+        })
+        write_ndjson(paths.recommendations_path, recommendations)
 
     rec_finding = finding(
         "pathway-next-recommendation",
         "pathway-next",
         "info",
-        f"Next-best pathway for {project_name}: {recommended['pathway']} ({card['title']}) "
-        f"— {recommended['reasons'][0] if recommended['reasons'] else 'lowest-coverage pathway'}.",
+        (f"All itinerary pathways for {project_name} are covered — work item {work_id} is ready to close."
+         if ready_to_close else
+         f"Next-best pathway for {project_name}: {recommended['pathway']} ({card['title']}) "
+         f"— {recommended['reasons'][0] if recommended['reasons'] else 'lowest-coverage pathway'}."),
         [line_evidence(md_path, source=project_name)],
-        card["one_percent_move"],
+        ("Run work-close to close the outcome and bank the learning candidate." if ready_to_close
+         else card["one_percent_move"]),
         "static",
         "high",
     )
@@ -4154,6 +5385,7 @@ def run_pathway_next(args, paths):
         "karpathy_card": card,
         "one_percent_move": card["one_percent_move"],
         "work_id": work_id,
+        "ready_to_close": ready_to_close,
         "next_command": next_command,
         "ranked": ranked,
         "signal_sources": sources,
@@ -4162,6 +5394,10 @@ def run_pathway_next(args, paths):
         "recommendation_confidence": confidence,
         "suggested_autonomy_tier": autonomy["tier"],
         "autonomy_rationale": autonomy,
+        "latest_carry_forward": latest_carry_forward,
+        "carry_forward_effect": carry_forward_note,
+        "outcome_profile": outcome_profile,
+        "risk_overlays": risk_overlays,
         "itinerary": (active_summary or {}).get("itinerary", []) if active_summary else [],
         "itinerary_coverage": (active_summary or {}).get("itinerary_coverage", {}) if active_summary else {},
         "report": str(md_path),
@@ -4193,6 +5429,8 @@ def run_pathway_run(args, paths):
         work_id = item.get("work_id")
     else:
         work_id = stable_work_id(project_path, goal_text)
+        scoped_findings = project_scoped_findings(paths, project_path, project_name) + project_local_findings(project_path)[0]
+        contract = outcome_contract(goal_text, project_path, project_name, scoped_findings)
         item = update_work_item(
             paths,
             work_id,
@@ -4202,6 +5440,10 @@ def run_pathway_run(args, paths):
             project_name=project_name,
             goal=goal_text,
             context=current_work_context(paths, project_path),
+            tier=contract["tier"],
+            outcome_profile=contract["outcome_profile"],
+            risk_overlays=contract["risk_overlays"],
+            itinerary=compute_itinerary(contract["tier"], goal_text, contract["outcome_profile"], contract["risk_overlays"]),
             closeout_readiness="not_ready",
         )
 
@@ -4213,8 +5455,8 @@ def run_pathway_run(args, paths):
         f"python3 ~/.claude/scripts/operating-layer.py work-log \\\n"
         f"  --work-id {work_id} \\\n"
         f"  --pathway {pathway} --kind verify \\\n"
-        f"  --evidence <path-to-real-artifact> --gate {pathway}-gate \\\n"
-        f"  --proof-type artifact --verified-by \"{guard_command or card.get('skill', '<verification-command>')}\" \\\n"
+        f"  --evidence <path-to-real-artifact> --gate {pathway}-gate --result pass \\\n"
+        f"  --proof-type artifact --verify-cmd \"{guard_command or '<verification-command>'}\" \\\n"
         f"  --recommendation-id {rec.get('recommendation_id', '')}"
     )
     plan = {
@@ -4249,6 +5491,237 @@ def run_pathway_run(args, paths):
         "html": str(html_path),
         "dashboard": str(paths.daily_dashboard_path),
         "daily": dashboard,
+    }
+
+
+def pathway_pilot_project_inputs(args):
+    raw = getattr(args, "projects", "") or getattr(args, "project", "") or ""
+    items = []
+    for part in str(raw).split(","):
+        value = part.strip()
+        if value:
+            items.append(value)
+    return items
+
+
+def review_gate_for_recommendation(rec):
+    pathway = rec.get("recommended_pathway", "")
+    autonomy = rec.get("suggested_autonomy_tier", "recommend")
+    confidence = rec.get("recommendation_confidence", {}).get("level", "low")
+    trust = rec.get("pathway_trust", {}).get("status", "unknown")
+    overlay_ids = {o.get("id") for o in rec.get("risk_overlays", []) if o.get("id")}
+    reasons = []
+    if autonomy != "execute-safe":
+        reasons.append(f"autonomy tier is {autonomy}")
+    if confidence != "high":
+        reasons.append(f"confidence is {confidence}")
+    if trust != "pass":
+        reasons.append(f"trust is {trust}")
+    if pathway in {"field", "release"}:
+        reasons.append(f"{pathway} pathway has an explicit human gate")
+    matched_overlays = sorted(overlay_ids & HUMAN_GATE_OVERLAYS)
+    if matched_overlays:
+        reasons.append("risk overlays require review: " + ", ".join(matched_overlays))
+    return {
+        "required": bool(reasons),
+        "reasons": reasons,
+        "default_action": "Alex reviews/approves before autonomous continuation." if reasons
+        else "Agentic loop may run the local reversible slice and still log proof before closeout.",
+    }
+
+
+def team_assignment_for_pathway(pathway):
+    base = TEAM_ROLE_BY_PATHWAY.get(pathway, {})
+    return {
+        "pathway": pathway,
+        "lead": base.get("lead", "Implementer"),
+        "critic": base.get("critic", "Second-model reviewer"),
+        "proof_gate": base.get("proof_gate", "Real artifact proof with executed verifier."),
+        "human_gate": base.get("human_gate", "Alex reviews material scope, prod, or external-risk decisions."),
+        "execution_stack": list(PATHWAY_EXECUTION.get(pathway, {}).get("stack", [])),
+        "execution_tools": list(PATHWAY_EXECUTION.get(pathway, {}).get("tools", [])),
+    }
+
+
+def pilot_id_for(cohort_id, project, recommendation_id):
+    return f"PILOT-{safe_slug(cohort_id)}-{safe_slug(project)}-{short_hash(cohort_id, project, recommendation_id, length=8)}"
+
+
+def render_pathway_pilot_report(snapshot):
+    metric = snapshot.get("measurement_snapshot", {})
+    lines = [
+        "# Agentic Dev Team Pilot",
+        "",
+        f"Generated: {snapshot.get('generated_at')}",
+        f"Cohort: `{snapshot.get('cohort_id')}`",
+        "",
+        "## Final-State Spec",
+        "",
+        "The operating layer now treats the dev environment as an agentic team, not a bag of commands:",
+        "",
+        "- `pathway-next` chooses the next pathway from live state, carry-forward memory, risk overlays, and work coverage.",
+        "- Each pathway maps to a lead, critic, proof gate, and Alex review gate.",
+        "- `pathway-run` creates the execution plan; `work-log` proves it with a real artifact and executed verifier.",
+        "- `pathway-metric`, `pathway-evaluate`, carry-forward records, and learning candidates measure improvement over time.",
+        "",
+        "## Measurement Snapshot",
+        "",
+        f"- Recommendations: {metric.get('total_recommendations', 0)}",
+        f"- Acted-on rate: {metric.get('acted_on_rate', 0)}",
+        f"- Proved rate: {metric.get('proved_rate', 0)}",
+        f"- Gate target: {metric.get('gate_target', 0)}",
+        "",
+        "## Pilot Cohort",
+        "",
+        "| Project | Work | Next Pathway | Lead | Critic | Autonomy | Review Gate |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for rec in snapshot.get("records", []):
+        team = rec.get("team_assignment", {})
+        review = rec.get("review_gate", {})
+        lines.append(
+            "| "
+            + " | ".join([
+                table_cell(rec.get("project")),
+                table_cell(rec.get("work_id") or "needs work-start"),
+                f"`{table_cell(rec.get('recommended_pathway'))}`",
+                table_cell(team.get("lead")),
+                table_cell(team.get("critic")),
+                f"`{table_cell(rec.get('suggested_autonomy_tier'))}`",
+                "yes" if review.get("required") else "no",
+            ])
+            + " |"
+        )
+    lines += [
+        "",
+        "## Review Gates",
+        "",
+    ]
+    for rec in snapshot.get("records", []):
+        review = rec.get("review_gate", {})
+        lines += [
+            f"### {rec.get('project')} / `{rec.get('recommended_pathway')}`",
+            "",
+            f"- Required: `{bool(review.get('required'))}`",
+            f"- Default action: {review.get('default_action', '')}",
+        ]
+        reasons = review.get("reasons", [])
+        if reasons:
+            lines.append("- Reasons:")
+            lines.extend(f"  - {reason}" for reason in reasons)
+        lines += [
+            f"- Proof gate: {rec.get('team_assignment', {}).get('proof_gate', '')}",
+            f"- Next command: `{rec.get('next_command', '').splitlines()[0] if rec.get('next_command') else ''}`",
+            "",
+        ]
+    lines += [
+        "## Operating Loop",
+        "",
+        "1. Run the next pathway for one pilot project.",
+        "2. Attach a real artifact and executed `--verify-cmd` through `work-log`.",
+        "3. Re-run `pathway-pilot` to refresh the cohort.",
+        "4. Judge at least one recommendation with `pathway-evaluate` so precision is measured, not assumed.",
+        "5. Close work only after required pathways are proved or explicitly N/A with a reason.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def run_pathway_pilot(args, paths):
+    projects = pathway_pilot_project_inputs(args)
+    if not projects:
+        return {
+            "findings": [finding(
+                "pathway-pilot-missing-projects",
+                "pathway-pilot",
+                "warn",
+                "pathway-pilot requires --project or --projects with one or more project names/paths.",
+                [line_evidence(paths.projects_root)],
+                "Run `pathway-pilot --projects koho,prettyfly-os --goal \"pilot goal\"`.",
+                "static",
+                "high",
+            )],
+            "records": [],
+        }
+    cohort_id = f"COHORT-{utc_now().strftime('%Y%m%d')}-{short_hash(','.join(projects), getattr(args, 'goal', ''), length=8)}"
+    records = []
+    findings_out = []
+    for raw_project in projects:
+        project_path = resolve_project_path(argparse.Namespace(project=raw_project), paths)
+        if not project_path or not Path(project_path).exists():
+            findings_out.append(finding(
+                "pathway-pilot-unknown-project",
+                "pathway-pilot",
+                "warn",
+                f"Project does not exist: {raw_project}",
+                [line_evidence(paths.projects_root, source=raw_project)],
+                "Pass an existing project path or project name under the projects root.",
+                "static",
+                "high",
+            ))
+            continue
+        goal = getattr(args, "goal", "") or f"Pilot the agentic dev team loop on {Path(project_path).name}"
+        next_args = argparse.Namespace(**vars(args))
+        next_args.project = project_path
+        next_args.goal = goal
+        rec = run_pathway_next(next_args, paths)
+        if not rec.get("work_id") and getattr(args, "goal", ""):
+            start_args = argparse.Namespace(**vars(args))
+            start_args.project = project_path
+            start_args.goal = goal
+            start_args.tier = rec.get("outcome_profile", {}).get("default_tier") or DEFAULT_ITINERARY_TIER
+            run_work_start(start_args, paths)
+            rec = run_pathway_next(next_args, paths)
+        pathway = rec.get("recommended_pathway", "")
+        team = team_assignment_for_pathway(pathway)
+        review = review_gate_for_recommendation(rec)
+        record = {
+            "pilot_id": pilot_id_for(cohort_id, rec.get("project", Path(project_path).name), rec.get("recommendation_id", "")),
+            "cohort_id": cohort_id,
+            "timestamp": iso_now(),
+            "project": rec.get("project", Path(project_path).name),
+            "project_path": project_path,
+            "goal": goal,
+            "work_id": rec.get("work_id") or "",
+            "recommended_pathway": pathway,
+            "recommendation_id": rec.get("recommendation_id", ""),
+            "confidence": rec.get("recommendation_confidence", {}).get("level", ""),
+            "suggested_autonomy_tier": rec.get("suggested_autonomy_tier", ""),
+            "outcome_profile": rec.get("outcome_profile", {}),
+            "risk_overlays": rec.get("risk_overlays", []),
+            "team_assignment": team,
+            "review_gate": review,
+            "next_command": rec.get("next_command", ""),
+            "pathway_next_report": rec.get("report", ""),
+            "pathway_next_html": rec.get("html", ""),
+            "source": "operating-layer pathway-pilot",
+        }
+        records.append(record)
+    metric = compute_pathway_metric(paths, args.window_days if args.window_days is not None else 1,
+                                    args.gate_target if args.gate_target is not None else 0.5)
+    snapshot = {
+        "generated_at": iso_now(),
+        "cohort_id": cohort_id,
+        "records": records,
+        "measurement_snapshot": metric,
+        "team_roles": TEAM_ROLE_BY_PATHWAY,
+        "review_gate_overlays": sorted(HUMAN_GATE_OVERLAYS),
+    }
+    existing = read_ndjson(paths.pathway_pilots_path)
+    write_ndjson(paths.pathway_pilots_path, existing + records)
+    write_json(paths.pathway_pilot_latest_path, snapshot)
+    md_path = dated_artifact_path(paths, "pathway-pilot")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_pathway_pilot_report(snapshot))
+    render_html(md_path, html_path)
+    return {
+        "records": records,
+        "findings": findings_out,
+        "cohort_id": cohort_id,
+        "pilot_ledger": str(paths.pathway_pilots_path),
+        "pilot_latest": str(paths.pathway_pilot_latest_path),
+        "measurement_snapshot": metric,
+        "report": str(md_path),
+        "html": str(html_path),
     }
 
 
@@ -4464,6 +5937,351 @@ def run_pathway_metric(args, paths):
         "metric": metric,
         "written": str(paths.operator_intel / "pathway-metric.json"),
     }
+
+
+AUDIT_DOCUMENT_REQUIREMENTS = {
+    "commands/pathway.md": ("pathway-next", "work-close", "--verify-cmd", CANONICAL_PATHWAY_CATALOG),
+    "README.md": ("pathway-next", "work-close", "--verify-cmd", CANONICAL_PATHWAY_CATALOG),
+    "pathway skill": ("$pathway", "work-log", "--verify-cmd", CANONICAL_PATHWAY_CATALOG),
+    "Claude instructions": ("Pathway", "--verify-cmd", CANONICAL_PATHWAY_CATALOG),
+    "Codex instructions": ("Pathway", "--verify-cmd", CANONICAL_PATHWAY_CATALOG),
+    "Hermes instructions": ("Pathway", "proof", CANONICAL_PATHWAY_CATALOG),
+    "technical-operator profile": ("Pathway", "proof", CANONICAL_PATHWAY_CATALOG),
+}
+PATHWAY_AUDIT_SCHEMA_VERSION = "v1"
+PATHWAY_AUDIT_REQUIRED_FIELDS = (
+    "overall_score", "pathway_scores", "metric_snapshot", "drift_findings",
+    "highest_value_refinements", "data_lineage",
+)
+
+
+def pathway_audit_document_surfaces(paths):
+    """Read the small, explicit authority surface for audit drift checks.
+
+    These paths are observations only. A missing or stale surface reduces the score and is
+    reported; this command never repairs a document on the caller's behalf.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    agents_root = Path(paths.projects_root) / "agents"
+    locations = {
+        "commands/pathway.md": repo_root / "commands" / "pathway.md",
+        "README.md": repo_root / "README.md",
+        "pathway skill": _HOME / ".agents" / "skills" / "pathway" / "SKILL.md",
+        "Claude instructions": paths.claude_home / "CLAUDE.md",
+        "Codex instructions": paths.codex_home / "AGENTS.md",
+        "Hermes instructions": agents_root / "CLAUDE.md",
+        "technical-operator profile": agents_root / "hermes" / "profiles" / "technical-operator" / "CLAUDE.md",
+    }
+    return {
+        label: {"path": str(path), "text": safe_read_text(path, max_bytes=2_000_000), "exists": path.is_file()}
+        for label, path in locations.items()
+    }
+
+
+def pathway_audit_document_drift(surfaces):
+    """Return deterministic, explainable drift findings for supplied document texts.
+
+    Keeping this pure makes intentionally drifted fixtures cheap to test and makes every
+    documentation deduction visible rather than hidden inside a score.
+    """
+    findings = []
+    checks = 0
+    passes = 0
+    for label, required in AUDIT_DOCUMENT_REQUIREMENTS.items():
+        surface = surfaces.get(label, {})
+        text = surface.get("text", "")
+        path = surface.get("path", label)
+        if not surface.get("exists", bool(text)):
+            findings.append({
+                "id": f"missing-{safe_slug(label)}",
+                "severity": "warn",
+                "surface": label,
+                "path": path,
+                "message": f"Required authority surface is missing: {label}.",
+                "refinement": f"Restore {label} and state the current Pathway proof contract.",
+            })
+            checks += len(required)
+            continue
+        for token in required:
+            checks += 1
+            if token.lower() in text.lower():
+                passes += 1
+                continue
+            findings.append({
+                "id": f"drift-{safe_slug(label)}-{safe_slug(token)}",
+                "severity": "warn",
+                "surface": label,
+                "path": path,
+                "message": f"{label} does not mention the required contract token `{token}`.",
+                "refinement": f"Align {label} with the canonical Pathway contract for `{token}`.",
+            })
+    return findings, passes, checks
+
+
+def pathway_audit_data_lineage(paths):
+    """Name the local ledgers consumed by Audit v1; paths are evidence, never credentials."""
+    return {
+        "schema_version": PATHWAY_AUDIT_SCHEMA_VERSION,
+        "sources": {
+            "proofs": str(paths.proofs_path),
+            "work_items": str(paths.work_items_path),
+            "carry_forward": str(paths.carry_forward_path),
+            "recommendations": str(paths.recommendations_path),
+        },
+    }
+
+
+def validate_pathway_audit_payload(audit):
+    """Validate Audit v1's local JSON contract before another tool relies on its score."""
+    errors = []
+    if not isinstance(audit, dict):
+        return ["audit payload must be an object"]
+    for field in PATHWAY_AUDIT_REQUIRED_FIELDS:
+        if field not in audit:
+            errors.append(f"missing required field: {field}")
+    score = audit.get("overall_score")
+    if not isinstance(score, int) or not 0 <= score <= 100:
+        errors.append("overall_score must be an integer from 0 to 100")
+    scores = audit.get("pathway_scores")
+    if not isinstance(scores, list) or not scores:
+        errors.append("pathway_scores must be a non-empty list")
+    else:
+        names = set()
+        for item in scores:
+            if not isinstance(item, dict) or not item.get("dimension"):
+                errors.append("each pathway score needs a dimension")
+                continue
+            names.add(item["dimension"])
+            value, maximum = item.get("score"), item.get("max_score")
+            if not isinstance(value, int) or not isinstance(maximum, int) or not 0 <= value <= maximum:
+                errors.append(f"invalid score bounds for {item.get('dimension', 'unknown')}")
+        if len(names) != len(scores):
+            errors.append("pathway score dimensions must be unique")
+    metric = audit.get("metric_snapshot")
+    if not isinstance(metric, dict):
+        errors.append("metric_snapshot must be an object")
+    else:
+        for field in ("project_proof_count", "verified_project_proof_count", "covered_pathways", "required_pathways"):
+            if not isinstance(metric.get(field), int) or metric[field] < 0:
+                errors.append(f"metric_snapshot.{field} must be a non-negative integer")
+        if metric.get("verified_project_proof_count", 0) > metric.get("project_proof_count", 0):
+            errors.append("verified project proofs cannot exceed project proof count")
+        if metric.get("covered_pathways", 0) > metric.get("required_pathways", 0):
+            errors.append("covered pathways cannot exceed required pathways")
+    lineage = audit.get("data_lineage")
+    if not isinstance(lineage, dict) or lineage.get("schema_version") != PATHWAY_AUDIT_SCHEMA_VERSION:
+        errors.append("data_lineage must declare the current audit schema version")
+    elif set(lineage.get("sources", {})) != {"proofs", "work_items", "carry_forward", "recommendations"}:
+        errors.append("data_lineage must name each Audit v1 source ledger")
+    return errors
+
+
+def _audit_score(name, score, maximum, evidence, status="measured"):
+    return {
+        "dimension": name,
+        "score": max(0, min(maximum, int(round(score)))),
+        "max_score": maximum,
+        "status": status,
+        "evidence": evidence,
+    }
+
+
+def audit_proof_integrity_snapshot(proofs, active_work_ids):
+    """Separate active readiness from historical proof hygiene without rewriting history."""
+    active_ids = {work_id for work_id in active_work_ids if work_id}
+    active = [proof for proof in proofs if proof.get("work_id") in active_ids]
+    scoped = active if active else proofs
+    verified = [proof for proof in scoped if proof_is_verified(proof)]
+    historical_unverified = [
+        proof for proof in proofs
+        if proof.get("work_id") not in active_ids and not proof_is_verified(proof)
+    ]
+    return {
+        "scope": "active outcomes" if active else "project history (no active outcome)",
+        "proof_count": len(scoped),
+        "verified_count": len(verified),
+        "historical_unverified_count": len(historical_unverified),
+    }
+
+
+def render_pathway_audit_report(audit):
+    lines = [
+        f"# Pathway Audit - {audit['project']}",
+        "",
+        f"Generated: {audit['generated_at']}",
+        "",
+        "## Score",
+        "",
+        f"- Overall score: **{audit['overall_score']}/100**",
+        f"- Target: {audit['target_score']} (reported only; this command exits zero after measurement)",
+        "",
+        "| Dimension | Score | Evidence |",
+        "|---|---:|---|",
+    ]
+    for item in audit["pathway_scores"]:
+        lines.append(f"| {item['dimension']} | {item['score']}/{item['max_score']} | {item['evidence']} |")
+    lines.extend(["", "## Drift Findings", ""])
+    if audit["drift_findings"]:
+        for item in audit["drift_findings"]:
+            lines.append(f"- `{item['id']}` ({item['surface']}): {item['message']}")
+    else:
+        lines.append("- No configured documentation drift found.")
+    lines.extend(["", "## Highest-Value Refinements", ""])
+    for item in audit["highest_value_refinements"]:
+        lines.append(f"{item['rank']}. {item['message']}")
+    lines.extend(["", "## Metric Snapshot", ""])
+    metric = audit["metric_snapshot"]
+    lines.extend([
+        f"- Proof integrity ({metric['proof_integrity_scope']}): {metric['proof_integrity_verified_count']}/{metric['proof_integrity_proof_count']} verified",
+        f"- Historical unverified proofs: {metric['historical_unverified_proof_count']}",
+        f"- Active work items: {metric['active_work_items']}",
+        f"- Itinerary coverage: {metric['covered_pathways']}/{metric['required_pathways']}",
+        f"- Recommendation proof rate: {metric['recommendation_proved_rate']}",
+        f"- Documentation checks: {metric['documentation_checks_passed']}/{metric['documentation_checks_total']}",
+        f"- Verifier templates: {metric['verifier_template_count']} configured",
+        "",
+        "## Boundary",
+        "",
+        "This is a local read-only scorecard. It reports missing controls and drift but does not change project files, runtime configuration, external systems, or the pass/fail policy for the target score.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def build_pathway_audit_signal(audit, proofs):
+    """Return a compact, safe-to-display local health signal for Audit v1.
+
+    The snapshot deliberately excludes evidence paths, verifier commands, and artifact text.
+    It is an operator signal, not production telemetry or an authorization to deploy.
+    """
+    project_proofs = [proof for proof in proofs if isinstance(proof, dict)]
+    template_mismatches = sum(
+        1 for proof in project_proofs
+        if proof.get("template_check") and not proof["template_check"].get("valid")
+    )
+    canary = {
+        "caught": sum(1 for proof in project_proofs if proof.get("canary_mutant_failed") is True),
+        "missed": sum(1 for proof in project_proofs if proof.get("canary_mutant_failed") is False),
+        "unavailable": sum(1 for proof in project_proofs if proof.get("canary_mutant_failed") is None),
+    }
+    metric = audit["metric_snapshot"]
+    return {
+        "schema_version": 1,
+        "generated_at": audit["generated_at"],
+        "project": audit["project"],
+        "overall_score": audit["overall_score"],
+        "target_score": audit["target_score"],
+        "coverage": {"covered": metric["covered_pathways"], "required": metric["required_pathways"]},
+        "recommendation_proved_rate": metric["recommendation_proved_rate"],
+        "verifier_template_count": metric["verifier_template_count"],
+        "template_mismatch_count": template_mismatches,
+        "canary": canary,
+        "drift_count": len(audit["drift_findings"]),
+    }
+
+
+def run_pathway_audit(args, paths):
+    """Measure Pathway proof integrity without treating a below-target score as an error."""
+    project_path = resolve_project_path(args, paths)
+    if not project_path:
+        raise ValueError("pathway-audit requires --project")
+    project = Path(project_path).expanduser()
+    project_name = project.name
+    active_work = active_work_for_project(paths, str(project), project_name)
+    # Audit one current outcome at a time. A project may have unrelated active work with a
+    # different proof posture; mixing it into this outcome's readiness score would make the
+    # selected work impossible to interpret or close on its own evidence.
+    selected_work = active_work[:1]
+    summaries = [work_status_summary(paths, item.get("work_id")) for item in selected_work]
+    proofs = [
+        proof for proof in read_ndjson(paths.proofs_path)
+        if proof.get("project") == project_name or proof.get("project_path") == str(project)
+    ]
+    verified_proofs = [proof for proof in proofs if proof_is_verified(proof)]
+    proof_integrity = audit_proof_integrity_snapshot(
+        proofs, [item.get("work_id") for item in selected_work])
+    carry_forward = [
+        item for item in read_ndjson(paths.carry_forward_path)
+        if item.get("project") == project_name or item.get("project_path") == str(project)
+    ]
+    surfaces = pathway_audit_document_surfaces(paths)
+    drift_findings, doc_passes, doc_checks = pathway_audit_document_drift(surfaces)
+    covered = sum(summary["itinerary_coverage"]["covered"] for summary in summaries)
+    required = sum(summary["itinerary_coverage"]["total"] for summary in summaries)
+    field_required = any(any(entry.get("pathway") == "field" for entry in summary.get("itinerary", [])) for summary in summaries)
+    release_required = any(any(entry.get("pathway") == "release" for entry in summary.get("itinerary", [])) for summary in summaries)
+    field_verified = any(proof.get("pathway") == "field" for proof in verified_proofs)
+    release_verified = any(proof.get("pathway") == "release" for proof in verified_proofs)
+    metric = compute_pathway_metric(paths)
+
+    if not proofs:
+        drift_findings.append({"id": "no-project-proofs", "severity": "warn", "surface": "proof ledger", "path": str(paths.proofs_path), "message": "No project proof records exist.", "refinement": "Log an executed verifier against the next completed pathway."})
+    if selected_work and required and covered < required:
+        drift_findings.append({"id": "open-itinerary-coverage", "severity": "warn", "surface": "work itinerary", "path": str(paths.work_items_path), "message": f"{required - covered} required pathway entries remain open.", "refinement": "Complete or explicitly justify the remaining itinerary entries with real evidence."})
+    if selected_work and not carry_forward:
+        drift_findings.append({"id": "missing-carry-forward", "severity": "warn", "surface": "carry-forward ledger", "path": str(paths.carry_forward_path), "message": "Active work has no project-scoped carry-forward receipt.", "refinement": "Record what changed, what is deferred, and the next pathway inputs."})
+    if field_required and not field_verified:
+        drift_findings.append({"id": "missing-field-receipt", "severity": "warn", "surface": "field proof", "path": str(paths.proofs_path), "message": "The itinerary requires field validation but no verified field proof exists.", "refinement": "Add a structured, locally verifiable field receipt in the field pathway slice."})
+    if release_required and not release_verified:
+        drift_findings.append({"id": "missing-release-proof", "severity": "warn", "surface": "release proof", "path": str(paths.proofs_path), "message": "The itinerary requires release evidence but no verified release proof exists.", "refinement": "Add rollback-aware release proof before closeout."})
+
+    scores = [
+        _audit_score(
+            "proof integrity",
+            25 * proof_integrity["verified_count"] / proof_integrity["proof_count"] if proof_integrity["proof_count"] else 0,
+            25,
+            f"{proof_integrity['verified_count']}/{proof_integrity['proof_count']} {proof_integrity['scope']} proofs verified",
+        ),
+        _audit_score("itinerary coverage", 20 * covered / required if required else 0, 20, f"{covered}/{required} required entries proved or N/A"),
+        _audit_score("continuity", 15 if carry_forward else 0, 15, f"{len(carry_forward)} project carry-forward receipt(s)"),
+        _audit_score("documentation alignment", 15 * doc_passes / doc_checks if doc_checks else 0, 15, f"{doc_passes}/{doc_checks} authority checks present"),
+        _audit_score("field readiness", 10 if not field_required or field_verified else 0, 10, "not required" if not field_required else ("verified field proof" if field_verified else "field proof missing")),
+        _audit_score("release readiness", 15 if not release_required or release_verified else 0, 15, "not required" if not release_required else ("verified release proof" if release_verified else "release proof missing")),
+    ]
+    refinements = sorted(drift_findings, key=lambda item: (item["severity"] != "critical", item["id"]))[:8]
+    highest_value_refinements = [
+        {"rank": index, "id": item["id"], "message": item["refinement"], "source": item["surface"]}
+        for index, item in enumerate(refinements, 1)
+    ]
+    if not highest_value_refinements:
+        highest_value_refinements.append({"rank": 1, "id": "maintain-scorecard", "message": "Keep the scorecard current with each Pathway contract change.", "source": "audit"})
+    audit = {
+        "generated_at": iso_now(),
+        "project": project_name,
+        "project_path": str(project),
+        "target_score": 92,
+        "overall_score": sum(item["score"] for item in scores),
+        "pathway_scores": scores,
+        "metric_snapshot": {
+            "project_proof_count": len(proofs),
+            "verified_project_proof_count": len(verified_proofs),
+            "proof_integrity_scope": proof_integrity["scope"],
+            "proof_integrity_proof_count": proof_integrity["proof_count"],
+            "proof_integrity_verified_count": proof_integrity["verified_count"],
+            "historical_unverified_proof_count": proof_integrity["historical_unverified_count"],
+            "active_work_items": len(active_work),
+            "selected_work_id": selected_work[0].get("work_id", "") if selected_work else "",
+            "other_active_work_items": max(0, len(active_work) - len(selected_work)),
+            "covered_pathways": covered,
+            "required_pathways": required,
+            "recommendation_proved_rate": metric["proved_rate"],
+            "documentation_checks_passed": doc_passes,
+            "documentation_checks_total": doc_checks,
+            "verifier_template_count": len(VERIFIER_TEMPLATES),
+        },
+        "data_lineage": pathway_audit_data_lineage(paths),
+        "drift_findings": drift_findings,
+        "highest_value_refinements": highest_value_refinements,
+    }
+    md_path = dated_artifact_path(paths, f"pathway-audit-{safe_slug(project_name)}")
+    html_path = md_path.with_suffix(".html")
+    write_text(md_path, render_pathway_audit_report(audit))
+    render_html(md_path, html_path)
+    signal_path = paths.operator_intel / "pathway-audit-signals" / f"{safe_slug(project_name)}.json"
+    write_json(signal_path, build_pathway_audit_signal(audit, proofs))
+    audit["report"] = str(md_path)
+    audit["html"] = str(html_path)
+    audit["signal"] = str(signal_path)
+    return {"records": scores, "findings": [], **audit}
 
 
 def portfolio_next_items(paths):
@@ -4711,6 +6529,7 @@ def build_cockpit(paths):
     rules = read_json_file(paths.rule_map_path, {"rules": rule_map_records(paths)}).get("rules", [])
     recs = sorted(read_ndjson(paths.recommendations_path), key=lambda r: r.get("timestamp", ""), reverse=True)
     stale_proofs = [p for p in proofs if proof_is_stale(p)]
+    trivial_verifier_proofs = [p for p in proofs if p.get("trivial_verifier")]
     critical_rule_gaps = [
         r for r in rules
         if r.get("criticality") == "critical" and r.get("enforcement_status") == "prose-only"
@@ -4736,6 +6555,11 @@ def build_cockpit(paths):
         "metric": metric,
         "proof_count": len(proofs),
         "stale_proofs": stale_proofs,
+        "trivial_verifier_count": len(trivial_verifier_proofs),
+        "trivial_verifier_proofs": [
+            {"proof_id": p.get("proof_id"), "pathway": p.get("pathway"), "project": p.get("project")}
+            for p in trivial_verifier_proofs[:8]
+        ],
         "critical_rule_gaps": critical_rule_gaps,
         "latest_artifacts": latest_artifacts(paths),
         "source_paths": {k: v for k, v in source_paths.items() if Path(v).exists()},
@@ -5267,6 +7091,7 @@ def render_cockpit_report(cockpit):
         f"- Active work items: {cockpit.get('active_work_count', 0)}",
         f"- Proofs recorded: {cockpit.get('proof_count', 0)}",
         f"- Stale proofs: {len(cockpit.get('stale_proofs', []))}",
+        f"- Trivial verifiers (no-op `--verify-cmd`): {cockpit.get('trivial_verifier_count', 0)}",
         f"- Critical prose-only rule gaps: {len(cockpit.get('critical_rule_gaps', []))}",
         "",
         "## What Matters",
@@ -5440,8 +7265,7 @@ def compute_tier_calibration(paths, min_outcomes=MIN_TIER_CALIBRATION_OUTCOMES,
     closed = [w for w in items if w.get("status") in ("closed", "done") and w.get("tier") in PATHWAY_TIERS]
 
     def canon_key(pathway):
-        idx = PATHWAY_CANON_ORDER.index(pathway) if pathway in PATHWAY_CANON_ORDER else len(PATHWAY_CANON_ORDER)
-        return (idx, pathway)  # name tiebreak keeps off-canon pathways deterministically ordered
+        return (pathway_sort_key(pathway), pathway)  # name tiebreak keeps off-canon pathways deterministically ordered
 
     tiers = []
     for tier, default in PATHWAY_TIERS.items():
@@ -5612,6 +7436,117 @@ def render_evaluations_report(summary, evals):
     return "\n".join(lines)
 
 
+# Evaluation harness (fast-follow dossier item 1). Recommendation-quality measurement earns a
+# defensible precision claim only behind: a 3-FAMILY jury (correlated same-family judges collapse to
+# one effective vote), kappa validation of the judges against a human label set BEFORE scaling, and
+# position-swap + rubric-fingerprint bias controls. These are the deterministic, no-API core; the
+# live judges plug in on top. (Verga et al. PoLL arXiv 2404.18796; Brown/Cai/DasGupta; Zheng 2023.)
+def cohens_kappa(rater_a, rater_b):
+    """Cohen's kappa: chance-corrected agreement between two raters (human vs one judge). Returns 0.0
+    for empty or mismatched-length inputs; 1.0 when both raters concentrate on a single category."""
+    n = len(rater_a)
+    if n == 0 or n != len(rater_b):
+        return 0.0
+    po = sum(1 for a, b in zip(rater_a, rater_b) if a == b) / n
+    categories = set(rater_a) | set(rater_b)
+    pe = sum((rater_a.count(c) / n) * (rater_b.count(c) / n) for c in categories)
+    return 1.0 if pe >= 1.0 else (po - pe) / (1 - pe)
+
+
+def fleiss_kappa(count_matrix):
+    """Fleiss' kappa: chance-corrected agreement across n raters. count_matrix rows are items, columns
+    are categories, each entry the number of raters that chose that category for that item. Returns
+    0.0 when there are no items or fewer than two raters per item."""
+    num_items = len(count_matrix)
+    if num_items == 0:
+        return 0.0
+    categories = len(count_matrix[0])
+    raters = sum(count_matrix[0])
+    # Fleiss assumes a fixed rater count and category set per item; reject ragged or inconsistent
+    # input (or fewer than two raters) rather than miscompute or crash indexing a short row.
+    if raters < 2 or any(len(row) != categories or sum(row) != raters for row in count_matrix):
+        return 0.0
+    item_agreement = [(sum(c * c for c in row) - raters) / (raters * (raters - 1)) for row in count_matrix]
+    p_bar = sum(item_agreement) / num_items
+    p_cat = [sum(row[j] for row in count_matrix) / (num_items * raters) for j in range(categories)]
+    p_e = sum(p * p for p in p_cat)
+    return 1.0 if p_e >= 1.0 else (p_bar - p_e) / (1 - p_e)
+
+
+def kappa_reliability(kappa):
+    """The dossier's go/no-go on a judge before scaling a precision claim."""
+    if kappa < 0.4:
+        return "unreliable"
+    if kappa < 0.6:
+        return "moderate"
+    return "trustworthy"
+
+
+def jury_verdict(votes, min_families=3):
+    """Aggregate a heterogeneous LLM jury. Correlated (same-family) judges collapse to ONE effective
+    vote — a family contributes its own majority verdict, or abstains if internally split — then the
+    decision is the strict majority across FAMILIES. `family_diverse` is the dossier's >=3 distinct
+    families bar; below it, a precision claim does not count (a one-vendor jury is one judge)."""
+    by_family = {}
+    for vote in votes:
+        by_family.setdefault(vote.get("family", "?"), []).append(vote.get("verdict"))
+    family_votes = {}
+    for family, verdicts in by_family.items():
+        tally = Counter(verdicts)
+        top, count = tally.most_common(1)[0]
+        if list(tally.values()).count(count) == 1:  # a strict within-family majority
+            family_votes[family] = top
+    across = Counter(family_votes.values())
+    decision = None
+    if across:
+        top, count = across.most_common(1)[0]
+        if count * 2 > sum(across.values()):  # a STRICT majority of the effective (family) votes
+            decision = top
+    known_families = [fam for fam in by_family if fam not in ("unknown", "?")]
+    return {
+        "verdict": decision,
+        "distinct_families": len(by_family),
+        "effective_votes": len(family_votes),
+        "family_diverse": len(known_families) >= min_families,
+        "tally": dict(across),
+    }
+
+
+def position_swap_resolve(verdict_order1, verdict_order2):
+    """Position-bias control: a fair judge gives the same verdict with the options swapped. Return the
+    agreed verdict, or None when the two orders disagree (position bias detected -> discard)."""
+    return verdict_order1 if verdict_order1 == verdict_order2 else None
+
+
+def rubric_fingerprint(rubric_text, model_ids):
+    """Pin the rubric text + the (order-independent) set of judge model ids, so a change to either —
+    judge drift or a rubric edit — is detectable as a different fingerprint."""
+    payload = (rubric_text or "") + "\x00" + "\x00".join(sorted(model_ids or []))
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
+JUDGE_FAMILY_PATTERNS = [
+    (("claude", "anthropic"), "anthropic"),
+    (("gpt", "openai", "codex", "o1", "o3"), "openai"),
+    (("gemini", "google", "bard"), "google"),
+    (("glm", "zai", "zhipu"), "zhipu"),
+    (("llama", "meta"), "meta"),
+    (("mistral",), "mistral"),
+    (("grok", "xai"), "xai"),
+    (("deepseek",), "deepseek"),
+]
+
+
+def judge_family(judge):
+    """Map a judge identity to its model FAMILY (vendor). Correlated same-family judges do not add an
+    independent vote, so family — not judge-count — is what makes a jury's precision claim count."""
+    low = (judge or "").strip().lower()
+    for needles, family in JUDGE_FAMILY_PATTERNS:
+        if any(n in low for n in needles):
+            return family
+    return "unknown"
+
+
 def run_pathway_evaluate(args, paths):
     evals = read_ndjson(paths.evaluations_path)
     if getattr(args, "summary", False):
@@ -5621,6 +7556,9 @@ def run_pathway_evaluate(args, paths):
         for e in evals:
             by_verdict[e.get("verdict", "?")] = by_verdict.get(e.get("verdict", "?"), 0) + 1
         external = {e.get("project") for e in evals if e.get("project") and e.get("project") != SELF_PROJECT}
+        families = sorted({judge_family(e.get("judge", "")) for e in evals if e.get("judge")})
+        known_families = [f for f in families if f != "unknown"]
+        diverse = len(known_families) >= 3
         summary = {
             "metric": "recommendation precision (independent judgments)",
             "generated_at": iso_now(),
@@ -5629,6 +7567,14 @@ def run_pathway_evaluate(args, paths):
             "precision": round(correct / total, 3) if total else 0.0,
             "by_verdict": by_verdict,
             "external_projects_judged": len(external),
+            "judge_families": families,
+            "family_diverse": diverse,
+            # The dossier's honesty gate: a precision number is a vibe until a >=3-family jury backs
+            # it. Surface the status so the number is never mistaken for a validated claim.
+            "precision_claim_status": (
+                "validated (>=3 judge families)" if diverse
+                else f"unvalidated (needs >=3 judge families; have {len(known_families)})"
+            ),
         }
         write_json(paths.operator_intel / "pathway-evaluations-summary.json", summary)
         md_path = dated_artifact_path(paths, "pathway-evaluations")
@@ -5690,7 +7636,7 @@ def build_parser():
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
         "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
-        "pathway-decision", "ingest-review", "pathway-metric", "tier-calibrate", "pathway-evaluate", "all"
+        "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate", "all"
     ])
     parser.add_argument("--claude-home", default=str(DEFAULT_CLAUDE_HOME))
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME))
@@ -5700,6 +7646,7 @@ def build_parser():
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--check-write", help="Boundary check mode for a future write path.")
     parser.add_argument("--project", help="Project path for work-start.")
+    parser.add_argument("--projects", help="Comma-separated projects for pathway-pilot.")
     parser.add_argument("--goal", help="User-visible outcome for work-start.")
     parser.add_argument("--work-id", help="Shared outcome identifier for daily work commands.")
     parser.add_argument("--pathway", help="Pathway name for work-log.")
@@ -5714,6 +7661,7 @@ def build_parser():
     parser.add_argument("--proof-type", help="Proof type to record with proof-add or work-log.")
     parser.add_argument("--verified-by", help="Free-text label for the verification (attestation only — does NOT prove on its own).")
     parser.add_argument("--verify-cmd", help="Verifier command the engine RE-EXECUTES; the pathway proves only if it exits 0 (executed proof).")
+    parser.add_argument("--canary-target", help="Optional changed file for a strict proof-canary; persisted only as a repository-relative path.")
     parser.add_argument("--reviewer", help="Named human reviewer signing off over the hashed artifact (signed proof).")
     parser.add_argument("--verdict", help="pathway-evaluate verdict: correct|wrong|late|missed_blocker|unnecessary.")
     parser.add_argument("--judge", help="pathway-evaluate: who independently judged the recommendation.")
@@ -5791,12 +7739,16 @@ def main(argv=None):
         result = run_pathway_next(args, paths)
     elif args.subcommand == "pathway-run":
         result = run_pathway_run(args, paths)
+    elif args.subcommand == "pathway-pilot":
+        result = run_pathway_pilot(args, paths)
     elif args.subcommand == "pathway-decision":
         result = run_pathway_decision(args, paths)
     elif args.subcommand == "ingest-review":
         result = run_ingest_review(args, paths)
     elif args.subcommand == "pathway-metric":
         result = run_pathway_metric(args, paths)
+    elif args.subcommand == "pathway-audit":
+        result = run_pathway_audit(args, paths)
     elif args.subcommand == "tier-calibrate":
         result = run_tier_calibrate(args, paths)
     elif args.subcommand == "pathway-evaluate":

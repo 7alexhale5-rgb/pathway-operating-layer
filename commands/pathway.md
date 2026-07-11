@@ -1,7 +1,7 @@
 ---
 name: pathway
-description: Ask a project what engineering pathway to run next, and track the work against one shared ID. Wraps operating-layer pathway-next + the work envelope so you never type the CLI. Loop mode runs the whole determine → execute → prove → advance cycle continuously, with autonomy earned by the proof metric.
-argument-hint: "<project> [ go | done | <goal> ]   —   usually just the project; I hand you the exact next command to paste"
+description: Ask a project what engineering pathway to run next, track the work against one shared ID, or start a measured multi-project pathway pilot. Wraps operating-layer pathway-next + the work envelope so you never type the CLI. Loop mode runs the whole determine → execute → prove → advance cycle continuously, with autonomy earned by the proof metric.
+argument-hint: "<project> [ go | done | <goal> ] | pilot <projects> <goal>   —   usually just the project; I hand you the exact next command to paste"
 ---
 
 # Pathway — next-best move for a project
@@ -14,6 +14,8 @@ Script: `python3 ~/.claude/scripts/operating-layer.py`
 
 ## Parse `$ARGUMENTS`
 
+- If the first token is `pilot` or `pathway-pilot` → **PILOT**.
+- Canonical pathway catalog: `govern, research, data, security, design, implementation, quality, field, observability, techdebt, release, docs`.
 - **First token = project** — a name resolvable under `~/Projects` (e.g. `consult-ops`,
   `koho`) or an absolute path.
 - **Remaining text = intent** (optional). Classify by **first-match-wins precedence**:
@@ -23,11 +25,12 @@ Script: `python3 ~/.claude/scripts/operating-layer.py`
     authority of the user pasting it now, then prove + log + hand back the next command. This is
     the keystone verb: almost every hand-off block tells the user to paste `/pathway <project> go`.
   - `done` / `close` / `finish` / `wrap` → **CLOSE**.
-  - a pathway name (`research govern data security release implementation quality observability
-    techdebt design docs`) followed by a file path, or "logged/finished `<pathway>`, proof
+  - a pathway name (`govern research data security design implementation quality field
+    observability techdebt release docs`) followed by a file path, or "logged/finished `<pathway>`, proof
     `<path>`" → **LOG**.
   - `loop` (optionally `--auto=recommend|safe|build`) → **LOOP** (run EXECUTE continuously, one
     shared work ID, autonomy earned by the proof metric).
+  - `pilot` / `pathway-pilot` → **PILOT** (measured real-project agentic dev-team rehearsal).
   - anything else — a goal sentence (≥2 words, not matched above) → **START** (open tracked work
     with that goal).
 
@@ -56,6 +59,7 @@ What goes in the block, by situation:
 | Recommendation ready · work tracked · trust = pass | `/pathway <project> go` | "runs <pathway> end-to-end with full power, proves it on <real_artifact>, logs it, hands you the next command" |
 | Project not tracked yet (`work_id` null) | `/pathway <project> <your one-line goal>` | "names the outcome and starts tracking — the one time you type a goal; I take it from there" |
 | Trust = fail | `/pathway <project> go` | "fixes trust first (that IS the next move), then resumes the recommended pathway" |
+| Pilot cohort created | `/pathway <highest-risk-project> go` | "runs the first assigned pathway from the measured pilot cohort" |
 | Just finished + logged a pathway | `/pathway <project> go` — or `/pathway <project> done` if the outcome's gates cleared | "starts the next pathway" / "closes the outcome" |
 | Closeout blocked | the one fix command | "clears <the one blocker> so the outcome can close" |
 
@@ -123,17 +127,15 @@ re-recommend, do not present a menu.
 
 1. Get the active work ID: `python3 ~/.claude/scripts/operating-layer.py pathway-next --project <project> --json` → read `work_id`.
    - If there is no active work item, switch to START first (ask for the goal if none was given).
-2. Proof needs TWO things — a **real file that exists** (deployed asset, test file, migration,
-   served HTML, report) AND a **named verifier** (`--verified-by`) saying how that artifact was
-   checked (the green test command, the measured delta, the closed-finding link). A bare file is
-   presence, not sufficiency: a pathway only flips to `proved` when both are present. Never invent
-   either — if the user didn't give an artifact, ask for it.
+2. Proof needs BOTH — a **real file that exists** AND an executable verifier passed through
+   `--verify-cmd`. `--verified-by` is attestation only; it never proves a pathway by itself.
+   Never invent either — if the user didn't give an artifact or verifier, ask for it.
 3. Run:
    ```bash
    python3 ~/.claude/scripts/operating-layer.py work-log \
      --work-id <work_id> --pathway <pathway> --kind verify \
      --gate <pathway>-gate --evidence <abs-evidence-path> --result pass \
-     --proof-type artifact --verified-by "<how the artifact was verified>"
+     --proof-type artifact --verify-cmd "<command that re-checks the artifact>"
    ```
 4. Re-run ASK so the user sees the new next-best pathway after this one closed out.
 
@@ -158,35 +160,24 @@ turn after turn, until the outcome closes. ASK/START/LOG/CLOSE become the loop's
 the user stops typing verbs.
 
 On EXECUTE the loop runs the **culmination of the stack** for the chosen pathway — its full
-`execution_stack` + `execution_tools` profile (all 11 pathways carry one, baked into the engine),
+`execution_stack` + `execution_tools` profile (the 11 core pathways plus `field` carry one, baked into the engine),
 Karpathy-wrapped — not a single command.
 
-**Autonomy is earned by the proof metric — never assumed.** The engine computes the ceiling for
-you: `pathway-next` returns `suggested_autonomy_tier` (`recommend` | `execute-safe`), derived fresh
-each determine turn from the proof track record (`proved_rate`), trust, and the recommended pick's
-`confidence` — with `autonomy_rationale` exposing the three inputs and the reason. **Read that field;
-never re-derive the rule.** Staleness fail-closes to Tier 1 in code (the metric is recomputed this
-turn), so the field is always current. The tiers it picks between:
+**Autonomy is earned by the proof metric — never assumed.** Read `suggested_autonomy_tier` +
+`autonomy_rationale` from `pathway-next` and apply it; never re-derive the rule (staleness
+fail-closes to Tier 1 in code, so the field is always current).
 
-- **Tier 1 · Recommend** — the default, and what the engine returns (`suggested_autonomy_tier ==
-  "recommend"`) whenever `proved_rate < 0.50` OR trust ≠ `pass` OR the pick isn't `high`-confidence.
-  Determine the next pathway, explain it in plain English, stage the exact `card.skill` command —
-  then STOP and let the user press go. Log proof only after they confirm it's done with a real artifact.
-- **Tier 2 · Execute-safe** — the engine returns `suggested_autonomy_tier == "execute-safe"` only when
-  `proved_rate ≥ 0.50` AND trust = `pass` AND recommendation `confidence` = `high` (all computed fresh
-  this turn). The loop may then auto-run only the **local, reversible portion** of the plan/analyze
-  pathways — `research, govern, data, security,
-  quality, observability, docs` — i.e. steps that only write plans / dossiers / docs to the working
-  tree. **It pauses mid-pathway, even inside a "safe" pathway, the instant a step would:** touch a real
-  database or prod surface (data's "verify a real row", security's "prove closed in prod"), send our
-  code/data to an external service (research's web / Exa / zread lookups beyond public search), or
-  commit / deploy. Those steps need an explicit grant. Pause for everything else.
-- **Tier 3 · Execute-build** — only on an explicit per-session grant from the user. Also auto-runs
-  the **build** pathways: `implementation, techdebt, design`.
+- **Tier 1 · Recommend** (default; returned whenever `proved_rate < 0.50` OR trust ≠ `pass` OR
+  confidence ≠ `high`) — stage the exact `card.skill` command, then STOP for the user's go.
+- **Tier 2 · Execute-safe** (only when all three pass, fresh this turn) — auto-run only the local,
+  reversible pathways `research, govern, data, security, quality, observability, docs`. Pause
+  mid-pathway the instant a step would touch a real DB / prod surface, send code/data to an external
+  service, or commit / deploy — those need an explicit grant.
+- **Tier 3 · Execute-build** — only on an explicit per-session grant; also auto-runs `implementation,
+  techdebt, design`.
 
-**Never auto, any tier:** `/ship` (release), `work-close`, prod-flag flips, external sends — the loop
-pauses and asks. (The `docs` pathway is now Tier-2 safe — its skill was corrected from `/closeout-stack`
-to `doc-coauthoring`, which authors a doc without committing or shipping.)
+**Never auto, any tier:** `/ship`, `work-close`, prod-flag flips, external sends — pause and ask.
+(The `docs` pathway is Tier-2 safe: its skill is `doc-coauthoring`, which authors without committing.)
 
 **One iteration:**
 
@@ -215,6 +206,27 @@ human-gated and the user isn't present to confirm · no pathway gains rank for 3
 a token budget is hit. If running unattended, self-pace with `ScheduleWakeup`; otherwise drive it
 turn-by-turn with the user. Always name the current tier in the first line of each turn.
 
+## PILOT — "test the full agentic dev-team loop on real projects"
+
+Use this before broadening autonomy across projects. It is a measured rehearsal, not a build pass.
+
+1. Parse projects as a comma-separated list after `pilot` / `pathway-pilot`.
+2. Use the remaining text as the pilot goal. If the goal is missing, ask for the goal; do not invent one.
+3. Run:
+   ```bash
+   python3 ~/.claude/scripts/operating-layer.py pathway-pilot \
+     --projects <project-a,project-b> \
+     --goal "<pilot goal>" \
+     --json
+   ```
+4. Report the cohort ID, baseline metric, pilot report path, and each assignment's project,
+   recommended pathway, lead role, critic role, proof gate, review gate, active overlays,
+   and next command.
+5. The command may open missing work envelopes, write pilot ledgers/reports, and snapshot metrics.
+   It must not mutate project repos, deploy, send, close work, or mark proof/N/A.
+6. End with one hand-off block for the safest first execution target, usually the highest-risk
+   assignment's `/pathway <project> go`.
+
 ## Rules
 
 - One shared work ID per outcome — every pathway logs against it. Never start a second ID for the same goal.
@@ -231,3 +243,6 @@ turn-by-turn with the user. Always name the current tier in the first line of ea
   (proof rate ≥ 0.50 + trust pass + high confidence, fresh each turn); never re-derive it by hand.
 - LOOP never auto-runs `/ship`, `work-close`, prod-flag flips, or external sends at any tier — pause and ask.
 - One project per loop, one shared work ID. Recompute `pathway-metric` every turn so it is never stale.
+- For real-work trials across projects, run `pathway-pilot --projects <a,b> --goal "<pilot goal>"`
+  first. It assigns the pathway lead/critic/proof gate, records Alex's review gate, snapshots
+  `pathway-metric`, and writes the measured pilot cohort without mutating project repos.

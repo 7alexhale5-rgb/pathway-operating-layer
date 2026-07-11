@@ -65,8 +65,10 @@ traffic; their small-n lesson is "**a hard minimum n is non-negotiable**" (rule 
 (Brown, Cai & DasGupta, PMC2706447.)
 
 **Recommendation (exact, becomes code):** **Wilson score lower bound (z=1.96) ≥ 0.5, hard floor n ≥ 10.**
-Unlock math: n=10→k≥8, n=20→k≥14, n=50→k≥31 — proves the rate, not a streak. Closed-form, deterministic,
-auditable in one line; keep a Jeffreys cross-check in tests. Failure modes: non-i.i.d. proofs (dedupe
+Unlock math: n=10→k≥9, n=20→k≥15, n=50→k≥32 — proves the rate, not a streak. Closed-form, deterministic,
+auditable in one line; keep a Jeffreys cross-check in tests. (Corrected on implementation from an earlier
+draft's k≥8/14/31, which were computed at z=1.645 — the one-sided 95% bound — and are off by one at the
+z=1.96 specified here; a stdlib Jeffreys cross-check in the suite confirms the z=1.96 thresholds.) Failure modes: non-i.i.d. proofs (dedupe
 per task-type), drift after unlock (pair with a sliding window), zero-failure illusion below n=10 (the
 floor closes it).
 

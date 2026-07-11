@@ -91,6 +91,9 @@ The ranking follows the **Karpathy ladder**: one thing end-to-end against a numb
 phase collapse, throwaway-v1 first, stop at the threshold. A generic primer on the method
 lives in [`docs/karpathy-method.md`](docs/karpathy-method.md).
 
+For the local Hermes agent-card scanner correction, see the operator runbook in
+[`docs/agent-card-scanner-scope.md`](docs/agent-card-scanner-scope.md).
+
 ### Add the Karpathy skill
 
 The method is also packaged as a drop-in **skill** ([`skills/karpathy/SKILL.md`](skills/karpathy/SKILL.md))
@@ -112,6 +115,10 @@ Requires Python 3.9+. No dependencies.
 ```bash
 # 1. What should I do next on this project? (read-only)
 python3 scripts/operating-layer.py pathway-next --project /path/to/project --json
+
+# 1a. Measure local Pathway proof integrity and documentation drift (read-only).
+# A score below 92 is reported; it does not make the command fail.
+python3 scripts/operating-layer.py pathway-audit --project /path/to/project --json
 
 # 2. Open a tracked outcome — one shared work ID, sized by a "done" tier
 python3 scripts/operating-layer.py work-start \
@@ -137,28 +144,44 @@ python3 scripts/operating-layer.py pathway-evaluate \
   --project /path/to/project --pathway govern \
   --verdict correct --judge "second-model review" --note "tracked outcome, real gaps"
 python3 scripts/operating-layer.py pathway-evaluate --summary   # → precision
+
+# 6. Start a measured real-project pilot cohort
+python3 scripts/operating-layer.py pathway-pilot \
+  --projects koho,prettyfly-os \
+  --goal "Pilot client feedback review packet for customer approval" \
+  --json
 ```
 
 The **work envelope** is the loop: `work-start` (open) → `work-log` (prove each
 pathway) → `work-close` (only when coverage is complete). `work-cover`, `work-status`,
 and `work-daily` round it out; `proof-add` / `proof-report` manage the proof registry.
 
-## The eleven pathways
+`pathway-audit` is the local scorecard over that loop. It writes a Markdown and HTML
+report to the configured operator-artifacts directory, reports its `/100` score, records
+documentation drift separately, and does not edit the selected project or make external calls.
+For the proof, credential-redaction, and release-state rules behind that score, see
+[`docs/pathway-proof-integrity.md`](docs/pathway-proof-integrity.md).
 
-Ranked each turn; the itinerary for an outcome is a subset sized by its "done" tier.
+## The eleven core pathways plus field
+
+Ranked each turn; the itinerary for an outcome is a subset sized by its "done" tier,
+outcome profile, and risk overlays. `field` is an extension pathway: it is first-class
+when customer/operator validation is triggered, but it is not part of the base core tiers.
+The canonical catalog is `govern, research, data, security, design, implementation, quality, field, observability, techdebt, release, docs`.
 
 | Pathway | The decision it answers |
 |---|---|
-| **research** | What must we know for certain before a plan can be trusted? |
 | **govern** | What business outcome and falsifiable metric does this work move? |
+| **research** | What must we know for certain before a plan can be trusted? |
 | **data** | Is the entity model, lineage, and data boundary correct and safe to build on? |
 | **security** | What can an untrusted actor reach, and is every secret/authz surface closed? |
-| **release** | How does this ship safely, and how do we undo it if it's wrong? |
+| **design** | Does the interface serve the workflow and the design system? |
 | **implementation** | What is the smallest slice that ships one thing end-to-end against the metric? |
 | **quality** | What proves this is correct, and what gate stops regressions? |
+| **field** | Did a real operator or customer review the right artifact, and what changed because of it? |
 | **observability** | Could we diagnose this at 3am from signals alone? |
 | **techdebt** | What dependency or duplication will cost most if left? |
-| **design** | Does the interface serve the workflow and the design system? |
+| **release** | How does this ship safely, and how do we undo it if it's wrong? |
 | **docs** | What does the next operator need that isn't written down? |
 
 `research` and `govern` are foundation gates: with nothing else signalling, they lead.
@@ -168,8 +191,19 @@ The "done" tiers seed the itinerary cumulatively:
 - **live** *(default)* — `+ data, observability, release, docs` (real users touch it)
 - **production-secure** — `+ research, security, techdebt` (untrusted actors, compliance)
 
-The goal's own words also pull in `design`, `research`, or `data` by keyword (e.g. a goal
-mentioning "schema" or "migration" adds `data`).
+The goal's own words also pull in pathways by keyword and overlay (e.g. "schema" or
+"migration" adds `data`; "client feedback" adds `field`; tenant/RLS/prod signals add
+security, data, release, and rollback-related coverage).
+
+Outcome profiles currently classify work as `tiny-fix`, `standard-bugfix`, `ui-slice`,
+`data-integration`, `internal-live-feature`, `production-secure-launch`, `agent-automation`,
+or `customer-field-review`. Risk overlays are not separate pathways; they pull existing
+pathways into the itinerary when signals require them.
+
+`pathway-pilot` is the measured test harness for real project work. It enrolls one or more
+projects, optionally opens missing work with the supplied goal, runs the router, assigns the
+pathway lead/critic/proof gate, names Alex's review gate, snapshots `pathway-metric`, and writes
+`operator-intelligence/pathway-pilots.ndjson` plus a Markdown/HTML operator report.
 
 ## How proof works
 
@@ -195,15 +229,16 @@ from being farmed by self-attestation.
 This is honest about where it stands:
 
 - **Single-operator store.** State lives in append-only NDJSON files in one local
-  directory. There is no row-level locking or atomic write yet, so concurrent writers can
-  lose updates and a killed process can truncate a ledger. Treat it as single-user.
+  directory. Writes are atomic, but there is no row-level locking, so concurrent writers can
+  still lose updates. Treat it as single-user.
 - **The self-measurement sample is small.** `pathway-evaluate` exists and has been run
   blind on a handful of external projects with independent verdicts — enough to catch a
   real regression (an early run scored precision 0/3, the recommender was fixed, a re-judged
   re-run scored 3/3), but `n=3` is a start, not proof. Larger external samples are needed
   before the precision number means much.
-- **Trivial verifiers still pass.** `--verify-cmd true` exits 0 and proves; the engine
-  can't yet tell a real test from a no-op. The command is recorded for human audit.
+- **Verifier anti-gaming is local.** No-op commands such as `true`, `:`, `exit 0`, and
+  `echo ok` no longer prove work; fast real-looking verifiers also get a canary mutation
+  check when a git diff is available. This is still a local proof guard, not a hosted CI trust root.
 - **Statistical thresholds are provisional.** The `0.50` autonomy gate and the minimum
   close counts for calibration have no confidence-interval basis yet.
 
