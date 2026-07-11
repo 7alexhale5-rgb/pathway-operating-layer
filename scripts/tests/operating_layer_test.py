@@ -2197,15 +2197,21 @@ def test_verifier_receipt_canary_mutant_catches_noop_verifier():
 
 
 def test_redact_obj_exempts_only_real_sha256_digests():
-    """Tightening the *_sha256 redaction fix (Codex): exempt a value ONLY when it IS a 64-hex
-    digest, so a key that merely ends in _sha256 but holds a secret is still scrubbed."""
+    """Digest exemption requires BOTH a digest-named key (*_sha256/_digest/_hash/_fingerprint)
+    AND a 64-hex value (review-redact-hex64-value-exemption): a *_sha256 key holding a non-digest
+    secret fails the value check, and a hex-encoded 256-bit secret (openssl rand -hex 32) under
+    any other key fails the key check and is scrubbed by the entropy pattern."""
     opl = load_cli("redact")
+    hex_secret = "d" * 64  # same shape as `openssl rand -hex 32`
     out = opl.redact_obj({"artifact_sha256": "a" * 64,
                           "note_sha256": "sk-proj-LEAKED-secret-value-0001",
+                          "session_key": hex_secret,
                           "body": "password=hunter2"})
-    check(out["artifact_sha256"] == "a" * 64, "a real 64-hex sha256 digest is preserved")
+    check(out["artifact_sha256"] == "a" * 64, "a real 64-hex digest under a digest-named key is preserved")
     check("sk-proj-" not in out["note_sha256"] and "LEAKED" not in out["note_sha256"],
-          "a *_sha256 key holding a non-digest secret is still redacted (value-based exemption)")
+          "a *_sha256 key holding a non-digest secret is still redacted")
+    check(hex_secret not in out["session_key"],
+          "a 64-hex secret under a non-digest key is scrubbed (key+value conjunction)")
     check("hunter2" not in out["body"], "ordinary secret values are unaffected by the exemption")
 
 
