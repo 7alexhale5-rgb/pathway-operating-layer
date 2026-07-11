@@ -71,6 +71,13 @@ SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"sk-proj-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"(?i)(?:xai-|xai_api_|gsk_|ghp_|github_pat_|sk-ant-|sk-or-v1-)[A-Za-z0-9_\-]{16,}"),
+    # Cloud-provider credential shapes shorter than the 64-char entropy floor.
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                              # AWS access key ID
+    re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*[A-Za-z0-9/+=]{40}"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),                        # Google API key
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),                 # Slack token
+    re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}\b"),   # Stripe key
+    re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),                     # GitLab PAT
     re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*[^\s,;]+"),
     re.compile(r"(?i)authorization\s*:\s*bearer\s+[^\s,;]+"),
     re.compile(r"\b[A-Za-z0-9_-]{64,}={0,2}\b"),
@@ -1594,7 +1601,9 @@ def verifier_command_is_trivial(command):
     if low in ("true", ":", "exit 0", "/bin/true", "/usr/bin/true"):
         return True
     first = low.split()[0] if low.split() else ""
-    return first == "echo"
+    # An echo is only trivial when it IS the whole command. "echo start && pytest -q" runs a
+    # real verifier after the preamble — flagging it trivial would silently skip the canary.
+    return first == "echo" and not re.search(r"&&|\|\||;|\|", low)
 
 
 # The canary re-runs the verifier on a mutant, so it doubles verifier runtime. Run it only for a
@@ -1766,6 +1775,12 @@ def _atomic_replace_bytes(path, data):
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
+        # os.replace swaps the inode, and mkstemp files are 0600 — carry the target's
+        # permission bits over so a canary pass never strips a script's executable bit.
+        try:
+            os.chmod(tmp, os.stat(str(path)).st_mode & 0o7777)
+        except OSError:
+            pass
         os.replace(tmp, str(path))
     except Exception:
         try:
@@ -4290,7 +4305,9 @@ def run_work_close(args, paths):
             "high",
         ))
         dashboard = build_daily_dashboard(paths)
-        return {"records": [summary], "findings": findings, "closed": False, "work_id": args.work_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
+        # Same key schema as the closed=True return (report/html present but null) so
+        # callers can rely on the shape without branching on closed first.
+        return {"records": [summary], "findings": findings, "closed": False, "work_id": args.work_id, "report": None, "html": None, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
     summary_item = summary.get("work_item") or {}
     item = update_work_item(
         paths,
@@ -5272,11 +5289,13 @@ def run_pathway_next(args, paths):
     # pathways), so the next move bends toward current risk instead of canonical order.
     # (Gap B part 2: coverage guarantee + evidence-grounded ordering, together.)
     itinerary_open = (active_summary or {}).get("itinerary_coverage", {}).get("open", []) if active_summary else []
-    itinerary_total = (active_summary or {}).get("itinerary_coverage", {}).get("total", 0) if active_summary else 0
-    # Ready-to-close routing: a tracked outcome whose itinerary is fully covered has no
-    # next pathway owed — the honest next move is work-close, and the result must say so
-    # explicitly instead of pointing the operator at another work-log.
-    ready_to_close = bool(work_id and itinerary_total and not itinerary_open)
+    # Ready-to-close routing: when the closeout gate itself says ready, the honest next
+    # move is work-close, and the result must say so explicitly instead of pointing the
+    # operator at another work-log. Gated on closeout_readiness — the SAME gate work-close
+    # enforces (runs + controls + evidence + staleness + itinerary) — so pathway-next can
+    # never route to a work-close that would refuse (e.g. itinerary covered but a control
+    # still open, or an all-na itinerary with no runs).
+    ready_to_close = bool(work_id and (active_summary or {}).get("closeout_readiness") == "ready")
     if itinerary_open:
         FOUNDATIONS = ("govern", "research")
         open_foundations = [p for p in itinerary_open if p in FOUNDATIONS]
@@ -5308,7 +5327,12 @@ def run_pathway_next(args, paths):
         autonomy_gate_rate(metric.get("proved", 0), metric.get("total_recommendations", 0)),
         trust, confidence)
     recommendations = read_ndjson(paths.recommendations_path)
-    recommendation_id = f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}"
+    # No recommendation_id on ready-to-close: nothing is logged to the ledger (see below),
+    # so returning an id would hand consumers a dangling reference to a row that never exists.
+    recommendation_id = (
+        "" if ready_to_close
+        else f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}"
+    )
 
     carry_forward_note = carry_forward_effect(latest_carry_forward, recommended["pathway"])
     if ready_to_close:
