@@ -1,0 +1,115 @@
+{
+  "by_pathway": {
+    "docs": 1,
+    "implementation": 3,
+    "quality": 3,
+    "security": 1,
+    "techdebt": 2
+  },
+  "finding_count": 10,
+  "findings": [
+    {
+      "confidence": "high",
+      "file": "scripts/operating-layer.py",
+      "id": "review-pilot-double-recommendation-log",
+      "line": "",
+      "message": "run_pathway_pilot invokes run_pathway_next twice in its no-work-item branch; the first call logs a recommendation row that is never acted on, corrupting the follow-through metric denominator. Fix: split compute vs persist in run_pathway_nex",
+      "pathway": "implementation",
+      "severity": "warn",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "high",
+      "file": "scripts/operating-layer.py",
+      "id": "review-redact-hex64-value-exemption",
+      "line": "",
+      "message": "redact_obj exempts ANY 64-hex value from redaction (value-based, documented as deliberate). A hex-encoded 256-bit secret (openssl rand -hex 32) passes redaction untouched. Decide: key-suffix (_sha256/_digest/_hash) + value shape, or keep an",
+      "pathway": "security",
+      "severity": "warn",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "medium",
+      "file": "scripts/operating-layer.py",
+      "id": "review-multi-active-work-silent-first",
+      "line": "",
+      "message": "pathway-next silently routes on work_items[0] when a project has multiple active outcomes; the tiebreak is undocumented and the other outcome is invisible in next_command. Emit a warning finding or sort by risk/updated_at.",
+      "pathway": "implementation",
+      "severity": "warn",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "medium",
+      "file": "scripts/operating-layer.py",
+      "id": "review-canary-crash-restore-journal",
+      "line": "",
+      "message": "Canary mutant restore runs in a finally block but has no on-disk journal; SIGKILL/power loss between mutate and restore leaves the mutant on disk. Consider a sibling backup file swept at next CLI start.",
+      "pathway": "quality",
+      "severity": "info",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "medium",
+      "file": "scripts/operating-layer.py",
+      "id": "review-work-close-empty-default-overwrite",
+      "line": "",
+      "message": "run_work_close passes itinerary/outcome_profile/risk_overlays with empty-collection defaults into update_work_item; if summary_item were ever empty this would overwrite persisted values. Pass only keys present in summary_item.",
+      "pathway": "implementation",
+      "severity": "info",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "high",
+      "file": "scripts/operating-layer.py",
+      "id": "review-pathway-metadata-parallel-tables",
+      "line": "",
+      "message": "DRY: pathway metadata is fragmented across PATHWAY_DOCTRINE, PATHWAY_EXECUTION, TEAM_ROLE_BY_PATHWAY plus three ordering lists (CORE_PATHWAYS / PATHWAY_CANON_ORDER / PATHWAY_ORDER alias). Merge into one PATHWAY_SPEC table or assert identica",
+      "pathway": "techdebt",
+      "severity": "info",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "high",
+      "file": "scripts/operating-layer.py",
+      "id": "review-audit-function-srp",
+      "line": "",
+      "message": "run_pathway_audit is ~100 LOC doing collection, drift derivation, inline magic-weight scoring (25/20/15/15/10/15, target 92), and artifact rendering in one body. Extract stages and name the weights.",
+      "pathway": "techdebt",
+      "severity": "info",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "high",
+      "file": "scripts/proof-canary-observability.py",
+      "id": "review-canary-observability-test-gaps",
+      "line": "",
+      "message": "scripts/proof-canary-observability.py: only the alert path is tested. watch/pass statuses, OSError exits, trivial_verifiers counter, and _safe_repo_relative_path edge cases (.., Windows-absolute, empty) are untested.",
+      "pathway": "quality",
+      "severity": "warn",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "high",
+      "file": ".planning/full-cycle-pathway-marketplace/implementation/verify-pathway-audit.py",
+      "id": "review-stale-state-dependent-receipt",
+      "line": "",
+      "message": ".planning/full-cycle-pathway-marketplace/implementation/verify-pathway-audit.py now exits 1: it asserts drift_findings is non-empty, but the drift it certified has since been resolved. State-dependent receipts should pin the state they veri",
+      "pathway": "quality",
+      "severity": "info",
+      "source": "review-stack"
+    },
+    {
+      "confidence": "medium",
+      "file": "scripts/operating-layer.py",
+      "id": "review-verifier-template-placeholder-commands",
+      "line": "",
+      "message": "VERIFIER_TEMPLATES recommended_command is a literal <govern-verifier.py> placeholder rendered into karpathy cards and reports as if authoritative. Populate real per-pathway commands or drop the field.",
+      "pathway": "docs",
+      "severity": "info",
+      "source": "review-stack"
+    }
+  ],
+  "generated_at": "2026-07-11T20:25:40Z",
+  "project": "pathway-operating-layer",
+  "source": "review-stack"
+}
