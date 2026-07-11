@@ -15,8 +15,10 @@
       "line": "",
       "message": "run_pathway_pilot invokes run_pathway_next twice in its no-work-item branch; the first call logs a recommendation row that is never acted on, corrupting the follow-through metric denominator. Fix: split compute vs persist in run_pathway_nex",
       "pathway": "implementation",
+      "resolution": "Split run_pathway_next into compute_pathway_next (pure, no ledger write/no render) + persist_pathway_next (assigns rec id, renders report, appends the one follow-through row). run_pathway_next = persist(compute(...)); pathway-pilot's no-work-item branch now runs the dry pass via compute_pathway_next and persists exactly once after work-start. Regression test test_pathway_pilot_logs_one_recommendation_per_enrollment asserts the ledger gains exactly one row per enrollment; suite 537/537 green (2026-07-11).",
       "severity": "warn",
-      "source": "review-stack"
+      "source": "review-stack",
+      "status": "resolved"
     },
     {
       "confidence": "high",
@@ -25,8 +27,10 @@
       "line": "",
       "message": "redact_obj exempts ANY 64-hex value from redaction (value-based, documented as deliberate). A hex-encoded 256-bit secret (openssl rand -hex 32) passes redaction untouched. Decide: key-suffix (_sha256/_digest/_hash) + value shape, or keep an",
       "pathway": "security",
+      "resolution": "Tightened to key-suffix + value conjunction (2026-07-11): exemption now requires the key to end in _sha256/_digest/_hash/_fingerprint AND the value to be 64-hex. All persisted digest fields verified to use compliant names (artifact_sha256, verify_stdout_sha256, verifier_source_sha256). Hex-encoded 256-bit secrets under any other key now hit the 64-char entropy pattern. Test test_redact_obj_exempts_only_real_sha256_digests extended; suite 538/538 green.",
       "severity": "warn",
-      "source": "review-stack"
+      "source": "review-stack",
+      "status": "resolved"
     },
     {
       "confidence": "medium",

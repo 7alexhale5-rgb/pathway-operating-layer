@@ -1021,14 +1021,23 @@ def _is_sha256_digest(value):
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-fA-F]{64}", value))
 
 
+DIGEST_KEY_SUFFIXES = ("_sha256", "_digest", "_hash", "_fingerprint")
+
+
+def _is_digest_field(key, value):
+    return isinstance(key, str) and key.endswith(DIGEST_KEY_SUFFIXES) and _is_sha256_digest(value)
+
+
 def redact_obj(value):
     if isinstance(value, dict):
         generated_id_keys = {"work_id", "run_id", "measurement_id", "control_id", "evidence_id", "created_by_run_id", "resolved_by_run_id", "resolution_evidence_id"}
-        # A value that IS a 64-hex digest is a content hash (artifact/transcript/verifier-source
-        # binding), never a secret — exempt it, or the entropy redactor scrubs the proof's hash to
-        # "[REDACTED]" and silently breaks the binding. Value-based, not key-based: a secret that
-        # happens to sit in a *_sha256-named key is still scrubbed.
-        return {k: (v if (k in generated_id_keys or _is_sha256_digest(v)) else redact_obj(v)) for k, v in value.items()}
+        # Exempt a value only when it BOTH sits under a digest-named key AND is a 64-hex string —
+        # that is a content hash (artifact/verifier-stdout/verifier-source binding) the entropy
+        # redactor would otherwise scrub to "[REDACTED]", silently breaking the binding. The
+        # conjunction closes both leak shapes: a non-digest secret in a *_sha256 key fails the
+        # value check, and a hex-encoded 256-bit secret (openssl rand -hex 32) under any other
+        # key fails the key check and gets scrubbed by the 64-char entropy pattern.
+        return {k: (v if (k in generated_id_keys or _is_digest_field(k, v)) else redact_obj(v)) for k, v in value.items()}
     if isinstance(value, list):
         return [redact_obj(v) for v in value]
     if isinstance(value, str):
