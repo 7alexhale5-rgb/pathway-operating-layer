@@ -855,6 +855,21 @@ def test_closeout_router_ready_to_close_and_work_close_receipts():
     run("work-log", ["--work-id", wid, "--pathway", required[-1], "--kind", "verify",
                      "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
                      "--verify-cmd", "printf verified"])
+
+    # Covered itinerary is NOT sufficient: an open control keeps the outcome blocked, so
+    # pathway-next must not claim ready-to-close (it would route to a refusing work-close).
+    blocker, _ = run("work-log", [
+        "--work-id", wid, "--pathway", required[0], "--kind", "control", "--evidence", str(ev),
+        "--control-risk", "closeout-blocker", "--target-pathways", required[0],
+    ])
+    control_id = next(r["control_id"] for r in blocker.get("records", []) if r.get("control_id"))
+    blocked, _ = run("pathway-next", ["--project", str(proj)])
+    check(blocked.get("ready_to_close") is False,
+          "open control blocks ready-to-close even with full itinerary coverage")
+    run("work-log", ["--work-id", wid, "--pathway", required[0], "--kind", "control-resolution",
+                     "--evidence", str(ev), "--control-id", control_id,
+                     "--control-status", "resolved", "--result", "pass"])
+
     recs_before = len((ROOT / "out" / "operator-intelligence" / "pathway-recommendations.ndjson").read_text(encoding="utf-8").splitlines()) if (ROOT / "out" / "operator-intelligence" / "pathway-recommendations.ndjson").exists() else 0
     ready, ready_proc = run("pathway-next", ["--project", str(proj)])
     check(ready_proc.returncode == 0, "pathway-next exits 0 on a fully covered outcome")
@@ -865,6 +880,8 @@ def test_closeout_router_ready_to_close_and_work_close_receipts():
     recs_after = len((ROOT / "out" / "operator-intelligence" / "pathway-recommendations.ndjson").read_text(encoding="utf-8").splitlines()) if (ROOT / "out" / "operator-intelligence" / "pathway-recommendations.ndjson").exists() else 0
     check(recs_after == recs_before,
           "ready-to-close pathway-next does not log a phantom pathway recommendation")
+    check(ready.get("recommendation_id") == "",
+          "ready-to-close returns an empty recommendation_id (nothing logged to reference)")
 
     closed, closed_proc = run("work-close", ["--work-id", wid])
     check(closed_proc.returncode == 0 and closed.get("closed") is True,
@@ -2106,6 +2123,14 @@ def test_verifier_receipt_flags_trivial_command():
     check(p2.get("trivial_verifier") is False,
           f"a non-denylisted verifier with real stdout is not flagged trivial (got {p2.get('trivial_verifier')})")
 
+    # An echo PREAMBLE must not hide a real verifier from the canary: only a bare echo is trivial.
+    opl = load_cli("trivial_chain")
+    check(opl.verifier_command_is_trivial("echo ok") is True, "a bare echo is trivial")
+    check(opl.verifier_command_is_trivial("echo start && pytest -q") is False,
+          "an echo chained to a real command is NOT trivial (canary must still run)")
+    check(opl.verifier_command_is_trivial("echo pretest; ./verify.sh") is False,
+          "an echo followed by a semicolon-chained verifier is NOT trivial")
+
 
 def test_verifier_receipt_canary_mutant_catches_noop_verifier():
     """Canary mutant (dossier item 2, keystone): flip a byte in a changed line and re-run the
@@ -2121,6 +2146,7 @@ def test_verifier_receipt_canary_mutant_catches_noop_verifier():
     (proj / "value.txt").write_text("42\n")
     git("add", "-A"); git("commit", "-q", "-m", "baseline")
     (proj / "value.txt").write_text("100\n")  # the change under verification
+    os.chmod(proj / "value.txt", 0o755)  # executable target: restore must keep the mode
     ev = write("out/operator-artifacts/canary-proof.md", "proof\n")
     start, _ = run("work-start", ["--project", str(proj), "--goal", "canary"])
     wid = start["work_id"]
@@ -2166,6 +2192,8 @@ def test_verifier_receipt_canary_mutant_catches_noop_verifier():
 
     check((proj / "value.txt").read_text() == "100\n",
           "canary restores the mutated file byte-for-byte (no working-tree side effects)")
+    check((proj / "value.txt").stat().st_mode & 0o777 == 0o755,
+          "canary preserves the target's permission bits (mkstemp 0600 must not survive the swap)")
 
 
 def test_redact_obj_exempts_only_real_sha256_digests():
@@ -2188,10 +2216,17 @@ def test_redaction_covers_bearer_and_provider_prefixed_credentials():
     xai_key = "xai-abcdefghijklmnopqrstuvwx123456"
     github_token = "github_pat_abcdefghijklmnopqrstuvwx123456"
     bearer = "Authorization: Bearer bearer_abcdefghijklmnopqrstuvwx123456"
-    raw = f"{bearer}\nXAI_API_KEY={xai_key}\ngithub={github_token}\n"
+    aws_key = "AKIAIOSFODNN7EXAMPLE"
+    google_key = "AIzaSyDUMMYKEYabcdefghijklmnopqrstu1234"
+    slack_token = "xoxb-not-a-token-0"
+    stripe_key = "sk_live_abcdefghijklmnop1234"
+    raw = (f"{bearer}\nXAI_API_KEY={xai_key}\ngithub={github_token}\n"
+           f"aws {aws_key} google {google_key}\nslack {slack_token} stripe {stripe_key}\n")
     redacted = opl.redact(raw)
     check(xai_key not in redacted and github_token not in redacted and "bearer_" not in redacted,
           "provider-prefixed and bearer credentials are redacted in memory")
+    check(all(v not in redacted for v in (aws_key, google_key, slack_token, stripe_key)),
+          "AWS/Google/Slack/Stripe credential shapes below the entropy floor are redacted")
     output = ROOT / "out" / "operator-intelligence" / "redaction-provider-fixture.json"
     opl.write_json(output, {"payload": raw})
     persisted = output.read_text(encoding="utf-8")
