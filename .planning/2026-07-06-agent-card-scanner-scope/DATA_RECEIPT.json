@@ -1,0 +1,10 @@
+{
+  "agent_cards_scope_false_blockers": 0,
+  "external_calls": false,
+  "real_manifest": "hermes/profiles/atlas-ceo/manifest.json",
+  "schema_version": "agent-card-scope-v1",
+  "selected_records": [
+    "real-hermes-profile"
+  ],
+  "status": "pass"
+}

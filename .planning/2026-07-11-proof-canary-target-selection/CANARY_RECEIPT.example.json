@@ -1,0 +1,6 @@
+{
+  "canary_target": "value.txt",
+  "canary_target_source": "explicit",
+  "canary_target_reason": "explicit_changed_regular_file",
+  "canary_mutant_failed": true
+}

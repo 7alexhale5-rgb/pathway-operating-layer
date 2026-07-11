@@ -1,0 +1,9 @@
+{
+  "external_calls": false,
+  "external_marker_emitted": false,
+  "scanner_candidates": [
+    "real-agent"
+  ],
+  "status": "pass",
+  "symlinked_candidates_rejected": true
+}

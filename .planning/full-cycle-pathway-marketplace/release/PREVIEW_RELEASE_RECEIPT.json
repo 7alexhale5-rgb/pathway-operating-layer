@@ -1,0 +1,13 @@
+{
+  "canary_status": "not-run",
+  "claimed_external_send": false,
+  "deploy_artifact": ".planning/full-cycle-pathway-marketplace/release/PREVIEW_RELEASE_RECEIPT.json",
+  "external_send_state": "not-sent",
+  "feature_flag_state": "disabled",
+  "human_approval": "",
+  "preview_status": "ready",
+  "production_status": "not-deployed",
+  "rollback_artifact": ".planning/full-cycle-pathway-marketplace/release/RELEASE_STATE_REHEARSAL.md",
+  "rollback_status": "ready",
+  "verification_artifact": ".planning/full-cycle-pathway-marketplace/release/verify-release-receipt.py"
+}

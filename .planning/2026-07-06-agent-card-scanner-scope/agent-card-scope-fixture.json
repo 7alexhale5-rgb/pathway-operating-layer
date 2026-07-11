@@ -1,0 +1,47 @@
+{
+  "schema_version": "agent-card-scope-v1",
+  "metric": "agent_cards_scope_false_blockers",
+  "target": 0,
+  "records": [
+    {
+      "id": "real-hermes-profile",
+      "source_path": "hermes/profiles/atlas-ceo",
+      "inclusion_signal": "manifest.json",
+      "kind": "hermes-profile",
+      "expected_selected": true,
+      "expected_incomplete": true
+    },
+    {
+      "id": "helper-tenants",
+      "source_path": "tenants",
+      "inclusion_signal": "README.md",
+      "kind": "helper-folder",
+      "expected_selected": false,
+      "expected_incomplete": false
+    },
+    {
+      "id": "helper-mcp-servers",
+      "source_path": "mcp-servers",
+      "inclusion_signal": "README.md",
+      "kind": "helper-folder",
+      "expected_selected": false,
+      "expected_incomplete": false
+    },
+    {
+      "id": "legacy-codex-automation",
+      "source_path": "codex/automations/legacy-job",
+      "inclusion_signal": "automation.toml",
+      "kind": "legacy-automation",
+      "expected_selected": false,
+      "expected_incomplete": false
+    },
+    {
+      "id": "symlinked-agent-candidate",
+      "source_path": "agents/linked-agent",
+      "inclusion_signal": "manifest.json",
+      "kind": "symlinked-candidate",
+      "expected_selected": false,
+      "expected_incomplete": false
+    }
+  ]
+}
