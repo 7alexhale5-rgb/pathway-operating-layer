@@ -1,0 +1,192 @@
+{
+  "fixture_id": "selected-work-scoring-ledger-v1",
+  "clock": "2026-07-18T00:00:10Z",
+  "project": {
+    "name": "fixture-project",
+    "path": "/private/tmp/operating-layer-test/projects/fixture-project",
+    "seed_file": "README.md"
+  },
+  "work_items": [
+    {
+      "work_id": "W-selected",
+      "project": "/private/tmp/operating-layer-test/projects/fixture-project",
+      "project_name": "fixture-project",
+      "goal": "Prove selected-work pathway scoring",
+      "status": "active",
+      "updated_at": "2026-07-18T00:00:03Z",
+      "tier": "production-secure",
+      "outcome_profile": {
+        "id": "internal-live-feature",
+        "label": "Internal live feature",
+        "default_tier": "live",
+        "required_pathways": [],
+        "overlays": []
+      },
+      "risk_overlays": [
+        {
+          "id": "selected-human-gate",
+          "title": "Selected human review gate",
+          "required_pathways": ["field"],
+          "reason": "selected fixture overlay"
+        }
+      ],
+      "itinerary": [
+        {"pathway": "govern", "status": "required", "proved_by_run": "", "reason": ""},
+        {"pathway": "research", "status": "required", "proved_by_run": "", "reason": ""},
+        {"pathway": "data", "status": "required", "proved_by_run": "", "reason": ""}
+      ]
+    },
+    {
+      "work_id": "W-older-nine",
+      "project": "/private/tmp/operating-layer-test/projects/fixture-project",
+      "project_name": "fixture-project",
+      "goal": "Older outcome with nine stale records",
+      "status": "active",
+      "updated_at": "2026-07-18T00:00:02Z",
+      "tier": "live",
+      "outcome_profile": {
+        "id": "internal-live-feature",
+        "label": "Internal live feature",
+        "default_tier": "live",
+        "required_pathways": [],
+        "overlays": []
+      },
+      "risk_overlays": [
+        {
+          "id": "older-rollback",
+          "title": "Older rollback gate",
+          "required_pathways": ["release"],
+          "reason": "older fixture overlay"
+        }
+      ],
+      "itinerary": [
+        {"pathway": "govern", "status": "proved", "proved_by_run": "R-old-govern", "reason": ""},
+        {"pathway": "research", "status": "proved", "proved_by_run": "R-old-research", "reason": ""}
+      ]
+    },
+    {
+      "work_id": "W-older-eight",
+      "project": "/private/tmp/operating-layer-test/projects/fixture-project",
+      "project_name": "fixture-project",
+      "goal": "Older outcome with eight stale records",
+      "status": "active",
+      "updated_at": "2026-07-18T00:00:01Z",
+      "tier": "demoable",
+      "outcome_profile": {
+        "id": "internal-live-feature",
+        "label": "Internal live feature",
+        "default_tier": "live",
+        "required_pathways": [],
+        "overlays": []
+      },
+      "risk_overlays": [
+        {
+          "id": "older-incident-response",
+          "title": "Older incident-response gate",
+          "required_pathways": ["observability"],
+          "reason": "older fixture overlay"
+        }
+      ],
+      "itinerary": [
+        {"pathway": "quality", "status": "proved", "proved_by_run": "R-old-quality", "reason": ""}
+      ]
+    }
+  ],
+  "pathway_runs": [
+    {"run_id": "R-old-govern", "work_id": "W-older-nine", "pathway": "govern", "status": "pass", "timestamp": "2026-07-01T00:00:00Z"},
+    {"run_id": "R-old-research", "work_id": "W-older-nine", "pathway": "research", "status": "pass", "timestamp": "2026-07-01T00:00:01Z"},
+    {"run_id": "R-old-quality", "work_id": "W-older-eight", "pathway": "quality", "status": "pass", "timestamp": "2026-07-01T00:00:02Z"}
+  ],
+  "pathway_measurements": [
+    {"measurement_id": "M-old-01", "run_id": "R-old-01", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:01Z", "evidence_id": "E-old-01", "stale_after_days": 1},
+    {"measurement_id": "M-old-02", "run_id": "R-old-02", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:02Z", "evidence_id": "E-old-02", "stale_after_days": 1},
+    {"measurement_id": "M-old-03", "run_id": "R-old-03", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:03Z", "evidence_id": "E-old-03", "stale_after_days": 1},
+    {"measurement_id": "M-old-04", "run_id": "R-old-04", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:04Z", "evidence_id": "E-old-04", "stale_after_days": 1},
+    {"measurement_id": "M-old-05", "run_id": "R-old-05", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:05Z", "evidence_id": "E-old-05", "stale_after_days": 1},
+    {"measurement_id": "M-old-06", "run_id": "R-old-06", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:06Z", "evidence_id": "E-old-06", "stale_after_days": 1},
+    {"measurement_id": "M-old-07", "run_id": "R-old-07", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:07Z", "evidence_id": "E-old-07", "stale_after_days": 1},
+    {"measurement_id": "M-old-08", "run_id": "R-old-08", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:08Z", "evidence_id": "E-old-08", "stale_after_days": 1},
+    {"measurement_id": "M-old-09", "run_id": "R-old-09", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:09Z", "evidence_id": "E-old-09", "stale_after_days": 1},
+    {"measurement_id": "M-old-10", "run_id": "R-old-10", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:10Z", "evidence_id": "E-old-10", "stale_after_days": 1},
+    {"measurement_id": "M-old-11", "run_id": "R-old-11", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:11Z", "evidence_id": "E-old-11", "stale_after_days": 1},
+    {"measurement_id": "M-old-12", "run_id": "R-old-12", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:12Z", "evidence_id": "E-old-12", "stale_after_days": 1},
+    {"measurement_id": "M-old-13", "run_id": "R-old-13", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:13Z", "evidence_id": "E-old-13", "stale_after_days": 1},
+    {"measurement_id": "M-old-14", "run_id": "R-old-14", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:14Z", "evidence_id": "E-old-14", "stale_after_days": 1},
+    {"measurement_id": "M-old-15", "run_id": "R-old-15", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:15Z", "evidence_id": "E-old-15", "stale_after_days": 1},
+    {"measurement_id": "M-old-16", "run_id": "R-old-16", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:16Z", "evidence_id": "E-old-16", "stale_after_days": 1},
+    {"measurement_id": "M-old-17", "run_id": "R-old-17", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2026-01-01T00:00:17Z", "evidence_id": "E-old-17", "stale_after_days": 1},
+    {"measurement_id": "M-old-missing-01", "run_id": "R-old-missing-01", "work_id": "W-older-nine", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2099-01-01T00:00:01Z", "evidence_id": "", "stale_after_days": 1},
+    {"measurement_id": "M-old-missing-02", "run_id": "R-old-missing-02", "work_id": "W-older-eight", "pathway": "quality", "gate": "quality-gate", "kind": "verify", "result": "pass", "timestamp": "2099-01-01T00:00:02Z", "evidence_id": "", "stale_after_days": 1}
+  ],
+  "controls": [
+    {"control_id": "C-selected-security", "work_id": "W-selected", "risk": "selected credential control", "source_pathway": "security", "target_pathways": ["security", "release"], "status": "open"},
+    {"control_id": "C-older-data", "work_id": "W-older-nine", "risk": "older work-local data control", "source_pathway": "data", "target_pathways": ["data"], "status": "open"}
+  ],
+  "proofs": [],
+  "pathway_carry_forward": [
+    {
+      "carry_forward_id": "CF-selected",
+      "work_id": "W-selected",
+      "project": "fixture-project",
+      "project_path": "/private/tmp/operating-layer-test/projects/fixture-project",
+      "pathway": "docs",
+      "source_artifact": "/private/tmp/operating-layer-test/projects/fixture-project/.planning/selected-docs.md",
+      "summary": "selected baton",
+      "what_changed": ["Selected-work scoring contract documented."],
+      "more_relevant": ["The singular active summary is now authoritative."],
+      "less_relevant": ["Older outcome scoring signals."],
+      "next_pathway_must_use": ["Implementation must implement selected scoring."],
+      "do_not_do_yet": ["Do not redesign work selection."],
+      "open_decisions": [],
+      "active_risk_overlays": [],
+      "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "created_at": "2026-07-18T00:00:04Z"
+    },
+    {
+      "carry_forward_id": "CF-older",
+      "work_id": "W-older-nine",
+      "project": "fixture-project",
+      "project_path": "/private/tmp/operating-layer-test/projects/fixture-project",
+      "pathway": "quality",
+      "source_artifact": "/private/tmp/operating-layer-test/projects/fixture-project/.planning/older-quality.md",
+      "summary": "older baton",
+      "what_changed": ["Older quality proof recorded."],
+      "more_relevant": ["Older outcome quality evidence."],
+      "less_relevant": [],
+      "next_pathway_must_use": ["Security must follow the contradictory older baton."],
+      "do_not_do_yet": [],
+      "open_decisions": [],
+      "active_risk_overlays": [],
+      "artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "created_at": "2026-07-18T00:00:09Z"
+    }
+  ],
+  "findings": [
+    {"id": "sec-current-project", "workflow": "fixture", "severity": "critical", "message": "current project security finding", "pathway": "security", "evidence": [{"path": "/private/tmp/operating-layer-test/projects/fixture-project/.planning/finding.json", "source": "fixture-project"}]}
+  ],
+  "mutations": {
+    "remove_selected_control": {"remove_control_ids": ["C-selected-security"], "expected_security_and_release_delta": -50},
+    "move_two_stale_to_selected": {"measurement_ids": ["M-old-01", "M-old-02"], "new_work_id": "W-selected", "expected_quality_delta": 10},
+    "move_two_missing_to_selected": {"measurement_ids": ["M-old-missing-01", "M-old-missing-02"], "new_work_id": "W-selected", "expected_quality_delta": 8}
+  },
+  "no_active_project": {
+    "name": "empty-project",
+    "path": "/private/tmp/operating-layer-test/projects/empty-project",
+    "work_items": [],
+    "expected": {"active_summary": null, "work_id": null, "has_active_work": false, "untracked_foundation_nudge": 8, "next_command_contains": "work-start"}
+  },
+  "expected": {
+    "selected_work_id": "W-selected",
+    "selected_tier": "production-secure",
+    "selected_risk_overlay_ids": ["selected-human-gate"],
+    "selected_carry_forward_id": "CF-selected",
+    "selected_seen": [],
+    "older_seen": ["govern", "research", "quality"],
+    "older_stale_count": 17,
+    "older_missing_evidence_count": 2,
+    "selected_control_ids": ["C-selected-security"],
+    "ignored_older_control_ids": ["C-older-data"],
+    "ignored_older_carry_forward_id": "CF-older",
+    "portfolio_stale_count": 17
+  }
+}
