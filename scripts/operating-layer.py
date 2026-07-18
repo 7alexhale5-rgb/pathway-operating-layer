@@ -401,6 +401,12 @@ def carry_forward_next_pathways(carry_forward):
             escaped = re.escape(pathway)
             if re.search(rf"\b{escaped}\b\s+must\s+use\b", text):
                 refs.add(pathway)
+            elif re.search(
+                rf"\b{escaped}\b\s+must\s+"
+                r"(?:close|complete|deliver|implement|produce|prove|resolve|run|verify)\b",
+                text,
+            ):
+                refs.add(pathway)
             elif re.search(rf"\b(next|run|recommend|route|handoff|proceed|start|feed)\b[^.:\n]{{0,100}}\b{escaped}\b", text):
                 refs.add(pathway)
     return sorted(refs, key=pathway_sort_key)
@@ -498,7 +504,13 @@ def merge_itinerary(old, new):
     # dropped, as retained coverage (both critics flagged this). They no longer block
     # (proved/na), but the record of work done is preserved.
     for pathway, prev in prior.items():
-        if pathway not in new_pathways and prev.get("status") in ("proved", "na"):
+        retained_manual_requirement = (
+            prev.get("status", "required") == "required"
+            and prev.get("coverage_source") == "work-cover"
+        )
+        if pathway not in new_pathways and (
+            prev.get("status") in ("proved", "na") or retained_manual_requirement
+        ):
             merged.append(prev)
     merged.sort(key=lambda e: pathway_sort_key(e.get("pathway")))
     return merged
@@ -1030,7 +1042,11 @@ def _is_digest_field(key, value):
 
 def redact_obj(value):
     if isinstance(value, dict):
-        generated_id_keys = {"work_id", "run_id", "measurement_id", "control_id", "evidence_id", "created_by_run_id", "resolved_by_run_id", "resolution_evidence_id"}
+        generated_id_keys = {
+            "work_id", "run_id", "measurement_id", "control_id", "evidence_id",
+            "created_by_run_id", "resolved_by_run_id", "resolution_evidence_id",
+            "proved_by_run",
+        }
         # Exempt a value only when it BOTH sits under a digest-named key AND is a 64-hex string —
         # that is a content hash (artifact/verifier-stdout/verifier-source binding) the entropy
         # redactor would otherwise scrub to "[REDACTED]", silently breaking the binding. The
@@ -1252,9 +1268,26 @@ def upsert_proof(paths, proof):
     return proofs
 
 
+def proof_result_is_passing(result):
+    """Return True only for an explicit pass-like proof result.
+
+    A verifier exiting 0 proves that its checks ran successfully; it does not turn an operator
+    outcome such as ``blocked``, ``open``, ``partial``, or ``fail`` into a passing result. Keep the
+    accepted vocabulary deliberately small while preserving the legacy proof-add default
+    (``present``) and descriptive ``pass: ...`` / ``passed-...`` results already in the ledger.
+    """
+    normalized = str(result or "").strip().lower()
+    if normalized in {
+        "approved", "complete", "completed", "green", "ok", "pass", "passed", "present",
+        "ready", "succeeded", "success", "verified",
+    }:
+        return True
+    return bool(re.match(r"^(?:pass|passed)(?:[\s:_-].*)$", normalized))
+
+
 def proof_is_verified(proof):
     """Keystone: a proof counts as REAL verification ONLY when a re-executed verifier exited 0
-    on a non-failing result. Free-text attestation (a --verified-by string) and bare human
+    on an explicitly passing result. Free-text attestation (a --verified-by string) and bare human
     attestation (a --reviewer name) are claims, not verifications — a name is not a verifiable
     receipt, so it cannot prove on its own (a dual-critic pass caught --reviewer as the same
     forgery under a different flag). Only `executed` proves; `signed`/`attested` are recorded for
@@ -1263,7 +1296,7 @@ def proof_is_verified(proof):
     signature/approval receipt — is a future strengthening of the `signed` tier.)"""
     if not isinstance(proof, dict):
         return False
-    if str(proof.get("result", "")).strip().lower() in ("fail", "failed", "error", "missing_evidence"):
+    if not proof_result_is_passing(proof.get("result")):
         return False
     return (
         proof.get("verifier_strength") == "executed"
@@ -4009,10 +4042,34 @@ def run_work_cover(args, paths):
     entry = next((e for e in itinerary if e.get("pathway") == args.pathway), None)
     if args.add:
         if entry:
-            # Never downgrade earned proof on --add (GLM P1 + reproduced): only an absent
-            # or already-required entry stays required; proved/na is preserved as-is.
-            if entry.get("status") not in ("proved", "na"):
+            # Preserve genuinely earned proof. If an older engine incorrectly marked a pathway
+            # proved from an explicitly non-passing proof, --add is also the narrow repair path:
+            # reopen only when the recorded proving receipt exists but no verified proof supports
+            # the pathway. Legacy/manual proved entries with no matching proof record stay intact.
+            pathway_proofs = [
+                proof for proof in read_ndjson(paths.proofs_path)
+                if proof.get("work_id") == args.work_id and proof.get("pathway") == args.pathway
+            ]
+            proved_by = entry.get("proved_by_run") or ""
+            recorded_receipt = any(
+                proved_by and proved_by in (proof.get("run_id"), proof.get("proof_id"))
+                for proof in pathway_proofs
+            )
+            # Older writes redacted the nested generated run id before `proved_by_run` was added
+            # to the redactor's generated-id allowlist. If the marker remains and this pathway has
+            # proof records, treat it as a recorded receipt; verified support below still decides
+            # whether it is earned or must be reopened.
+            recorded_receipt = recorded_receipt or (
+                proved_by == "[REDACTED]" and bool(pathway_proofs)
+            )
+            verified_support = any(proof_is_verified(proof) for proof in pathway_proofs)
+            invalid_recorded_proof = (
+                entry.get("status") == "proved" and recorded_receipt and not verified_support
+            )
+            if entry.get("status") not in ("proved", "na") or invalid_recorded_proof:
                 entry["status"] = "required"
+                entry["coverage_source"] = "work-cover"
+                entry["proved_by_run"] = ""
             if args.reason:
                 entry["reason"] = args.reason
         else:
@@ -4021,6 +4078,7 @@ def run_work_cover(args, paths):
                 "status": "required",
                 "reason": args.reason or "revealed during execution",
                 "proved_by_run": "",
+                "coverage_source": "work-cover",
             })
         itinerary.sort(key=lambda e: pathway_sort_key(e.get("pathway")))
     else:
@@ -4631,6 +4689,23 @@ def active_work_for_project(paths, project_path, project_name):
     return sorted(matches, key=lambda w: w.get("updated_at", ""), reverse=True)
 
 
+def work_item_is_within_project(item, project_path, project_name):
+    """Whether an explicitly selected work item belongs to this project boundary.
+
+    Default selection keeps its existing exact project/name behavior. Explicit selection may pin
+    a work item owned by a nested checkout (for example ConsultOps inside the Koho project root),
+    but never a sibling or unrelated project.
+    """
+    item_project = str(item.get("project") or "").strip()
+    if item_project:
+        try:
+            Path(item_project).resolve().relative_to(Path(project_path).resolve())
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+    return item.get("project_name") == project_name
+
+
 # Error findings escalate so a cluster of live fires can out-rank the foundation gates
 # (research 100 / govern 80): 1 error stays below govern (foundation-first holds), 2 ties it,
 # 3+ overrides everything — a pile of P0s beats "pin your metric / do research first".
@@ -4669,7 +4744,7 @@ def learned_pathway_closures(paths, project_name, project_path):
     return closures
 
 
-def score_pathways(paths, project_path, project_name, scoped_findings, work_summaries,
+def score_pathways(paths, project_path, project_name, scoped_findings, active_summary,
                    outcome_profile=None, risk_overlays=None, latest_carry_forward=None):
     """Score each pathway by how much it is the current constraint.
 
@@ -4685,22 +4760,18 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
         scores[pathway]["score"] += amount
         scores[pathway]["reasons"].append(reason)
 
-    # Pathways already exercised for this project's active work.
-    seen = set()
-    covered_pathways = set()
-    open_controls = []
-    stale_count = 0
-    missing_evidence_count = 0
-    for summary in work_summaries:
-        seen.update(summary.get("pathway_coverage", {}).get("seen", []))
-        covered_pathways.update(summary.get("pathway_coverage", {}).get("proved", []))
-        covered_pathways.update(
-            e.get("pathway") for e in summary.get("itinerary", [])
-            if e.get("status") in ("proved", "na")
-        )
-        open_controls.extend(summary.get("open_controls", []))
-        stale_count += len(summary.get("stale_measurements", []))
-        missing_evidence_count += len(summary.get("missing_evidence", []))
+    # Outcome-state signals belong only to the selected active work item. Project findings and
+    # closed-outcome learning remain broader inputs below; portfolio aggregation has its own path.
+    summary = active_summary or {}
+    seen = set(summary.get("pathway_coverage", {}).get("seen", []))
+    covered_pathways = set(summary.get("pathway_coverage", {}).get("proved", []))
+    covered_pathways.update(
+        e.get("pathway") for e in summary.get("itinerary", [])
+        if e.get("status") in ("proved", "na")
+    )
+    open_controls = list(summary.get("open_controls", []))
+    stale_count = len(summary.get("stale_measurements", []))
+    missing_evidence_count = len(summary.get("missing_evidence", []))
 
     def covered_by_active_work(pathway):
         return pathway in covered_pathways
@@ -4725,7 +4796,7 @@ def score_pathways(paths, project_path, project_name, scoped_findings, work_summ
     # real findings — the measured 0/3 external-precision failure (consult-ops had 36 findings and
     # got "pin a metric"). So the gate only dominates with active work; untracked, it is a small
     # tiebreaker and live findings drive the pick.
-    has_active_work = bool(work_summaries)
+    has_active_work = active_summary is not None
     if "research" not in seen:
         bump("research", 100 if has_active_work else UNTRACKED_FOUNDATION_NUDGE, "Foundation gate: no verified research dossier for this project — cannot plan from vague context.")
     if "govern" not in seen:
@@ -5245,7 +5316,12 @@ def run_pathway_trust(args, paths):
     return result
 
 
-def run_pathway_next(args, paths):
+def compute_pathway_next(args, paths):
+    """Pure recommendation compute — scores pathways and derives the pick without touching
+    disk (no recommendations-ledger append, no report render). run_pathway_next persists the
+    result exactly once via persist_pathway_next; callers that need a dry pass (pathway-pilot
+    enrollment probing for an active work item) call this directly, so unactionable rows never
+    reach the ledger and never corrupt the autonomy_gate_rate denominator."""
     project_path = resolve_project_path(args, paths)
     if not project_path:
         return {
@@ -5268,10 +5344,50 @@ def run_pathway_next(args, paths):
     scoped_findings = ol_findings + local_findings
     sources = {"operating_layer": len(ol_findings), "project_local": len(local_findings)}
     work_items = active_work_for_project(paths, project_path, project_name)
-    work_summaries = [work_status_summary(paths, w.get("work_id")) for w in work_items]
-    active_summary = work_summaries[0] if work_summaries else None
-    work_id = work_items[0].get("work_id") if work_items else None
-    active_item = (active_summary or {}).get("work_item") or (work_items[0] if work_items else {})
+    requested_work_id = str(getattr(args, "work_id", "") or "").strip()
+    if requested_work_id:
+        known_item = next(
+            (item for item in read_ndjson(paths.work_items_path)
+             if item.get("work_id") == requested_work_id),
+            None,
+        )
+        selected_item = (
+            known_item
+            if known_item
+            and known_item.get("status", "active") != "closed"
+            and work_item_is_within_project(known_item, project_path, project_name)
+            else None
+        )
+        if not selected_item:
+            if known_item and known_item.get("status", "active") == "closed":
+                detail = f"Work item {requested_work_id} is closed and cannot drive a new recommendation."
+            elif known_item:
+                detail = (
+                    f"Work item {requested_work_id} does not belong to the selected project "
+                    f"{project_name}."
+                )
+            else:
+                detail = f"No work item exists for work_id {requested_work_id}."
+            return {
+                "findings": [finding(
+                    "pathway-next-work-id-not-active",
+                    "pathway-next",
+                    "warn",
+                    detail,
+                    [line_evidence(paths.work_items_path, source=requested_work_id)],
+                    f"Pass an active work ID for {project_name}, or omit --work-id to use the newest active item.",
+                    "static",
+                    "high",
+                )],
+                "records": [],
+                "project": project_name,
+                "work_id": requested_work_id,
+            }
+    else:
+        selected_item = work_items[0] if work_items else None
+    work_id = selected_item.get("work_id") if selected_item else None
+    active_summary = work_status_summary(paths, work_id) if work_id else None
+    active_item = (active_summary or {}).get("work_item") or selected_item or {}
     latest_carry_forward = latest_carry_forward_for_work(paths, work_id) if work_id else {}
     goal_for_contract = args.goal or active_item.get("goal") or f"Advance {project_name} via /pathway"
     if active_item.get("outcome_profile") or active_item.get("risk_overlays"):
@@ -5286,7 +5402,7 @@ def run_pathway_next(args, paths):
         risk_overlays = contract["risk_overlays"]
         contract_tier = contract["tier"]
     ranked = score_pathways(
-        paths, project_path, project_name, scoped_findings, work_summaries,
+        paths, project_path, project_name, scoped_findings, active_summary,
         outcome_profile, risk_overlays, latest_carry_forward)
     recommended = ranked[0]
     # Itinerary override: when the active outcome still owes required pathways, the next
@@ -5311,11 +5427,23 @@ def run_pathway_next(args, paths):
         if open_foundations:
             first = open_foundations[0]  # itinerary_open is canonical-ordered: govern before research
         else:
-            first = next((r["pathway"] for r in ranked if r["pathway"] in itinerary_open), itinerary_open[0])
+            # A structured baton is the authority for semantic continuity. Once foundations are
+            # covered, an explicit non-conditional "X must close/produce/..." directive outranks
+            # generic profile/overlay scoring among still-open pathways; otherwise a blocked
+            # release can immediately loop back to release despite saying implementation must go
+            # first. Scoring still decides when the baton has no actionable open directive.
+            baton_open = [
+                pathway for pathway in carry_forward_next_pathways(latest_carry_forward)
+                if pathway in itinerary_open
+            ]
+            first = baton_open[0] if baton_open else next(
+                (r["pathway"] for r in ranked if r["pathway"] in itinerary_open),
+                itinerary_open[0],
+            )
         recommended = next((r for r in ranked if r["pathway"] == first), recommended)
-    card = karpathy_card(recommended["pathway"], project_name, args.goal)
+    card = karpathy_card(recommended["pathway"], project_name, goal_for_contract)
     trust = load_pathway_trust_summary(paths)
-    has_context = bool(scoped_findings or work_items)
+    has_context = bool(scoped_findings or selected_item)
     # Confidence must reflect the ACTUALLY recommended pathway and the field it competes
     # in. For a tracked outcome the router chooses among the open-required itinerary, so
     # confidence compares within that set (recommended is its highest-scored member) — not
@@ -5335,6 +5463,55 @@ def run_pathway_next(args, paths):
     autonomy = suggest_autonomy_tier(
         autonomy_gate_rate(metric.get("proved", 0), metric.get("total_recommendations", 0)),
         trust, confidence)
+    return {
+        "project_path": project_path,
+        "project": project_name,
+        "ranked": ranked,
+        "recommended": recommended,
+        "recommended_pathway": recommended["pathway"],
+        "karpathy_card": card,
+        "one_percent_move": card["one_percent_move"],
+        "pathway_trust": trust,
+        "has_context": has_context,
+        "signal_sources": sources,
+        "recommendation_confidence": confidence,
+        "suggested_autonomy_tier": autonomy["tier"],
+        "autonomy_rationale": autonomy,
+        "ready_to_close": ready_to_close,
+        "work_id": work_id,
+        "contract_tier": contract_tier,
+        "latest_carry_forward": latest_carry_forward,
+        "carry_forward_effect": carry_forward_effect(latest_carry_forward, recommended["pathway"]),
+        "outcome_profile": outcome_profile,
+        "risk_overlays": risk_overlays,
+        "itinerary": (active_summary or {}).get("itinerary", []) if active_summary else [],
+        "itinerary_coverage": (active_summary or {}).get("itinerary_coverage", {}) if active_summary else {},
+    }
+
+
+def persist_pathway_next(args, paths, state):
+    """Persist step for compute_pathway_next: assigns the recommendation id, renders the
+    operator report, and appends the follow-through row to the recommendations ledger — the
+    autonomy_gate_rate denominator, so this must run exactly once per acted-on recommendation."""
+    if "recommended" not in state:
+        return state  # compute-step error result (e.g. missing project) — pass through
+    project_path = state["project_path"]
+    project_name = state["project"]
+    recommended = state["recommended"]
+    ranked = state["ranked"]
+    card = state["karpathy_card"]
+    trust = state["pathway_trust"]
+    has_context = state["has_context"]
+    sources = state["signal_sources"]
+    confidence = state["recommendation_confidence"]
+    autonomy = state["autonomy_rationale"]
+    ready_to_close = state["ready_to_close"]
+    work_id = state["work_id"]
+    contract_tier = state["contract_tier"]
+    latest_carry_forward = state["latest_carry_forward"]
+    carry_forward_note = state["carry_forward_effect"]
+    outcome_profile = state["outcome_profile"]
+    risk_overlays = state["risk_overlays"]
     recommendations = read_ndjson(paths.recommendations_path)
     # No recommendation_id on ready-to-close: nothing is logged to the ledger (see below),
     # so returning an id would hand consumers a dangling reference to a row that never exists.
@@ -5343,7 +5520,6 @@ def run_pathway_next(args, paths):
         else f"REC-{safe_slug(project_name)}-{recommended['pathway']}-{len(recommendations) + 1:04d}"
     )
 
-    carry_forward_note = carry_forward_effect(latest_carry_forward, recommended["pathway"])
     if ready_to_close:
         next_command = (
             f"python3 ~/.claude/scripts/operating-layer.py work-close \\\n"
@@ -5431,11 +5607,15 @@ def run_pathway_next(args, paths):
         "carry_forward_effect": carry_forward_note,
         "outcome_profile": outcome_profile,
         "risk_overlays": risk_overlays,
-        "itinerary": (active_summary or {}).get("itinerary", []) if active_summary else [],
-        "itinerary_coverage": (active_summary or {}).get("itinerary_coverage", {}) if active_summary else {},
+        "itinerary": state["itinerary"],
+        "itinerary_coverage": state["itinerary_coverage"],
         "report": str(md_path),
         "html": str(html_path),
     }
+
+
+def run_pathway_next(args, paths):
+    return persist_pathway_next(args, paths, compute_pathway_next(args, paths))
 
 
 def run_pathway_run(args, paths):
@@ -5696,14 +5876,19 @@ def run_pathway_pilot(args, paths):
         next_args = argparse.Namespace(**vars(args))
         next_args.project = project_path
         next_args.goal = goal
-        rec = run_pathway_next(next_args, paths)
+        # Dry pass: pure compute only. Persisting here would ledger a recommendation the
+        # pilot immediately supersedes after work-start — an unactionable row that corrupts
+        # the follow-through denominator (autonomy_gate_rate). Exactly one row is persisted
+        # per enrollment, below.
+        rec = compute_pathway_next(next_args, paths)
         if not rec.get("work_id") and getattr(args, "goal", ""):
             start_args = argparse.Namespace(**vars(args))
             start_args.project = project_path
             start_args.goal = goal
             start_args.tier = rec.get("outcome_profile", {}).get("default_tier") or DEFAULT_ITINERARY_TIER
             run_work_start(start_args, paths)
-            rec = run_pathway_next(next_args, paths)
+            rec = compute_pathway_next(next_args, paths)
+        rec = persist_pathway_next(next_args, paths, rec)
         pathway = rec.get("recommended_pathway", "")
         team = team_assignment_for_pathway(pathway)
         review = review_gate_for_recommendation(rec)
@@ -7681,7 +7866,10 @@ def build_parser():
     parser.add_argument("--project", help="Project path for work-start.")
     parser.add_argument("--projects", help="Comma-separated projects for pathway-pilot.")
     parser.add_argument("--goal", help="User-visible outcome for work-start.")
-    parser.add_argument("--work-id", help="Shared outcome identifier for daily work commands.")
+    parser.add_argument(
+        "--work-id",
+        help="Shared outcome identifier; pathway-next pins its active selection when supplied.",
+    )
     parser.add_argument("--pathway", help="Pathway name for work-log.")
     parser.add_argument("--kind", help="Run or measurement kind for work-log.")
     parser.add_argument("--evidence", help="Local evidence path for work-log.")

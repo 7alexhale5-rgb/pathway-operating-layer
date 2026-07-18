@@ -116,6 +116,9 @@ Requires Python 3.9+. No dependencies.
 # 1. What should I do next on this project? (read-only)
 python3 scripts/operating-layer.py pathway-next --project /path/to/project --json
 
+# Pin a specific active outcome (including a nested checkout under the project root)
+python3 scripts/operating-layer.py pathway-next --project /path/to/project --work-id <WORK_ID> --json
+
 # 1a. Measure local Pathway proof integrity and documentation drift (read-only).
 # A score below 92 is reported; it does not make the command fail.
 python3 scripts/operating-layer.py pathway-audit --project /path/to/project --json
@@ -161,6 +164,10 @@ report to the configured operator-artifacts directory, reports its `/100` score,
 documentation drift separately, and does not edit the selected project or make external calls.
 For the proof, credential-redaction, and release-state rules behind that score, see
 [`docs/pathway-proof-integrity.md`](docs/pathway-proof-integrity.md).
+
+For the outcome-versus-portfolio boundary used by `pathway-next`, including the
+singular selected-work summary and regression contract, see
+[`docs/selected-work-pathway-next-scoring.md`](docs/selected-work-pathway-next-scoring.md).
 
 ## The eleven core pathways plus field
 

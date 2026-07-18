@@ -65,7 +65,7 @@ What goes in the block, by situation:
 
 ## ASK — "what should I do next?"
 
-1. Run: `python3 ~/.claude/scripts/operating-layer.py pathway-next --project <project> --json`
+1. Run: `python3 ~/.claude/scripts/operating-layer.py pathway-next --project <project> [--work-id <selected-work-id>] --json`. Omit `--work-id` only when no outcome has been selected yet; once the JSON returns a work ID, pin every later determine call for that outcome to it.
 2. From the JSON, tell the user, in plain English:
    - **Coverage first** (when `work_id` exists) — `itinerary_coverage`: "Pathway 3 of 7 proved ·
      remaining: security, observability, docs." This is the spine; the recommendation is the next step on it.
@@ -85,7 +85,7 @@ The user pasted `/pathway <project> go`. Their paste **is** the authority for th
 are present and explicitly triggering it — so run the recommended pathway now. Do not
 re-recommend, do not present a menu.
 
-1. **Determine** — `pathway-next --project <project> --json`. Read `recommended_pathway`,
+1. **Determine** — `pathway-next --project <project> [--work-id <selected-work-id>] --json`. On a fresh invocation, the first result selects the work ID; pin every later determine call in this outcome to it. Read `recommended_pathway`,
    `karpathy_card` (skill / execution_stack / execution_tools / one_percent_move / verifier_good /
    real_artifact), `pathway_trust`, `confidence`, `work_id`. `go` re-derives the recommendation
    here, so it round-trips deterministically from a fresh session — no in-session state needed.
@@ -118,14 +118,14 @@ re-recommend, do not present a menu.
    The goal's own words also auto-pull `design` (UI), `research`, or `data`. If the user didn't say,
    infer from the goal and state your pick in one line — don't interrogate.
 3. Run: `python3 ~/.claude/scripts/operating-layer.py work-start --project <abs-path> --goal "<goal>" --tier <tier>`
-4. Immediately run ASK (pathway-next). Show the **seeded itinerary** in plain English — "this outcome
+4. Immediately run ASK with the `work-start` result's `--work-id` pinned. Show the **seeded itinerary** in plain English — "this outcome
    needs N pathways: govern, data, … — I walk them in order, and it can't close until each is proved
    on a real artifact or explicitly marked not-applicable with a reason."
 5. Tell the user the work ID once; every pathway logs against it. End with the hand-off block.
 
 ## LOG — "I finished a pathway, here's the proof"
 
-1. Get the active work ID: `python3 ~/.claude/scripts/operating-layer.py pathway-next --project <project> --json` → read `work_id`.
+1. Get the active work ID: `python3 ~/.claude/scripts/operating-layer.py pathway-next --project <project> [--work-id <selected-work-id>] --json` → read `work_id`. Once known, keep passing it so a newer sibling outcome cannot replace it.
    - If there is no active work item, switch to START first (ask for the goal if none was given).
 2. Proof needs BOTH — a **real file that exists** AND an executable verifier passed through
    `--verify-cmd`. `--verified-by` is attestation only; it never proves a pathway by itself.
@@ -181,7 +181,7 @@ fail-closes to Tier 1 in code, so the field is always current).
 
 **One iteration:**
 
-1. **Determine** — `pathway-next --project <project> --json`. Read `recommended_pathway`, the
+1. **Determine** — `pathway-next --project <project> [--work-id <selected-work-id>] --json`. Omit the ID only on the first selection; pin the returned ID for the rest of the loop. Read `recommended_pathway`, the
    `karpathy_card` (decision / verifier_good / real_artifact / skill + `execution_stack` +
    `execution_tools` — the full best-execution profile), `confidence`, `suggested_autonomy_tier`
    (+ `autonomy_rationale`), and `work_id`. The engine already gated the tier — apply it, don't

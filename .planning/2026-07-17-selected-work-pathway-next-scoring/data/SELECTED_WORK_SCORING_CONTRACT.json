@@ -1,0 +1,97 @@
+{
+  "contract_id": "selected-work-pathway-next-scoring-v1",
+  "status": "approved-for-implementation",
+  "version": 1,
+  "selector": {
+    "owner": "compute_pathway_next",
+    "policy": "most-recently-updated-active-work",
+    "selected_cardinality": "zero-or-one",
+    "explicit_work_id_in_scope": false
+  },
+  "selected_outcome": {
+    "input_name": "active_summary",
+    "cardinality": "zero-or-one",
+    "fields": {
+      "pathway_coverage.seen": {
+        "default": [],
+        "consumer": "foundation-and-completeness-scoring"
+      },
+      "pathway_coverage.proved": {
+        "default": [],
+        "consumer": "profile-overlay-and-carry-forward-coverage"
+      },
+      "itinerary": {
+        "default": [],
+        "consumer": "proved-or-na-coverage-and-itinerary-routing"
+      },
+      "open_controls": {
+        "default": [],
+        "consumer": "selected-control-scoring",
+        "weight_each_target": 50
+      },
+      "stale_measurements": {
+        "default": [],
+        "consumer": "selected-verification-health",
+        "weight_each": 5
+      },
+      "missing_evidence": {
+        "default": [],
+        "consumer": "selected-verification-health",
+        "weight_each": 4
+      }
+    }
+  },
+  "project_scope": {
+    "scoped_findings": {
+      "behavior": "preserve",
+      "consumer": "current-project-risk-scoring"
+    },
+    "learned_pathway_closures": {
+      "behavior": "preserve",
+      "consumer": "bounded-project-history-dampening"
+    }
+  },
+  "system_scope": {
+    "pathway_trust": {
+      "behavior": "preserve",
+      "consumer": "recommendation-confidence"
+    },
+    "global_proof_metric": {
+      "behavior": "preserve",
+      "consumer": "suggested-autonomy-only"
+    }
+  },
+  "portfolio_scope": {
+    "surfaces": [
+      "work-status",
+      "work-daily",
+      "daily-dashboard",
+      "portfolio-next"
+    ],
+    "behavior": "continue-aggregating-all-relevant-active-work"
+  },
+  "no_active_work": {
+    "active_summary": null,
+    "has_active_work": false,
+    "work_id": null,
+    "tracked_foundation_weight": 0,
+    "untracked_foundation_nudge": 8,
+    "next_command": "work-start"
+  },
+  "invariants": [
+    "selected-work-id-owns-all-outcome-scoring-signals",
+    "non-selected-work-mutation-does-not-change-selected-result",
+    "project-findings-remain-cross-outcome",
+    "portfolio-health-remains-aggregate",
+    "persistence-identifies-the-selected-work-id",
+    "no-ledger-schema-or-record-migration"
+  ],
+  "out_of_scope": [
+    "active-work-selector-redesign",
+    "explicit-work-id-interface",
+    "control-scope-schema",
+    "scoring-weight-redesign",
+    "portfolio-priority-redesign",
+    "resolved-local-finding-filtering"
+  ]
+}

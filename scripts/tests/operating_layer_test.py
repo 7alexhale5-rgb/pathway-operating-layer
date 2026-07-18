@@ -6,18 +6,32 @@ Stdlib only. Run: python3 ~/.claude/scripts/tests/operating_layer_test.py
 Exit 0 = all pass; non-zero = failures.
 """
 import ast
+import atexit
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
 CLI = (HERE / ".." / "operating-layer.py").resolve()
-ROOT = Path("/private/tmp/operating-layer-test")
+_TEST_ROOT_PARENT = Path("/private/tmp").resolve()
+ROOT = _TEST_ROOT_PARENT / f"operating-layer-test-{uuid.uuid4().hex}"
+ROOT.mkdir(mode=0o700)
+
+
+def _cleanup_owned_test_root(test_root=ROOT):
+    if (test_root.parent == _TEST_ROOT_PARENT
+            and test_root.name.startswith("operating-layer-test-")
+            and test_root.exists()):
+        shutil.rmtree(test_root)
+
+
+atexit.register(_cleanup_owned_test_root)
 
 _passes = 0
 _failures = []
@@ -619,6 +633,423 @@ def test_pathway_next_recommendation_and_cohesion():
             assert_no_secret_output(file.read_text(errors="ignore"), f"{file.name} redacts secrets in pathway-next outputs")
 
 
+def test_pathway_next_scores_only_selected_active_work():
+    """Outcome scoring follows the selected work ID; portfolio reporting still aggregates.
+
+    This fixture reproduces the live contamination shape: the newest work has no stale or
+    missing-evidence measurements, while two older active outcomes own 17 stale and two missing
+    records. Direct compute comparisons exclude persistence-only IDs and timestamps.
+    """
+    fixture_path = (
+        HERE.parent.parent
+        / ".planning/2026-07-17-selected-work-pathway-next-scoring/data/SELECTED_WORK_SCORING_LEDGER_FIXTURE.json"
+    )
+    fixture = read_json(fixture_path)
+
+    def seed_fixture(mutator=None):
+        reset()
+        fixture_root = str(Path(fixture["project"]["path"]).parents[1])
+        data = json.loads(json.dumps(fixture).replace(fixture_root, str(ROOT)))
+        if mutator:
+            mutator(data)
+        project = ROOT / "projects" / "fixture-project"
+        write("projects/fixture-project/README.md", "# Fixture project\n")
+        write("projects/fixture-project/.planning/STATE.md", "# Current\n")
+        write("projects/fixture-project/.planning/finding.json", "{}\n")
+        write("projects/fixture-project/.planning/selected-docs.md", "# Selected docs\n")
+        write("projects/fixture-project/.planning/older-quality.md", "# Older quality\n")
+        ledger_files = {
+            "work_items": "work-items.ndjson",
+            "pathway_runs": "pathway-runs.ndjson",
+            "pathway_measurements": "pathway-measurements.ndjson",
+            "controls": "controls.ndjson",
+            "proofs": "proofs.ndjson",
+            "pathway_carry_forward": "pathway-carry-forward.ndjson",
+            "findings": "findings.ndjson",
+            "learning_candidates": "learning-candidates.ndjson",
+        }
+        for key, filename in ledger_files.items():
+            write(
+                f"out/operator-intelligence/{filename}",
+                "".join(json.dumps(row) + "\n" for row in data.get(key, [])),
+            )
+        write("out/operator-intelligence/pathway-trust.json", json.dumps({
+            "status": "pass", "summary": "fixture trust passes", "generated_at": fixture["clock"],
+        }))
+        return project, data
+
+    opl = load_cli("selected_work_scoring")
+
+    def compute(project, work_id=""):
+        argv = [
+            "pathway-next",
+            "--project", str(project),
+            "--claude-home", str(ROOT / "claude"),
+            "--codex-home", str(ROOT / "codex"),
+            "--projects-root", str(ROOT / "projects"),
+            "--output-root", str(ROOT / "out"),
+            "--since-days", "3650",
+        ]
+        if work_id:
+            argv.extend(["--work-id", work_id])
+        args = opl.build_parser().parse_args(argv)
+        return opl.compute_pathway_next(args, opl.Paths(args))
+
+    def pathway_score(state, pathway):
+        return next(row["score"] for row in state["ranked"] if row["pathway"] == pathway)
+
+    def selected_projection(state):
+        keys = (
+            "work_id", "ranked", "recommended_pathway", "recommendation_confidence",
+            "suggested_autonomy_tier", "autonomy_rationale", "ready_to_close", "contract_tier",
+            "latest_carry_forward", "carry_forward_effect", "outcome_profile", "risk_overlays",
+            "itinerary", "itinerary_coverage",
+        )
+        return {key: state[key] for key in keys}
+
+    project, _ = seed_fixture()
+    base = compute(project)
+    parameters = list(opl.score_pathways.__code__.co_varnames[:opl.score_pathways.__code__.co_argcount])
+    check(parameters[4] == "active_summary",
+          "selected scoring: score_pathways accepts one active_summary, not an aggregate list")
+    check(base.get("work_id") == "W-selected", "selected scoring: newest active work is selected")
+    check(base.get("contract_tier") == "production-secure"
+          and [row["id"] for row in base.get("risk_overlays", [])] == ["selected-human-gate"],
+          "selected scoring: tier and risk overlays come from the selected work only")
+    check(pathway_score(base, "research") == 100 and pathway_score(base, "govern") == 80,
+          "selected scoring: older foundation coverage does not satisfy selected foundations")
+    selected_statuses = {row["pathway"]: row["status"] for row in base["itinerary"]}
+    check({"govern", "research"}.issubset(base["itinerary_coverage"]["open"])
+          and selected_statuses["govern"] == "required" and selected_statuses["research"] == "required",
+          "selected scoring: older foundations do not satisfy the selected itinerary")
+    check(pathway_score(base, "quality") == 4,
+          "selected scoring: older 17 stale and two missing-evidence rows add zero to quality")
+    check(pathway_score(base, "data") == 4,
+          "selected scoring: an older data control adds zero to selected data score")
+    check(pathway_score(base, "security") == 94 and pathway_score(base, "release") == 54,
+          "selected scoring: selected control adds exactly 50 to each target")
+    security_reasons = next(row["reasons"] for row in base["ranked"] if row["pathway"] == "security")
+    release_reasons = next(row["reasons"] for row in base["ranked"] if row["pathway"] == "release")
+    check(any("C-selected-security" in reason for reason in security_reasons)
+          and any("C-selected-security" in reason for reason in release_reasons),
+          "selected scoring: selected control reason is retained on both target pathways")
+    check(any("sec-current-project" in reason for reason in security_reasons),
+          "selected scoring: current project finding retains its score and reason")
+    check(base.get("latest_carry_forward", {}).get("carry_forward_id") == "CF-selected"
+          and "contradictory older baton" not in base.get("carry_forward_effect", ""),
+          "selected scoring: a chronologically newer older-work baton cannot replace the selected baton")
+    check(base.get("karpathy_card", {}).get("goal") == "Prove selected-work pathway scoring",
+          "selected scoring: the recommendation card uses the selected work goal")
+
+    explicitly_older = compute(project, "W-older-nine")
+    older_quality_reasons = next(
+        row["reasons"] for row in explicitly_older["ranked"] if row["pathway"] == "quality"
+    )
+    check(explicitly_older.get("work_id") == "W-older-nine"
+          and explicitly_older.get("contract_tier") == "live"
+          and [row["id"] for row in explicitly_older.get("risk_overlays", [])] == ["older-rollback"],
+          "selected scoring: --work-id selects an older active outcome and its contract")
+    check(any("9 stale measurement" in reason for reason in older_quality_reasons)
+          and not any("17 stale measurement" in reason for reason in older_quality_reasons),
+          "selected scoring: explicit selection sees its nine stale rows, never the other eight")
+    check(explicitly_older.get("latest_carry_forward", {}).get("carry_forward_id") == "CF-older"
+          and explicitly_older.get("karpathy_card", {}).get("goal") == "Older outcome with nine stale records",
+          "selected scoring: explicit selection scopes carry-forward and goal to the same work ID")
+
+    def move_explicit_work_to_nested_checkout(data):
+        older = next(row for row in data["work_items"] if row["work_id"] == "W-older-nine")
+        older["project"] = str(ROOT / "projects" / "fixture-project" / "nested-app")
+        older["project_name"] = "nested-app"
+
+    project, _ = seed_fixture(move_explicit_work_to_nested_checkout)
+    nested = compute(project, "W-older-nine")
+    check(nested.get("work_id") == "W-older-nine"
+          and nested.get("latest_carry_forward", {}).get("carry_forward_id") == "CF-older",
+          "selected scoring: explicit work may belong to a nested checkout under the project root")
+
+    def selected_requires_quality(data):
+        selected = next(row for row in data["work_items"] if row["work_id"] == "W-selected")
+        selected["outcome_profile"]["required_pathways"] = ["quality"]
+
+    project, _ = seed_fixture(selected_requires_quality)
+    required_quality = compute(project)
+    required_quality_reasons = next(
+        row["reasons"] for row in required_quality["ranked"] if row["pathway"] == "quality"
+    )
+    check(pathway_score(required_quality, "quality") == pathway_score(base, "quality") + 12
+          and any("requires quality" in reason for reason in required_quality_reasons),
+          "selected scoring: older proved coverage does not suppress a selected profile requirement")
+
+    def older_quality_na(data):
+        selected_requires_quality(data)
+        older = next(row for row in data["work_items"] if row["work_id"] == "W-older-eight")
+        next(row for row in older["itinerary"] if row["pathway"] == "quality")["status"] = "na"
+
+    project, _ = seed_fixture(older_quality_na)
+    required_quality_with_older_na = compute(project)
+    check(pathway_score(required_quality_with_older_na, "quality") == pathway_score(required_quality, "quality"),
+          "selected scoring: older N/A coverage does not suppress a selected profile requirement")
+
+    def selected_quality_proved(data):
+        selected_requires_quality(data)
+        selected = next(row for row in data["work_items"] if row["work_id"] == "W-selected")
+        selected["itinerary"].append({
+            "pathway": "quality", "status": "proved", "proved_by_run": "R-selected-quality", "reason": "",
+        })
+
+    project, _ = seed_fixture(selected_quality_proved)
+    covered_quality = compute(project)
+    covered_quality_reasons = next(
+        row["reasons"] for row in covered_quality["ranked"] if row["pathway"] == "quality"
+    )
+    check(pathway_score(covered_quality, "quality") == pathway_score(required_quality, "quality") - 12
+          and not any("requires quality" in reason for reason in covered_quality_reasons),
+          "selected scoring: selected proved coverage suppresses its own profile requirement")
+
+    def without_selected_control(data):
+        data["controls"] = [row for row in data["controls"] if row["work_id"] != "W-selected"]
+
+    project, _ = seed_fixture(without_selected_control)
+    no_control = compute(project)
+    check(pathway_score(no_control, "security") == pathway_score(base, "security") - 50
+          and pathway_score(no_control, "release") == pathway_score(base, "release") - 50,
+          "selected scoring: removing the selected control removes exactly 50 per target")
+
+    def move_two_stale(data):
+        wanted = set(data["mutations"]["move_two_stale_to_selected"]["measurement_ids"])
+        for row in data["pathway_measurements"]:
+            if row["measurement_id"] in wanted:
+                row["work_id"] = "W-selected"
+
+    project, _ = seed_fixture(move_two_stale)
+    selected_stale = compute(project)
+    stale_reasons = next(row["reasons"] for row in selected_stale["ranked"] if row["pathway"] == "quality")
+    check(pathway_score(selected_stale, "quality") == pathway_score(base, "quality") + 10
+          and any("2 stale measurement" in reason for reason in stale_reasons),
+          "selected scoring: two selected stale rows add exactly 10 and name the count")
+
+    def move_two_missing(data):
+        wanted = set(data["mutations"]["move_two_missing_to_selected"]["measurement_ids"])
+        for row in data["pathway_measurements"]:
+            if row["measurement_id"] in wanted:
+                row["work_id"] = "W-selected"
+
+    project, _ = seed_fixture(move_two_missing)
+    selected_missing = compute(project)
+    missing_reasons = next(row["reasons"] for row in selected_missing["ranked"] if row["pathway"] == "quality")
+    check(pathway_score(selected_missing, "quality") == pathway_score(base, "quality") + 8
+          and any("2 measurement(s) lack evidence" in reason for reason in missing_reasons),
+          "selected scoring: two selected missing-evidence rows add exactly 8 and name the count")
+
+    def remove_all_older_signals(data):
+        data["pathway_runs"] = [row for row in data["pathway_runs"] if row["work_id"] == "W-selected"]
+        data["pathway_measurements"] = [
+            row for row in data["pathway_measurements"] if row["work_id"] == "W-selected"
+        ]
+        data["controls"] = [row for row in data["controls"] if row["work_id"] == "W-selected"]
+        data["pathway_carry_forward"] = [
+            row for row in data["pathway_carry_forward"] if row["work_id"] == "W-selected"
+        ]
+
+    project, _ = seed_fixture(remove_all_older_signals)
+    without_older = compute(project)
+    check(selected_projection(without_older) == selected_projection(base),
+          "selected scoring: changing only non-selected work leaves normalized output invariant")
+
+    def add_project_learning(data):
+        data["learning_candidates"] = [{
+            "learning_id": "L-closed-data",
+            "work_id": "W-closed",
+            "project": "fixture-project",
+            "project_path": str(ROOT / "projects" / "fixture-project"),
+            "pathways_seen": ["data"],
+        }]
+
+    project, _ = seed_fixture(add_project_learning)
+    learned = compute(project)
+    check(pathway_score(learned, "data") == pathway_score(base, "data") - 3,
+          "selected scoring: one closed project outcome preserves the exact bounded learning dampener")
+
+    def add_learning_without_older(data):
+        add_project_learning(data)
+        remove_all_older_signals(data)
+
+    project, _ = seed_fixture(add_learning_without_older)
+    learned_without_older = compute(project)
+    check(selected_projection(learned_without_older) == selected_projection(learned),
+          "selected scoring: project learning remains identical when older active signals change")
+
+    project, _ = seed_fixture()
+    persisted, persisted_proc = run(
+        "pathway-next", ["--project", str(project), "--work-id", "W-older-nine"]
+    )
+    recommendation_rows = [
+        json.loads(line) for line in
+        (ROOT / "out/operator-intelligence/pathway-recommendations.ndjson").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    check(persisted_proc.returncode == 0 and len(recommendation_rows) == 1
+          and recommendation_rows[0]["recommendation_id"] == persisted["recommendation_id"]
+          and recommendation_rows[0]["work_id"] == "W-older-nine"
+          and "W-older-nine" in persisted.get("next_command", "")
+          and persisted["recommendation_id"] in persisted.get("next_command", ""),
+          "selected scoring: explicit selection persists one recommendation and retains selected identity")
+
+    def add_invalid_selection_rows(data):
+        data["work_items"].extend([
+            {
+                "work_id": "W-closed", "project": str(ROOT / "projects" / "fixture-project"),
+                "project_name": "fixture-project", "goal": "Closed outcome", "status": "closed",
+                "updated_at": "2026-07-18T00:00:04Z", "itinerary": [],
+            },
+            {
+                "work_id": "W-other-project", "project": str(ROOT / "projects" / "other-project"),
+                "project_name": "fixture-project", "goal": "Same-name sibling outcome", "status": "active",
+                "updated_at": "2026-07-18T00:00:05Z", "itinerary": [],
+            },
+        ])
+
+    project, _ = seed_fixture(add_invalid_selection_rows)
+    recommendations_path = ROOT / "out/operator-intelligence/pathway-recommendations.ndjson"
+    for invalid_id in ("W-missing", "W-closed", "W-other-project"):
+        invalid, _ = run("pathway-next", ["--project", str(project), "--work-id", invalid_id])
+        check({row["id"] for row in invalid.get("findings", [])} == {"pathway-next-work-id-not-active"}
+              and invalid.get("records") == [] and not recommendations_path.exists(),
+              f"selected scoring: invalid selection {invalid_id} fails closed without a recommendation row")
+
+    project, _ = seed_fixture()
+    older_status, _ = run("work-status", ["--work-id", "W-older-nine"])
+    portfolio, _ = run("portfolio-next")
+    portfolio_row = next(row for row in portfolio["records"] if row["project"] == "fixture-project")
+    check(older_status["summary"]["work_item"]["work_id"] == "W-older-nine"
+          and len(older_status["summary"]["stale_measurements"]) == 9
+          and len(older_status["summary"]["missing_evidence"]) == 1
+          and [row["control_id"] for row in older_status["summary"]["open_controls"]] == ["C-older-data"],
+          "selected scoring: older work state remains visible in work-status")
+    check(portfolio_row["active_work"] == 3 and portfolio_row["stale_measurements"] == 17
+          and portfolio_row["open_controls"] == 2,
+          "selected scoring: portfolio-next still aggregates all active work")
+
+    empty = ROOT / "projects" / "empty-project"
+    write("projects/empty-project/README.md", "# Empty project\n")
+    untracked, untracked_proc = run("pathway-next", ["--project", str(empty)])
+    untracked_scores = {row["pathway"]: row["score"] for row in untracked["ranked"]}
+    check(untracked_proc.returncode == 0 and untracked.get("work_id") is None
+          and untracked_scores["research"] == 8 and untracked_scores["govern"] == 8
+          and "work-start" in untracked.get("next_command", ""),
+          "selected scoring: no-active behavior keeps untracked nudges and work-start routing")
+
+
+def test_selected_work_scoring_regression_kills_aggregate_mutant():
+    """The registered quality gate must reject the exact pre-fix aggregate-scoring seam."""
+    import contextlib
+    import io
+    import runpy
+    import tempfile
+
+    replacements = (
+        (
+            "def score_pathways(paths, project_path, project_name, scoped_findings, active_summary,\n",
+            "def score_pathways(paths, project_path, project_name, scoped_findings, work_summaries,\n",
+        ),
+        (
+            """    # Outcome-state signals belong only to the selected active work item. Project findings and
+    # closed-outcome learning remain broader inputs below; portfolio aggregation has its own path.
+    summary = active_summary or {}
+    seen = set(summary.get("pathway_coverage", {}).get("seen", []))
+    covered_pathways = set(summary.get("pathway_coverage", {}).get("proved", []))
+    covered_pathways.update(
+        e.get("pathway") for e in summary.get("itinerary", [])
+        if e.get("status") in ("proved", "na")
+    )
+    open_controls = list(summary.get("open_controls", []))
+    stale_count = len(summary.get("stale_measurements", []))
+    missing_evidence_count = len(summary.get("missing_evidence", []))
+""",
+            """    # Mutant: restore the pre-fix aggregation across every active outcome.
+    seen = set()
+    covered_pathways = set()
+    open_controls = []
+    stale_count = 0
+    missing_evidence_count = 0
+    for summary in work_summaries:
+        seen.update(summary.get("pathway_coverage", {}).get("seen", []))
+        covered_pathways.update(summary.get("pathway_coverage", {}).get("proved", []))
+        covered_pathways.update(
+            e.get("pathway") for e in summary.get("itinerary", [])
+            if e.get("status") in ("proved", "na")
+        )
+        open_controls.extend(summary.get("open_controls", []))
+        stale_count += len(summary.get("stale_measurements", []))
+        missing_evidence_count += len(summary.get("missing_evidence", []))
+""",
+        ),
+        (
+            "    has_active_work = active_summary is not None\n",
+            "    has_active_work = bool(work_summaries)\n",
+        ),
+        (
+            "    active_summary = work_status_summary(paths, work_id) if work_id else None\n",
+            "    active_summary = work_status_summary(paths, work_id) if work_id else None\n"
+            "    work_summaries = [work_status_summary(paths, item.get(\"work_id\")) for item in work_items]\n",
+        ),
+        (
+            "        paths, project_path, project_name, scoped_findings, active_summary,\n",
+            "        paths, project_path, project_name, scoped_findings, work_summaries,\n",
+        ),
+    )
+    required_failures = {
+        "selected scoring: score_pathways accepts one active_summary, not an aggregate list",
+        "selected scoring: older foundation coverage does not satisfy selected foundations",
+        "selected scoring: older 17 stale and two missing-evidence rows add zero to quality",
+        "selected scoring: an older data control adds zero to selected data score",
+        "selected scoring: two selected stale rows add exactly 10 and name the count",
+        "selected scoring: two selected missing-evidence rows add exactly 8 and name the count",
+        "selected scoring: changing only non-selected work leaves normalized output invariant",
+    }
+
+    with tempfile.TemporaryDirectory(prefix="selected-work-scoring-mutant-") as temp_dir:
+        mutant_root = Path(temp_dir)
+        mutant_scripts = mutant_root / "repo/scripts"
+        mutant_tests_dir = mutant_scripts / "tests"
+        mutant_fixture_dir = mutant_root / "repo/.planning/2026-07-17-selected-work-pathway-next-scoring/data"
+        mutant_tests_dir.mkdir(parents=True)
+        mutant_fixture_dir.mkdir(parents=True)
+        mutant_cli = mutant_scripts / "operating-layer.py"
+        mutant_tests = mutant_tests_dir / "operating_layer_test.py"
+        shutil.copy2(Path(__file__).resolve(), mutant_tests)
+        shutil.copy2(
+            HERE.parent.parent
+            / ".planning/2026-07-17-selected-work-pathway-next-scoring/data/SELECTED_WORK_SCORING_LEDGER_FIXTURE.json",
+            mutant_fixture_dir / "SELECTED_WORK_SCORING_LEDGER_FIXTURE.json",
+        )
+
+        mutant_source = CLI.read_text(encoding="utf-8")
+        replacement_counts = []
+        for original, replacement in replacements:
+            replacement_counts.append(mutant_source.count(original))
+            mutant_source = mutant_source.replace(original, replacement)
+        mutant_cli.write_text(mutant_source, encoding="utf-8")
+
+        namespace = runpy.run_path(str(mutant_tests), run_name="selected_work_aggregate_mutant")
+        mutant_test = namespace["test_pathway_next_scores_only_selected_active_work"]
+        mutant_globals = mutant_test.__globals__
+        mutant_globals["ROOT"] = mutant_root / "runtime"
+        passes_before = mutant_globals["_passes"]
+        failures_before = len(mutant_globals["_failures"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            mutant_test()
+        failures = set(mutant_globals["_failures"][failures_before:])
+        executed = mutant_globals["_passes"] - passes_before + len(failures)
+
+    check(replacement_counts == [1] * len(replacements),
+          f"selected scoring quality: aggregate mutant rewrites the five exact scoring seams (got {replacement_counts})")
+    check(executed == 32,
+          f"selected scoring quality: aggregate mutant executes the complete 32-assertion corpus (got {executed})")
+    check(required_failures.issubset(failures),
+          "selected scoring quality: regression corpus kills the aggregate mutant on all seven original contamination paths")
+
+
 def test_pathway_carry_forward_logged_and_used_by_next():
     """Semantic continuity: a completed pathway leaves a structured carry-forward baton, and the next
     determine turn exposes it in JSON and the operator report instead of treating the proof as mere
@@ -673,6 +1104,55 @@ Research says proof/closeout safety is the first implementation slice.
     report_text = Path(rec["report"]).read_text(encoding="utf-8")
     check("## What Previous Work Changed" in report_text and "full RAG framework adoption" in report_text,
           "pathway-next report renders carry-forward deltas and deferred concerns")
+
+    # A non-conditional baton directive is authoritative once foundations are covered, even when
+    # generic production overlays would otherwise score release/security higher.
+    opl = load_cli("carrydirective")
+    directive = {"next_pathway_must_use": [
+        "Implementation must close the code defects without production mutation.",
+        "If the next recommendation is design, preserve the verifier boundary.",
+    ]}
+    check(opl.carry_forward_next_pathways(directive) == ["implementation"],
+          "carry-forward recognizes a direct implementation-must-close baton without treating a conditional as current")
+
+    # Integration: close the remaining foundation and record a release baton whose explicit next
+    # move is implementation. Production profile/rollback scoring is intentionally stronger than
+    # the normal baton bump, so only the continuity override makes the authoritative handoff win.
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify",
+                     "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+                     "--verify-cmd", "printf verified"])
+    release_evidence = write("out/operator-artifacts/release-carry.md", """# Release Verification
+
+## Summary
+Release preflight is complete and rollback is verified; implementation is the next slice.
+
+## What Changed
+- Pinned the rollback sequence.
+
+## More Relevant
+- Close correctness defects.
+
+## Less Relevant
+- Production mutation.
+
+## Next Pathway Must Use
+- Implementation must close the code defects before another release pass.
+
+## Do Not Do Yet
+- Do not deploy.
+
+## Open Decisions
+- Choose the deployment window.
+
+## Active Risk Overlays
+- rollback
+""")
+    run("work-log", ["--work-id", wid, "--pathway", "release", "--kind", "verify",
+                     "--evidence", str(release_evidence), "--result", "pass", "--proof-type", "artifact",
+                     "--verify-cmd", "printf verified"])
+    rec2, _ = run("pathway-next", ["--project", str(proj)])
+    check(rec2.get("recommended_pathway") == "implementation",
+          f"an explicit open implementation baton outranks generic release/security scoring (got {rec2.get('recommended_pathway')})")
 
 
 def test_carry_forward_deferrals_do_not_trigger_false_risk_overlays():
@@ -952,6 +1432,34 @@ def test_pathway_pilot_tracks_agentic_team_cohort():
           "pilot report renders the final-state spec")
     after_project_files = sorted(p.relative_to(ROOT / "projects") for p in (ROOT / "projects").rglob("*") if p.is_file())
     check(after_project_files == before_project_files, "pathway-pilot writes central operator state only")
+
+
+def test_pathway_pilot_logs_one_recommendation_per_enrollment():
+    """Regression (review-pilot-double-recommendation-log): the pilot's dry pass must not
+    ledger a recommendation. Before the compute/persist split, enrolling a project with no
+    active work logged a pre-work-start row that could never be acted on, corrupting the
+    autonomy_gate_rate denominator. Exactly one ledger row per enrolled project, and it is
+    the row the pilot record references."""
+    reset()
+    write("projects/koho/README.md", "# Koho\n")
+    write("projects/prettyfly-os/README.md", "# PrettyFly OS\n")
+    res, proc = run("pathway-pilot", [
+        "--projects", "koho,prettyfly-os",
+        "--goal", "Pilot client feedback review packet for customer approval",
+    ])
+    check(proc.returncode == 0, "pilot single-log: pathway-pilot exits 0")
+    records = res.get("records", [])
+    check(len(records) == 2, "pilot single-log: both projects enrolled")
+    rec_ledger = ROOT / "out" / "operator-intelligence" / "pathway-recommendations.ndjson"
+    rows = [json.loads(line) for line in rec_ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+    check(len(rows) == len(records),
+          f"pilot single-log: recommendations ledger gains exactly one row per enrollment (got {len(rows)} for {len(records)})")
+    ledger_ids = {r.get("recommendation_id") for r in rows}
+    record_ids = {r.get("recommendation_id") for r in records}
+    check(record_ids == ledger_ids and all(record_ids),
+          "pilot single-log: every ledgered row is the one the pilot record references")
+    check(all(r.get("work_id") for r in rows),
+          "pilot single-log: no orphan pre-work-start rows (every row carries a work id)")
 
 
 def test_portfolio_next_ranks_riskier_project_first():
@@ -1558,6 +2066,18 @@ def test_itinerary_coverage_guarantee():
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st["govern"] == "proved", "work-cover --add preserves earned proof")
 
+    # Regression: a newly revealed required pathway must survive the read-time
+    # itinerary recompute, or work-cover reports success once and then silently
+    # allows a false closeout on the very next command.
+    run("work-cover", ["--work-id", demo_wid, "--pathway", "field", "--add",
+                       "--reason", "operator validation surfaced during execution"])
+    data, _ = run("work-status", ["--work-id", demo_wid])
+    st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
+    check(st.get("field") == "required",
+          "work-cover --add preserves a newly required pathway across recompute")
+    check("field" in data["summary"]["itinerary_coverage"]["open"],
+          "newly required pathway continues to block closeout")
+
     # Fix (Codex): work-cover input guards.
     data, _ = run("work-cover", ["--work-id", demo_wid, "--pathway", "bogus", "--na", "--reason", "x"])
     check("work-cover-unknown-pathway" in ids(data), "work-cover rejects an unknown pathway name")
@@ -1567,7 +2087,7 @@ def test_itinerary_coverage_guarantee():
     check("work-cover-na-needs-reason" in ids(data), "work-cover --na requires a reason")
 
     # N/A the rest (with reasons) -> close succeeds at full coverage.
-    for pathway in ("implementation", "quality"):
+    for pathway in ("implementation", "quality", "field"):
         run("work-cover", ["--work-id", demo_wid, "--pathway", pathway, "--na", "--reason", "n/a for this test"])
     data, _ = run("work-close", ["--work-id", demo_wid])
     check(data.get("closed") is True, "work-close succeeds once every pathway is proved or N/A")
@@ -2011,7 +2531,32 @@ def test_proof_requires_real_verifier_not_freetext():
                      "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "exit 1"])
     check(gov_status() == "required", "a verifier command that exits non-zero does not prove")
 
-    # 3. REAL VERIFIER PROVES — an executed command that exits 0 with observable output flips to proved.
+    # 3. BLOCKED OUTCOME STAYS BLOCKED — exit 0 means the verifier ran; it must not launder an
+    # explicitly blocked operator result into a passing proof.
+    blocked, _ = run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
+                     "--result", "blocked", "--proof-type", "artifact", "--verify-cmd", "printf verified"])
+    check(gov_status() == "required", "an exit-0 verifier does not turn a blocked result into proved")
+    blocked_proof = [r for r in blocked.get("records", []) if r.get("verifier_strength")]
+    check(bool(blocked_proof) and blocked_proof[0]["exit_code"] == 0,
+          "the blocked proof still records its successful verifier receipt")
+
+    # Repair regression: older engines could already have persisted that blocked receipt as
+    # `proved`. A deliberate work-cover --add reopens only this demonstrably unsupported entry.
+    items_path = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    items = [json.loads(line) for line in items_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    for item in items:
+        if item.get("work_id") != wid:
+            continue
+        for entry in item.get("itinerary", []):
+            if entry.get("pathway") == "govern":
+                entry["status"] = "proved"
+                entry["proved_by_run"] = "[REDACTED]"  # legacy nested-id redaction defect
+    items_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in items), encoding="utf-8")
+    run("work-cover", ["--work-id", wid, "--pathway", "govern", "--add",
+                       "--reason", "blocked receipt does not prove the pathway"])
+    check(gov_status() == "required", "work-cover --add repairs a proved entry backed only by a blocked receipt")
+
+    # 4. REAL VERIFIER PROVES — an executed command that exits 0 with observable output flips to proved.
     out, _ = run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
                      "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "printf verified"])
     check(gov_status() == "proved", "a re-executed verifier exiting 0 proves the pathway")
@@ -2019,7 +2564,7 @@ def test_proof_requires_real_verifier_not_freetext():
     check(bool(proof) and proof[0]["verifier_strength"] == "executed" and proof[0]["exit_code"] == 0,
           f"the proof records executed strength + exit code 0 (got {proof[0] if proof else None})")
 
-    # 4. BARE HUMAN ATTESTATION DOES NOT PROVE — a --reviewer NAME is recorded for accountability
+    # 5. BARE HUMAN ATTESTATION DOES NOT PROVE — a --reviewer NAME is recorded for accountability
     # (with the artifact hash) but is not a verifiable receipt, so it cannot flip to proved on its
     # own. (A dual-critic pass caught --reviewer as the same forgery the keystone killed under a
     # different flag.) Only a re-executed verifier proves; verifiable human sign-off is future work.
@@ -2031,6 +2576,16 @@ def test_proof_requires_real_verifier_not_freetext():
     check(qstat == "required", "a bare reviewer name does NOT prove (a name is not a verifiable receipt)")
     check(bool(sproof) and sproof[0]["verifier_strength"] == "signed" and bool(sproof[0].get("artifact_sha256")),
           "the reviewer attestation is still recorded (signed strength + artifact hash) for accountability")
+
+    # Explicit pass vocabulary stays backward compatible; ambiguous workflow states do not pass.
+    opl = load_cli("proofresults")
+    for result in ("pass", "passed: checks green", "pass-spec-only", "present", "GREEN"):
+        check(opl.proof_result_is_passing(result) is True, f"{result!r} remains a passing proof result")
+    for result in ("blocked", "blocked-pending-owner", "open", "partial", "fail", "STAGED", "[REDACTED]"):
+        check(opl.proof_result_is_passing(result) is False, f"{result!r} cannot prove a pathway")
+    generated_run_id = "R-W-20260717-example-release-001"
+    check(opl.redact_obj({"proved_by_run": generated_run_id})["proved_by_run"] == generated_run_id,
+          "nested proved_by_run receipts survive safety redaction")
 
 
 def test_autonomy_metric_counts_only_verified_proofs():
@@ -2661,6 +3216,8 @@ def main():
         test_work_close_extracts_learning_candidate,
         test_pathway_trust_report_and_pathway_next_metadata,
         test_pathway_next_recommendation_and_cohesion,
+        test_pathway_next_scores_only_selected_active_work,
+        test_selected_work_scoring_regression_kills_aggregate_mutant,
         test_pathway_carry_forward_logged_and_used_by_next,
         test_carry_forward_deferrals_do_not_trigger_false_risk_overlays,
         test_carry_forward_validation_requires_full_contract,
@@ -2668,6 +3225,7 @@ def main():
         test_closeout_router_ready_to_close_and_work_close_receipts,
         test_pathway_run_creates_plan_and_preserves_project,
         test_pathway_pilot_tracks_agentic_team_cohort,
+        test_pathway_pilot_logs_one_recommendation_per_enrollment,
         test_portfolio_next_ranks_riskier_project_first,
         test_rule_map_names_enforced_and_prose_only_rules,
         test_cockpit_writes_one_page_operator_surface,
