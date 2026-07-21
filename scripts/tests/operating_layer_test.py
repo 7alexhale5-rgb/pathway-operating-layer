@@ -2145,6 +2145,58 @@ def test_proof_add_flips_itinerary_coverage():
           "proof-add with only free-text attestation does NOT prove a pathway (bar preserved)")
 
 
+def test_proof_add_resolves_bare_project_name_and_flags_invalid_cwd():
+    """Regression (verify cwd): legacy work items created via `work-start --project koho` stored
+    the bare project NAME, so proof-add handed subprocess.run cwd="koho", which raised and was
+    recorded fail-closed as exit 1 / empty stdout / trivial_verifier — the leg could never flip
+    to proved (W-20260720-koho-consultops-tasks-section-d84095). proof-add must resolve the name
+    against the projects root before running the verifier, work-start must store the resolved
+    path at entry, and a cwd that resolves nowhere must be recorded as verify_error=cwd_invalid
+    instead of an indistinguishable silent exit 1."""
+    reset()
+    proj = ROOT / "projects" / "barename"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "proof-of-cwd.txt").write_text("cwd resolved to the real project directory\n", encoding="utf-8")
+    ev = ROOT / "barename-evidence.txt"
+    ev.write_text("artifact", encoding="utf-8")
+    start, _ = run("work-start", ["--project", "barename", "--goal", "bare name cwd test", "--tier", "demoable"])
+    wid = start["work_id"]
+    items_path = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+
+    # Entry fix: work-start resolves the bare name against the projects root before storing it.
+    items = [json.loads(l) for l in items_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    stored = next(w for w in items if w.get("work_id") == wid)
+    check(stored["project"] == str(proj.resolve()),
+          "work-start resolves a bare --project name to the real project directory")
+
+    # Re-inject the legacy shape (bare name) to prove proof-add resolves it at consumption too.
+    stored["project"] = "barename"
+    items_path.write_text("\n".join(json.dumps(w) for w in items) + "\n", encoding="utf-8")
+    added, _ = run("proof-add", ["--work-id", wid, "--pathway", "govern", "--proof-type", "artifact",
+                                 "--evidence", str(ev), "--verify-cmd", "cat proof-of-cwd.txt"])
+    proof = added["records"][0]
+    check(proof.get("exit_code") == 0 and not proof.get("verify_error"),
+          "proof-add resolves a bare work-item project name and runs the verifier in the real directory")
+    check(added.get("itinerary_coverage", {}).get("covered", 0) >= 1,
+          "a verifier run in the resolved directory flips the pathway to proved")
+
+    # A project value that resolves nowhere is a distinguishable receipt, not a silent exit 1.
+    stored["project"] = "no-such-project-dir"
+    items_path.write_text("\n".join(json.dumps(w) for w in items) + "\n", encoding="utf-8")
+    ev2 = ROOT / "barename-evidence-2.txt"
+    ev2.write_text("artifact two", encoding="utf-8")
+    added2, _ = run("proof-add", ["--work-id", wid, "--pathway", "quality", "--proof-type", "artifact",
+                                  "--evidence", str(ev2), "--verify-cmd", "cat proof-of-cwd.txt"])
+    proof2 = added2["records"][0]
+    check(proof2.get("verify_error") == "cwd_invalid" and proof2.get("exit_code") is None,
+          "an unresolvable project cwd records verify_error=cwd_invalid with no fabricated exit code")
+    check(not proof2.get("trivial_verifier"),
+          "a cwd_invalid verifier is not mislabeled trivial_verifier")
+    data, _ = run("work-status", ["--work-id", wid])
+    st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
+    check(st.get("quality") != "proved", "cwd_invalid stays fail-closed: the pathway does not prove")
+
+
 def test_proof_requires_verifier_not_just_presence():
     """Gap A (world-class bar): a pathway is `proved` only by a NAMED verifier (a proof
     record) plus a real artifact. A bare evidence file is presence, not sufficiency."""
@@ -3242,6 +3294,7 @@ def main():
         test_pathway_execution_profile_invariants,
         test_itinerary_coverage_guarantee,
         test_proof_add_flips_itinerary_coverage,
+        test_proof_add_resolves_bare_project_name_and_flags_invalid_cwd,
         test_proof_requires_verifier_not_just_presence,
         test_recommendation_confidence_reflects_evidence,
         test_recommendation_follows_evidence_within_itinerary,
