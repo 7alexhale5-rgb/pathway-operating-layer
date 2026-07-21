@@ -1878,7 +1878,25 @@ def run_canary_mutant(verify_cmd, cwd, timeout=120, canary_target=None, selectio
         _atomic_replace_bytes(path, original)
 
 
-def build_proof_record(args, work_item=None, run_id="", measurement_id_value=""):
+def resolve_project_dir(raw, projects_root=None):
+    """Resolve a project value to a real directory: the path itself when it exists, else a
+    projects-root join. Work items created via `work-start --project koho` stored the bare NAME,
+    which subprocess.run rejects as a cwd — the join recovers the actual project directory.
+    Falls back to the expanded raw value (preserving what was asked for in records); verifier
+    execution separately gates on is_dir() and records cwd_invalid."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    p = Path(raw).expanduser()
+    if p.exists():
+        return str(p.resolve())
+    candidate = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser() / raw
+    if candidate.exists():
+        return str(candidate.resolve())
+    return str(p)
+
+
+def build_proof_record(args, work_item=None, run_id="", measurement_id_value="", projects_root=None):
     evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
     if not evidence_path or not Path(evidence_path).exists():
         return None, finding(
@@ -1893,11 +1911,11 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
         )
     proof_type = args.proof_type or "artifact"
     template_check = check_verifier_template(args.pathway or "", safe_read_text(evidence_path, max_bytes=64_000))
-    cli_project_path = str(Path(args.project).expanduser()) if getattr(args, "project", None) else ""
+    cli_project_path = resolve_project_dir(getattr(args, "project", None), projects_root)
     project_path = cli_project_path
     project_name = Path(project_path).name if project_path else ""
     if work_item:
-        project_path = work_item.get("project", project_path)
+        project_path = resolve_project_dir(work_item.get("project", ""), projects_root) or project_path
         project_name = work_item.get("project_name", project_name)
     # Keystone: classify HOW the artifact was verified. `executed` = a re-run command (record its
     # exit code + stdout hash); `signed` = a named human reviewer over a hashed artifact; otherwise
@@ -1910,6 +1928,7 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
     canary_mutant_failed, trivial_verifier = None, False
     canary_target, canary_target_source = None, "unavailable"
     canary_target_reason = "not_executed"
+    verify_error = ""
     if verify_cmd:
         verifier_strength, verify_command = "executed", verify_cmd
         verifier_source_sha256 = hashlib.sha256(verify_cmd.strip().encode("utf-8", "replace")).hexdigest()
@@ -1917,27 +1936,36 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
         # constrained to a changed regular file the verifier directly names, or an explicit caller
         # target. Unrelated dirt yields an unavailable result instead of a false trivial demotion.
         verify_cwd = cli_project_path or project_path or str(Path(evidence_path).parent)
-        _t0 = time.monotonic()
-        exit_code, verify_stdout_sha256, verify_stdout_bytes = run_verifier_command(verify_cmd, verify_cwd)
-        first_run_secs = time.monotonic() - _t0
-        # Receipt: a no-op verifier is recognizable by a denylisted source or an empty transcript.
-        trivial_verifier = verifier_command_is_trivial(verify_cmd) or verify_stdout_bytes < STDOUT_BYTE_FLOOR
-        # Keystone: flip a byte in a changed line and re-run — a real verifier now fails; one that
-        # still passes ignored the change. Gated so a known-trivial or slow verifier isn't run twice.
-        if _should_run_canary(trivial_verifier, first_run_secs):
-            selection = select_canary_target(
-                verify_cmd, verify_cwd, getattr(args, "canary_target", None)
-            )
-            canary_target = selection["canary_target"]
-            canary_target_source = selection["canary_target_source"]
-            canary_target_reason = selection["canary_target_reason"]
-            canary_mutant_failed = run_canary_mutant(verify_cmd, verify_cwd, selection=selection)
-            if canary_mutant_failed is False:
-                trivial_verifier = True
-        elif trivial_verifier:
-            canary_target_reason = "canary_skipped_trivial_verifier"
+        if not Path(verify_cwd).is_dir():
+            # A cwd that is not a real directory makes subprocess.run raise before the verifier
+            # ever executes — the fail-closed wrapper would record that as exit 1 with an empty
+            # transcript, indistinguishable from a genuinely failing verifier (and falsely flagged
+            # trivial). Record cwd_invalid distinctly; exit_code stays None so it still cannot
+            # flip a pathway to proved.
+            verify_error = "cwd_invalid"
+            canary_target_reason = "cwd_invalid"
         else:
-            canary_target_reason = "canary_skipped_slow_verifier"
+            _t0 = time.monotonic()
+            exit_code, verify_stdout_sha256, verify_stdout_bytes = run_verifier_command(verify_cmd, verify_cwd)
+            first_run_secs = time.monotonic() - _t0
+            # Receipt: a no-op verifier is recognizable by a denylisted source or an empty transcript.
+            trivial_verifier = verifier_command_is_trivial(verify_cmd) or verify_stdout_bytes < STDOUT_BYTE_FLOOR
+            # Keystone: flip a byte in a changed line and re-run — a real verifier now fails; one that
+            # still passes ignored the change. Gated so a known-trivial or slow verifier isn't run twice.
+            if _should_run_canary(trivial_verifier, first_run_secs):
+                selection = select_canary_target(
+                    verify_cmd, verify_cwd, getattr(args, "canary_target", None)
+                )
+                canary_target = selection["canary_target"]
+                canary_target_source = selection["canary_target_source"]
+                canary_target_reason = selection["canary_target_reason"]
+                canary_mutant_failed = run_canary_mutant(verify_cmd, verify_cwd, selection=selection)
+                if canary_mutant_failed is False:
+                    trivial_verifier = True
+            elif trivial_verifier:
+                canary_target_reason = "canary_skipped_trivial_verifier"
+            else:
+                canary_target_reason = "canary_skipped_slow_verifier"
     elif reviewer:
         verifier_strength = "signed"
     proof = {
@@ -1954,6 +1982,7 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="")
         "verified_by": args.verified_by or "",
         "verifier_strength": verifier_strength,
         "verify_command": verify_command,
+        "verify_error": verify_error,
         "exit_code": exit_code,
         "verify_stdout_sha256": verify_stdout_sha256,
         "verify_stdout_bytes": verify_stdout_bytes,
@@ -3929,7 +3958,11 @@ def run_work_start(args, paths):
             )],
             "records": [],
         }
-    project_path = str(Path(args.project).expanduser())
+    # Resolve a bare project NAME (`--project koho`) to its real directory here, at entry —
+    # every downstream consumer (verify cwd, boundary checks, portfolio joins, stable_work_id)
+    # treats this field as a path, and stable_work_id would otherwise hash it relative to the
+    # invoking process's cwd, making the work_id unstable across invocation directories.
+    project_path = resolve_project_dir(args.project, paths.projects_root)
     work_id = stable_work_id(project_path, args.goal)
     context = current_work_context(paths, project_path)
     existing = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == work_id), None)
@@ -4267,7 +4300,7 @@ def run_work_log(args, paths):
     }
     proof = None
     if args.proof_type or args.verified_by or args.recommendation_id or getattr(args, "verify_cmd", None) or getattr(args, "reviewer", None):
-        proof, proof_finding = build_proof_record(args, work_item=item, run_id=run_id, measurement_id_value=measurement["measurement_id"])
+        proof, proof_finding = build_proof_record(args, work_item=item, run_id=run_id, measurement_id_value=measurement["measurement_id"], projects_root=paths.projects_root)
         if proof_finding:
             findings.append(proof_finding)
         if proof:
@@ -4426,7 +4459,7 @@ def run_proof_add(args, paths):
     work_item = None
     if args.work_id:
         work_item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
-    proof, proof_finding = build_proof_record(args, work_item=work_item)
+    proof, proof_finding = build_proof_record(args, work_item=work_item, projects_root=paths.projects_root)
     if proof_finding:
         return {
             "records": [],
@@ -4476,16 +4509,7 @@ def run_proof_report(args, paths):
 
 
 def resolve_project_path(args, paths):
-    raw = (args.project or "").strip()
-    if not raw:
-        return None
-    p = Path(raw).expanduser()
-    if p.exists():
-        return str(p.resolve())
-    candidate = Path(paths.projects_root).expanduser() / raw
-    if candidate.exists():
-        return str(candidate.resolve())
-    return str(p)
+    return resolve_project_dir(args.project, paths.projects_root) or None
 
 
 def pathway_for_finding(item):
