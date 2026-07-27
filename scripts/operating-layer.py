@@ -3481,10 +3481,51 @@ def load_work_records(paths):
     }
 
 
+def newest_measurement_per_gate(measurements):
+    """Collapse a measurement history to the current reading for each gate.
+
+    The ledger is append-only, so re-measuring a gate adds a row rather than
+    replacing one. Keyed on GATE alone, deliberately: the same gate is often
+    re-measured under a different pathway, and keying on (pathway, gate) treats
+    those as unrelated series. Measured 2026-07-26 against the live ledger — keying
+    on (pathway, gate) freed exactly zero outcomes; gate alone freed the one that
+    was genuinely superseded.
+
+    Rows with no gate fall back to `kind`, then to their own id, so an unlabelled
+    measurement is never silently merged into someone else's series.
+    """
+    newest = {}
+    for measurement in measurements:
+        key = (measurement.get("gate")
+               or measurement.get("kind")
+               or measurement.get("measurement_id")
+               or id(measurement))
+        current = newest.get(key)
+        if current is None or str(measurement.get("timestamp") or "") > str(
+                current.get("timestamp") or ""):
+            newest[key] = measurement
+    return list(newest.values())
+
+
 def stale_measurements(measurements):
+    """Gates whose CURRENT reading is past its freshness window.
+
+    Only the newest row per gate is judged. Superseded history stays in the ledger
+    and stops blocking — before this, a work item that had been re-measured and
+    passed could never close, because the original row aged out and nothing retired
+    it. `W-20260627` was fully verified at 7/7 coverage and permanently unclosable
+    for exactly that reason.
+
+    What this deliberately does NOT do is forgive dormancy. If the newest reading
+    for a gate is itself stale, the gate is still stale. Measured the same day: 24
+    of 31 blocked outcomes have a newest row older than 14 days — that is genuinely
+    untouched work, and the flag is right about it. A change that frees those would
+    be worse than the bug it fixes. `tests/test_measurement_staleness.py` pins both
+    directions.
+    """
     now = utc_now()
     stale = []
-    for measurement in measurements:
+    for measurement in newest_measurement_per_gate(measurements):
         ts = parse_ts(measurement.get("timestamp"))
         stale_after = int(measurement.get("stale_after_days") or WORK_STALE_DAYS)
         if ts and (now - ts).days > stale_after:
