@@ -1,0 +1,23 @@
+{
+  "action": "Inspect ignored canary mutations before accepting further proof coverage.",
+  "counts": {
+    "canary_receipts": 836,
+    "invalid_provenance": 0,
+    "legacy_canary_ignored": 157,
+    "legacy_canary_passed": 132,
+    "legacy_receipts": 836,
+    "malformed_rows": 0,
+    "strict_probe_ignored": 0,
+    "strict_probe_passed": 0,
+    "target_unavailable": 0,
+    "trivial_verifiers": 278
+  },
+  "generated_at": "2026-07-11T15:51:59Z",
+  "privacy": {
+    "includes_canary_target_paths": false,
+    "includes_raw_commands": false
+  },
+  "schema_version": 1,
+  "signal": "proof_canary_observability",
+  "status": "alert"
+}

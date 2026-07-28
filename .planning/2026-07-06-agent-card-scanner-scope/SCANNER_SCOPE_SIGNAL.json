@@ -1,0 +1,13 @@
+{
+  "agent_cards_scope_false_blockers": 0,
+  "expected_selected_systems": [
+    "atlas-ceo"
+  ],
+  "external_calls": false,
+  "false_blocker_systems": [],
+  "missing_real_profile_systems": [],
+  "selected_systems": [
+    "atlas-ceo"
+  ],
+  "status": "pass"
+}

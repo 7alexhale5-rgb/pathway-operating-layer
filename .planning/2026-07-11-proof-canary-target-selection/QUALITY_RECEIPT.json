@@ -1,0 +1,18 @@
+{
+  "outside_file_unchanged": "DO NOT TOUCH",
+  "outside_target": {
+    "canary_mutant_failed": null,
+    "canary_target": null,
+    "canary_target_reason": "explicit_target_outside_verification_checkout",
+    "canary_target_source": "unavailable",
+    "trivial_verifier": false
+  },
+  "unchanged_file_unchanged": "stable",
+  "unchanged_target": {
+    "canary_mutant_failed": null,
+    "canary_target": null,
+    "canary_target_reason": "explicit_target_not_changed_regular_file",
+    "canary_target_source": "unavailable",
+    "trivial_verifier": false
+  }
+}

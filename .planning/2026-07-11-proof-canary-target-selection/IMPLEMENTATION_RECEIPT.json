@@ -1,0 +1,25 @@
+{
+  "automatic_named_target": {
+    "canary_mutant_failed": true,
+    "canary_target": "value.txt",
+    "canary_target_reason": "verifier_named_changed_file",
+    "canary_target_source": "verifier_reference",
+    "trivial_verifier": false
+  },
+  "explicit_ignored_target": {
+    "canary_mutant_failed": false,
+    "canary_target": "value.txt",
+    "canary_target_reason": "explicit_changed_regular_file",
+    "canary_target_source": "explicit",
+    "trivial_verifier": true
+  },
+  "opaque_unavailable_target": {
+    "canary_mutant_failed": null,
+    "canary_target": null,
+    "canary_target_reason": "no_relevant_changed_file",
+    "canary_target_source": "unavailable",
+    "trivial_verifier": false
+  },
+  "restored_value": "100",
+  "unrelated_file_unchanged": "jobs: e2e-stale"
+}

@@ -1,0 +1,252 @@
+{
+  "fixture_id": "selected-work-scoring-isolation-v1",
+  "project": {
+    "name": "fixture-project",
+    "path": "/private/tmp/operating-layer-test/projects/fixture-project"
+  },
+  "selected": {
+    "work_item": {
+      "work_id": "W-selected",
+      "updated_at": "2026-07-18T00:00:03Z",
+      "status": "active"
+    },
+    "summary": {
+      "pathway_coverage": {
+        "seen": [
+          "govern",
+          "research"
+        ],
+        "proved": [
+          "govern",
+          "research"
+        ]
+      },
+      "itinerary": [
+        {
+          "pathway": "govern",
+          "status": "proved"
+        },
+        {
+          "pathway": "research",
+          "status": "proved"
+        }
+      ],
+      "open_controls": [
+        {
+          "control_id": "C-selected-security",
+          "risk": "selected credential control",
+          "source_pathway": "security",
+          "target_pathways": [
+            "security",
+            "release"
+          ],
+          "status": "open"
+        }
+      ],
+      "stale_measurements": [],
+      "missing_evidence": [],
+      "closeout_readiness": "not_ready"
+    }
+  },
+  "non_selected": [
+    {
+      "work_item": {
+        "work_id": "W-older-nine",
+        "updated_at": "2026-07-18T00:00:02Z",
+        "status": "active"
+      },
+      "summary": {
+        "pathway_coverage": {
+          "seen": [
+            "govern",
+            "research",
+            "data",
+            "quality"
+          ],
+          "proved": [
+            "govern",
+            "research"
+          ]
+        },
+        "itinerary": [
+          {
+            "pathway": "govern",
+            "status": "proved"
+          },
+          {
+            "pathway": "research",
+            "status": "proved"
+          }
+        ],
+        "open_controls": [
+          {
+            "control_id": "C-older-data",
+            "risk": "older work-local data control",
+            "source_pathway": "data",
+            "target_pathways": [
+              "data"
+            ],
+            "status": "open"
+          }
+        ],
+        "stale_measurements": [
+          {"measurement_id": "M-old-01"},
+          {"measurement_id": "M-old-02"},
+          {"measurement_id": "M-old-03"},
+          {"measurement_id": "M-old-04"},
+          {"measurement_id": "M-old-05"},
+          {"measurement_id": "M-old-06"},
+          {"measurement_id": "M-old-07"},
+          {"measurement_id": "M-old-08"},
+          {"measurement_id": "M-old-09"}
+        ],
+        "missing_evidence": [
+          {"measurement_id": "M-old-missing-01"}
+        ]
+      }
+    },
+    {
+      "work_item": {
+        "work_id": "W-older-eight",
+        "updated_at": "2026-07-18T00:00:01Z",
+        "status": "active"
+      },
+      "summary": {
+        "pathway_coverage": {
+          "seen": [
+            "govern",
+            "quality"
+          ],
+          "proved": [
+            "quality"
+          ]
+        },
+        "itinerary": [
+          {
+            "pathway": "quality",
+            "status": "proved"
+          }
+        ],
+        "open_controls": [],
+        "stale_measurements": [
+          {"measurement_id": "M-old-10"},
+          {"measurement_id": "M-old-11"},
+          {"measurement_id": "M-old-12"},
+          {"measurement_id": "M-old-13"},
+          {"measurement_id": "M-old-14"},
+          {"measurement_id": "M-old-15"},
+          {"measurement_id": "M-old-16"},
+          {"measurement_id": "M-old-17"}
+        ],
+        "missing_evidence": [
+          {"measurement_id": "M-old-missing-02"}
+        ]
+      }
+    }
+  ],
+  "project_findings": [
+    {
+      "id": "sec-current-project",
+      "severity": "critical",
+      "pathway": "security",
+      "message": "current project security finding"
+    }
+  ],
+  "coverage_isolation": {
+    "selected_summary": {
+      "pathway_coverage": {
+        "seen": [],
+        "proved": []
+      },
+      "itinerary": [],
+      "open_controls": [],
+      "stale_measurements": [],
+      "missing_evidence": []
+    },
+    "older_summary": {
+      "pathway_coverage": {
+        "seen": [
+          "govern",
+          "research"
+        ],
+        "proved": [
+          "govern",
+          "research"
+        ]
+      },
+      "itinerary": [
+        {
+          "pathway": "govern",
+          "status": "proved"
+        },
+        {
+          "pathway": "research",
+          "status": "proved"
+        }
+      ]
+    },
+    "expected_selected_foundations_seen": [],
+    "expected_research_foundation_weight": 100,
+    "expected_govern_foundation_weight": 80
+  },
+  "control_isolation": {
+    "selected_without_control": [],
+    "selected_with_control": [
+      {
+        "control_id": "C-selected-security",
+        "risk": "selected credential control",
+        "source_pathway": "security",
+        "target_pathways": [
+          "security",
+          "release"
+        ],
+        "status": "open"
+      }
+    ],
+    "older_control": {
+      "control_id": "C-older-data",
+      "risk": "older work-local data control",
+      "source_pathway": "data",
+      "target_pathways": [
+        "data"
+      ],
+      "status": "open"
+    },
+    "expected_selected_control_delta_each_target": 50,
+    "expected_older_control_delta": 0
+  },
+  "no_active": {
+    "work_items": [],
+    "active_summary": null,
+    "work_id": null,
+    "has_active_work": false,
+    "untracked_foundation_nudge": 8,
+    "next_command": "work-start"
+  },
+  "selected_mutation": {
+    "stale_measurements": [
+      {"measurement_id": "M-selected-stale-01"},
+      {"measurement_id": "M-selected-stale-02"}
+    ],
+    "missing_evidence": [
+      {"measurement_id": "M-selected-missing-01"},
+      {"measurement_id": "M-selected-missing-02"}
+    ]
+  },
+  "expected": {
+    "selected_work_id": "W-selected",
+    "non_selected_stale_count": 17,
+    "non_selected_missing_evidence_count": 2,
+    "selected_base_stale_count": 0,
+    "selected_base_missing_evidence_count": 0,
+    "selected_stale_mutation_count": 2,
+    "selected_missing_evidence_mutation_count": 2,
+    "selected_stale_score_delta": 10,
+    "selected_missing_evidence_score_delta": 8,
+    "selected_control_score_delta_each_target": 50,
+    "older_control_score_delta": 0,
+    "project_critical_finding_score_delta": 40,
+    "untracked_foundation_nudge": 8,
+    "metamorphic_non_selected_change_delta": 0
+  }
+}
