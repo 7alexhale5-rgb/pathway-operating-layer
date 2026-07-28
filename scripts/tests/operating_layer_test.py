@@ -2831,7 +2831,7 @@ def test_redaction_covers_bearer_and_provider_prefixed_credentials():
     bearer = "Authorization: Bearer bearer_abcdefghijklmnopqrstuvwx123456"
     aws_key = "AKIAIOSFODNN7EXAMPLE"
     google_key = "AIzaSyDUMMYKEYabcdefghijklmnopqrstu1234"
-    slack_token = "xoxb-not-a-token-0"
+    slack_token = "xoxb-EXAMPLE-NOT-A-REAL-TOKEN-000"
     stripe_key = "sk_live_abcdefghijklmnop1234"
     raw = (f"{bearer}\nXAI_API_KEY={xai_key}\ngithub={github_token}\n"
            f"aws {aws_key} google {google_key}\nslack {slack_token} stripe {stripe_key}\n")
