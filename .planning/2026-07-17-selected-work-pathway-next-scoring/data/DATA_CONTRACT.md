@@ -12,12 +12,12 @@ Project findings, bounded closed-outcome learning, Pathway trust, and the global
 
 ## Machine-Readable Artifacts
 
-| Artifact | Purpose |
-| --- | --- |
-| `SELECTED_WORK_SCORING_CONTRACT.json` | Cardinality, field defaults, weights, scopes, invariants, and excluded changes |
-| `SELECTED_WORK_SCORING_FIXTURES.json` | Deterministic selected, older, selected-mutation, project-finding, and no-active expectations |
+| Artifact                                    | Purpose                                                                                                                             |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `SELECTED_WORK_SCORING_CONTRACT.json`       | Cardinality, field defaults, weights, scopes, invariants, and excluded changes                                                      |
+| `SELECTED_WORK_SCORING_FIXTURES.json`       | Deterministic selected, older, selected-mutation, project-finding, and no-active expectations                                       |
 | `SELECTED_WORK_SCORING_LEDGER_FIXTURE.json` | Directly writable work-item, run, measurement, control, carry-forward, and finding records for end-to-end compute/persistence tests |
-| `verify-data.py` | Contract, fixture, source-weight, and live-ledger verification |
+| `verify-data.py`                            | Contract, fixture, source-weight, and live-ledger verification                                                                      |
 
 ## Lineage
 
@@ -37,14 +37,14 @@ The contract fixes cardinality at zero-or-one before the scorer. It does not fil
 
 ## Field Contract
 
-| Selected field | Default | Weight or behavior |
-| --- | --- | --- |
-| `pathway_coverage.seen` | empty list | selected foundation/completeness state |
-| `pathway_coverage.proved` | empty list | selected profile/overlay coverage |
-| proved or N/A `itinerary` rows | empty list | selected required coverage |
-| `open_controls` | empty list | `+50` per selected target |
-| `stale_measurements` | empty list | `+5` each |
-| `missing_evidence` | empty list | `+4` each |
+| Selected field                 | Default    | Weight or behavior                     |
+| ------------------------------ | ---------- | -------------------------------------- |
+| `pathway_coverage.seen`        | empty list | selected foundation/completeness state |
+| `pathway_coverage.proved`      | empty list | selected profile/overlay coverage      |
+| proved or N/A `itinerary` rows | empty list | selected required coverage             |
+| `open_controls`                | empty list | `+50` per selected target              |
+| `stale_measurements`           | empty list | `+5` each                              |
+| `missing_evidence`             | empty list | `+4` each                              |
 
 No active work means `active_summary = null`, `has_active_work = false`, `work_id = null`, untracked foundation nudge `8`, and a `work-start` next command.
 
@@ -64,15 +64,33 @@ Expected behavior:
 - changing only older records leaves normalized selected output unchanged;
 - aggregate work and portfolio surfaces still expose the older records.
 
+## Gate Identity Requirement (2026-08-04 addendum)
+
+Every row in `SELECTED_WORK_SCORING_LEDGER_FIXTURE.json`'s `pathway_measurements` array must
+carry a **distinct `gate` value**. Do not "simplify" the 19 near-identical rows back to one
+shared literal (e.g. `"quality-gate"`) — that has already broken this fixture once.
+
+Reason: `newest_measurement_per_gate()` in `scripts/operating-layer.py` (added by
+`eeac057`, 2026-07-26, "fix(staleness): judge only the newest reading per gate"; locked
+decision at `memory-vault/decisions/2026-07-26-pathway-staleness-supersession-metric-lock.md`)
+retires every reading for a gate except the newest. Rows that share a gate collapse to one
+survivor, so the per-row `stale_measurements` weighting this fixture exists to exercise
+(`+5` each, see Field Contract above) becomes unmeasurable — a single shared gate silently
+turns "nine stale rows" into at most one. This fixture predates that commit by nine days
+(`ffb58eb`, 2026-07-17) and originally used one shared `"quality-gate"` literal for all 19
+rows, which caused `pathway-next --work-id W-older-nine`, `work-status`, and `portfolio-next`
+to all under-report stale counts once gate-based supersession shipped. Fixed 2026-08-04 by
+giving each row `"quality-gate-<measurement_id>"` instead.
+
 ## Live Record Verification
 
 The verifier also checks the current Koho lineage:
 
-| Work ID | Role | Stale |
-| --- | --- | ---: |
-| `W-20260717-koho-complete-consultops-inte-2a7d82` | selected | `0` |
-| `W-20260702-koho-seed-the-sdr-rail-prune--6e4c48` | older active | `9` |
-| `W-20260630-koho-fork-josh-s-template-rev-8b69d2` | older active | `8` |
+| Work ID                                           | Role         | Stale |
+| ------------------------------------------------- | ------------ | ----: |
+| `W-20260717-koho-complete-consultops-inte-2a7d82` | selected     |   `0` |
+| `W-20260702-koho-seed-the-sdr-rail-prune--6e4c48` | older active |   `9` |
+| `W-20260630-koho-fork-josh-s-template-rev-8b69d2` | older active |   `8` |
 
 The selected Koho record owns the open Supabase PAT control targeted to security and release. The older records own no open controls. This proves the real data boundary without changing a ledger row.
 
