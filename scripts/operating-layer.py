@@ -664,8 +664,8 @@ PATHWAY_EXECUTION = {
         "tools": ["supabase MCP", "supabase-ssh docs", "context7 schema-typed", "database-reviewer agent", "migration-guard"],
     },
     "security": {
-        "stack": ["/review-stack --audit (primary)", "security-review skill", "/codex:adversarial-review (second model)", "prove the hole closed on the live surface"],
-        "tools": ["security-reviewer agent", "sec- guards", "koho-guardrail + secret guards", "Vercel runtime logs"],
+        "stack": ["/review-stack --audit (primary, read-only)", "/build-stack to fix the top confirmed finding", "/review-stack --quick to prove the remediation", "/codex:adversarial-review (second model)"],
+        "tools": ["reviewer agent", "local sec-guard scripts (no app-backed scan unless requested)", "koho-guardrail + secret guards", "project runtime evidence"],
     },
     "release": {
         "stack": ["/ship (primary)", "/commit first", "deploy-verify on the deployed asset", "rollback rehearsal before flip"],
@@ -4673,6 +4673,15 @@ def project_local_findings(project_path, max_files=40, max_records=200):
         for fpath in files[:max_files]:
             if len(findings) >= max_records:
                 break
+            latest_review = fpath.parent / "latest-findings.json"
+            if (
+                fpath.parent.name == "review"
+                and fpath.name != "latest-findings.json"
+                and latest_review.exists()
+            ):
+                # review-stack writes a current-state snapshot here. Older named
+                # review files are retained as evidence, not open findings.
+                continue
             gen_at = review_generated_at(fpath)
             if gen_at is not None and (utc_now() - gen_at).days > REVIEW_STALE_DAYS:
                 age = (utc_now() - gen_at).days

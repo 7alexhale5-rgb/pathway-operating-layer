@@ -55,3 +55,48 @@ dashboard, not an operating layer. Compute it: `operating-layer.py pathway-metri
 Central, never in project repos (except the review findings file the router reads):
 `~/Projects/memory-vault/operator-intelligence/` — `work-items.ndjson`, `pathway-runs.ndjson`,
 `pathway-measurements.ndjson`, `controls.ndjson`, `pathway-recommendations.ndjson`, `pathway-metric.json`.
+
+## Catalog and risk overlays
+
+Core catalog: `research, govern, data, security, release, implementation, quality,
+observability, techdebt, design, docs` — plus `field` as the customer/operator validation
+extension, used when human review, client UI, review packets, external approval, or
+send-state gates exist.
+
+Risk overlays: `tenant-authz`, `privacy-evidence`, `production-mutation`, `rollback`,
+`supply-chain`, `incident-response`, `ui-proof`, `llm-agent-eval`, `human-gate`. These
+inject mandatory gates. Do not mark one N/A without a structured reason and real evidence —
+an overlay dismissed on assertion is an overlay that was never applied.
+
+## The two hard rules
+
+**Proof.** A real artifact, an executed `--verify-cmd`, and the result read back. Defined
+once in [proof-standard.md](proof-standard.md) — do not restate it anywhere.
+
+**Carry-forward.** Every completed pathway must leave context: what changed, what became
+more or less relevant, what the next pathway must use, what not to do yet, open decisions,
+and active risk overlays. `pathway-carry-forward.ndjson` is authoritative continuity memory
+— RAG, grep, vault notes and old artifacts are advisory only.
+
+## pathway-next and pathway-pilot
+
+`pathway-next` must explain coverage, prior carry-forward, outcome profile, risk overlays,
+proof requirements, and the one next command — not merely name a pathway.
+
+`pathway-pilot` is the measured multi-project agentic-dev-team rehearsal: it records cohort
+assignments, lead/critic/proof gates, review gates, baseline metrics, and a Markdown/HTML
+operator report **without mutating project repos**.
+
+## When NOT to use it
+
+Pathway is stateful and per-project. Config work, one-off fixes and single-session tasks do
+not belong in the ledger; putting them there dilutes the signal it exists to carry.
+
+---
+
+_Consolidated 2026-08-04. This doctrine was maintained in THREE places — this file plus the
+always-on `~/.claude/CLAUDE.md` and `~/CLAUDE.md` — with the description, runtime paths,
+pathway-pilot and carry-forward authority stated in more than one. `~/.claude/CLAUDE.md`
+asserted that `~/CLAUDE.md` held "the fuller copy, kept there so it is not maintained
+twice", which was measurably false. Both always-on files now point here. If you are about
+to restate any of this in a CLAUDE.md, don't — edit this file instead._
