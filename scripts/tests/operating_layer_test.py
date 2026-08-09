@@ -3252,6 +3252,44 @@ def test_learning_dampener_never_suppresses_a_pathway_with_live_findings():
     check(docs_dampened, "docs (no live finding) IS still dampened — the guard is selective, not a blanket off-switch")
 
 
+def test_pathway_prompt_never_retiers_an_existing_outcome_via_work_start():
+    """commands/pathway.md is the contract the model executes, and it had NO coverage until
+    2026-08-09. The defect this guards actually shipped: the `--max` section told the reader to
+    re-run `work-start` with the same goal to retier an existing outcome. `stable_work_id` hashes
+    the current DAY (see below), so on any later date that opens a SECOND outcome and orphans every
+    proof on the first. The safe retier path is `work-cover --add`, which is keyed on --work-id."""
+    doc = (HERE / ".." / ".." / "commands" / "pathway.md").resolve()
+    check(doc.is_file(), f"commands/pathway.md is reachable from the test dir ({doc})")
+    if not doc.is_file():
+        return
+    text = doc.read_text(encoding="utf-8")
+
+    # The day-in-the-hash property that makes work-start unsafe for retiering. If this ever stops
+    # being true the guard below can be relaxed — but it must be re-proved, not assumed.
+    cli_src = CLI.read_text(encoding="utf-8")
+    fn = cli_src.split("def stable_work_id(", 1)[1].split("\ndef ", 1)[0]
+    check("strftime(\"%Y%m%d\")" in fn and "short_hash(" in fn and "day" in fn,
+          "stable_work_id still hashes the calendar day, so a same-goal re-run forks on a new date")
+
+    max_section = text.split("## `--max`", 1)[-1].split("\n## ", 1)[0] if "## `--max`" in text else ""
+    check(bool(max_section), "the --max flag advertised in argument-hint has a body section defining it")
+    check("work-cover" in max_section and "--add" in max_section,
+          "--max retiers an existing outcome through work-cover --add (keyed on --work-id)")
+    check("Never re-run `work-start` to retier" in max_section,
+          "--max explicitly forbids retiering an existing outcome via work-start (proof-fork guard)")
+
+    # Modifier stripping must be defined BEFORE intent classification, or `go --max` falls through
+    # to START and mints a work item whose goal is literally "go --max".
+    strip_at = text.find("Strip modifiers FIRST")
+    intent_at = text.find("Remaining text = intent")
+    check(strip_at != -1 and intent_at != -1 and strip_at < intent_at,
+          "the modifier-strip rule is stated before intent classification, not after")
+
+    # A rigor modifier must never promote a read-only verb into an executing one.
+    check("rigor modifier only" in max_section,
+          "--max is documented as rigor-only, never widening authority")
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -3328,6 +3366,7 @@ def main():
         test_pathway_evaluate_records_independent_verdicts_and_precision,
         test_recommender_engages_findings_over_foundation_on_untracked_project,
         test_learning_dampener_never_suppresses_a_pathway_with_live_findings,
+        test_pathway_prompt_never_retiers_an_existing_outcome_via_work_start,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")

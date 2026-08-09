@@ -1,7 +1,7 @@
 ---
 name: pathway
 description: Ask a project what engineering pathway to run next, track the work against one shared ID, or start a measured multi-project pathway pilot. Wraps operating-layer pathway-next + the work envelope so you never type the CLI. Loop mode runs the whole determine → execute → prove → advance cycle continuously, with autonomy earned by the proof metric.
-argument-hint: "<project> [ go | done | <goal> ] | pilot <projects> <goal>   —   usually just the project; I hand you the exact next command to paste"
+argument-hint: "<project> [ go | done | <goal> ] [--max] | pilot <projects> <goal>   —   usually just the project; add --max for the full hypercritical chain; I hand you the exact next command to paste"
 ---
 
 # Pathway — next-best move for a project
@@ -18,15 +18,21 @@ Script: `python3 ~/.claude/scripts/operating-layer.py`
 - Canonical pathway catalog: `govern, research, data, security, design, implementation, quality, field, observability, techdebt, release, docs`.
 - **First token = project** — a name resolvable under `~/Projects` (e.g. `consult-ops`,
   `koho`) or an absolute path.
+- **Strip modifiers FIRST.** Pull any `--`-prefixed token out of the argument string and hold it
+  aside BEFORE classifying the verb below. A modifier is never part of the intent text. Skipping
+  this step is what turns `/pathway koho go --max` into a START that mints a work item whose goal
+  is literally "go --max". Recognised modifiers: `--max` (see below), `--auto=<tier>` (LOOP only).
+  An unrecognised `--flag` is an error: say so in one line and stop; never fall it through to START.
 - **Remaining text = intent** (optional). Classify by **first-match-wins precedence**:
   - empty → **ASK** (just recommend, read-only).
-  - exactly `go` / `run` / `execute` / `proceed` (one reserved verb, nothing after it) →
+  - exactly `go` / `run` / `execute` / `proceed` (one reserved verb, nothing after it once
+    modifiers are stripped) →
     **EXECUTE** — run the currently-recommended pathway's full execution profile once, with the
     authority of the user pasting it now, then prove + log + hand back the next command. This is
     the keystone verb: almost every hand-off block tells the user to paste `/pathway <project> go`.
   - `done` / `close` / `finish` / `wrap` → **CLOSE**.
   - a pathway name (`govern research data security design implementation quality field
-    observability techdebt release docs`) followed by a file path, or "logged/finished `<pathway>`, proof
+observability techdebt release docs`) followed by a file path, or "logged/finished `<pathway>`, proof
     `<path>`" → **LOG**.
   - `loop` (optionally `--auto=recommend|safe|build`) → **LOOP** (run EXECUTE continuously, one
     shared work ID, autonomy earned by the proof metric).
@@ -36,6 +42,61 @@ Script: `python3 ~/.claude/scripts/operating-layer.py`
 
 If the project token is missing, ask which project — nothing else.
 
+## `--max` — the whole chain, hardest setting
+
+One flag for "do this at the hardest setting." `--max` is a **rigor modifier only**. It never
+changes which verb runs, never starts work on its own, and never grants authority. Strip it, run
+the verb the remaining text selects, and raise rigor while doing it.
+
+| You type                          | Verb that runs (unchanged by the flag) | What `--max` adds        |
+| --------------------------------- | -------------------------------------- | ------------------------ |
+| `/pathway <project> --max`        | ASK (read-only, same as bare)          | Effects 1 + 2 below      |
+| `/pathway <project> go --max`     | one EXECUTE turn                       | Effects 1 + 2 below      |
+| `/pathway <project> loop --max`   | LOOP                                   | Effects 1 + 2 below      |
+| `/pathway <project> <goal> --max` | START                                  | tier `production-secure` |
+
+**Effect 1 — arm every pathway the default tier drops.** The default tier is `live`, which does
+**not** seed `security`, `research`, or `techdebt`. `--max` makes the coverage gate refuse to close
+without them. How depends on whether the outcome exists yet:
+
+- **New outcome (START):** pass `--tier production-secure` to `work-start`. Verified 2026-08-09
+  against `compute_itinerary` / `merge_itinerary`: a `live` itinerary holding three proved pathways
+  upgraded to `production-secure` keeps all three proofs and their run IDs and gains exactly
+  `research`, `security`, `techdebt`.
+- **Existing outcome:** add the missing pathways **by work ID**, one call each —
+  `work-cover --work-id <id> --pathway <security|research|techdebt> --add`. Read `<id>` from
+  `pathway-next --json`.
+  **Never re-run `work-start` to retier an existing outcome.** `stable_work_id` hashes the current
+  **day** alongside project and goal (`operating-layer.py:1231-1236`), so the identical goal
+  produces a different ID on a different date and silently opens a SECOND outcome, orphaning every
+  proof on the first. Verified 2026-08-09: the same project and goal hashed to
+  `W-20260717-…-e7eb9c` on its creation date and `W-20260809-…-1fea88` today.
+
+**Effect 2 — escalate the critic set, subject to the send rail.** The execution stacks name a Codex
+critic only. Under `--max`, run the `karpathy verify` dual cascade: Codex **and**
+`~/.claude/glm-routing/glm-review` on the same diff with the same brief, Opus adjudicating the
+union on the real artifact. If a family is unavailable (not installed, rate-limited, or
+guard-blocked on a client repo), run the other AND substitute an objective Fable critic
+(`Agent(subagent_type="reviewer", model="fable")`) with an adversarial brief, then **say the
+model-family gap out loud** — a Fable critic adjudicated by Opus is one family, not two. Never
+silently drop a pass. Briefs must require DRY, KISS, YAGNI, SOLID, SINE, plus correctness, edge
+cases, and security.
+**This is an external send.** A second-family critic ships the diff to a hosted service, so it
+obeys the same rail as everything else in LOOP: pause and ask before the first send of a session,
+and never send from a guard-blocked client repo. `--max` does not pre-authorise it.
+
+**Effect 3 — nothing else changes, including stickiness.** `--max` is **not persisted**: nothing in
+the work item or `pathway-next` records that an outcome is running at max, and `production-secure`
+cannot stand in for it because ordinary outcomes reach that tier too. So repeat the flag in the
+hand-off block while a session is running at max, and know it is a within-session convention, not
+an enforced one — a fresh session cannot recover it. The irreversible rails hold unchanged:
+`/ship`, `work-close`, prod-flag flips, external sends, and force-push never auto-fire, with or
+without this flag.
+
+**Grammar.** Only a `--`-prefixed token **outside** the goal text counts as a modifier; a `--max`
+appearing inside a quoted goal is goal text, not a flag. Repeating `--max` is idempotent. `--max`
+composes with `--auto=` on LOOP. PILOT ignores it.
+
 ## The hand-off block — MANDATORY on every output
 
 Every `/pathway` response — ASK, START, EXECUTE, LOG, CLOSE, and every LOOP turn — **ends with
@@ -44,24 +105,31 @@ after it. This is the whole point of the skill: the user copies the next move, t
 it from memory. One block, one command, one paste — never a menu. If you would offer a choice,
 pick the safest default, put only that in the block, and name the alternative in prose above it.
 
+**Carry `--max` into the block, within the session.** If this session is running at max rigor,
+every hand-off block must repeat the flag (`/pathway <project> go --max`); dropping it silently
+downgrades the next turn's critic set. This is a convention, not a guarantee: max is not persisted
+anywhere, so a fresh session cannot know, and the user must retype the flag to resume at max.
+
 Shape (always this):
 
 > ▶ **Next — copy-paste this:**
+>
 > ```
 > /pathway <project> <verb>
 > ```
+>
 > _(one plain-English line: what pasting it will do)_
 
 What goes in the block, by situation:
 
-| Situation | Block holds | One-liner says |
-|---|---|---|
-| Recommendation ready · work tracked · trust = pass | `/pathway <project> go` | "runs <pathway> end-to-end with full power, proves it on <real_artifact>, logs it, hands you the next command" |
-| Project not tracked yet (`work_id` null) | `/pathway <project> <your one-line goal>` | "names the outcome and starts tracking — the one time you type a goal; I take it from there" |
-| Trust = fail | `/pathway <project> go` | "fixes trust first (that IS the next move), then resumes the recommended pathway" |
-| Pilot cohort created | `/pathway <highest-risk-project> go` | "runs the first assigned pathway from the measured pilot cohort" |
-| Just finished + logged a pathway | `/pathway <project> go` — or `/pathway <project> done` if the outcome's gates cleared | "starts the next pathway" / "closes the outcome" |
-| Closeout blocked | the one fix command | "clears <the one blocker> so the outcome can close" |
+| Situation                                          | Block holds                                                                           | One-liner says                                                                                                 |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Recommendation ready · work tracked · trust = pass | `/pathway <project> go`                                                               | "runs <pathway> end-to-end with full power, proves it on <real_artifact>, logs it, hands you the next command" |
+| Project not tracked yet (`work_id` null)           | `/pathway <project> <your one-line goal>`                                             | "names the outcome and starts tracking — the one time you type a goal; I take it from there"                   |
+| Trust = fail                                       | `/pathway <project> go`                                                               | "fixes trust first (that IS the next move), then resumes the recommended pathway"                              |
+| Pilot cohort created                               | `/pathway <highest-risk-project> go`                                                  | "runs the first assigned pathway from the measured pilot cohort"                                               |
+| Just finished + logged a pathway                   | `/pathway <project> go` — or `/pathway <project> done` if the outcome's gates cleared | "starts the next pathway" / "closes the outcome"                                                               |
+| Closeout blocked                                   | the one fix command                                                                   | "clears <the one blocker> so the outcome can close"                                                            |
 
 ## ASK — "what should I do next?"
 
@@ -115,8 +183,8 @@ re-recommend, do not present a menu.
    - **demoable** — runs end-to-end, you can show it (govern · implementation · quality).
    - **live** — real users touch it (+ data · observability · release · docs). _Default._
    - **production-secure** — untrusted actors, compliance (+ research · security · techdebt).
-   The goal's own words also auto-pull `design` (UI), `research`, or `data`. If the user didn't say,
-   infer from the goal and state your pick in one line — don't interrogate.
+     The goal's own words also auto-pull `design` (UI), `research`, or `data`. If the user didn't say,
+     infer from the goal and state your pick in one line — don't interrogate.
 3. Run: `python3 ~/.claude/scripts/operating-layer.py work-start --project <abs-path> --goal "<goal>" --tier <tier>`
 4. Immediately run ASK with the `work-start` result's `--work-id` pinned. Show the **seeded itinerary** in plain English — "this outcome
    needs N pathways: govern, data, … — I walk them in order, and it can't close until each is proved
@@ -174,7 +242,7 @@ fail-closes to Tier 1 in code, so the field is always current).
   mid-pathway the instant a step would touch a real DB / prod surface, send code/data to an external
   service, or commit / deploy — those need an explicit grant.
 - **Tier 3 · Execute-build** — only on an explicit per-session grant; also auto-runs `implementation,
-  techdebt, design`.
+techdebt, design`.
 
 **Never auto, any tier:** `/ship`, `work-close`, prod-flag flips, external sends — pause and ask.
 (The `docs` pathway is Tier-2 safe: its skill is `doc-coauthoring`, which authors without committing.)
@@ -235,6 +303,8 @@ Use this before broadening autonomy across projects. It is a measured rehearsal,
   or marked `na` with a reason (`work-cover`). This is enforced in the engine, not by memory — a pathway
   is never silently skipped or lost between turns. Re-running START never clobbers earned proof.
 - Evidence is always a real artifact on disk. No artifact, no `--result pass`.
+  What counts as proof is defined once, in ~/.claude/references/proof-standard.md —
+  artifact + executed check + result read back. Don't restate it here.
 - Never modify the target project's repo files; this tool only writes to the central operator-intelligence store.
 - Plain English in chat; the CLI mechanics stay under the hood.
 - The router is read-only advice. START / LOG / CLOSE are the only state changes, and only on explicit intent.
