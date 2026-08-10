@@ -1893,6 +1893,24 @@ def resolve_project_dir(raw, projects_root=None):
     candidate = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser() / raw
     if candidate.exists():
         return str(candidate.resolve())
+    # Owner-family nesting (FILESYSTEM-PROTOCOL §1.2): the projects root is flat
+    # EXCEPT owner families (koho/, prettyfly/, willys/, ...), nested exactly one
+    # level. A work item created as `--project consultops-live` stored the bare
+    # name of a repo living at koho/consultops-live; the flat join above missed
+    # it, the verifier cwd came back invalid, and every proof for a nested
+    # project silently stayed logged_unverified (found 2026-08-10 on the
+    # clm-pipeline-integrity outcome: three passing live verifiers, zero
+    # credit). One level down, UNIQUE hit only — an ambiguous name must not
+    # guess a cwd; meta directories (_archive, _views, .git) never match.
+    root = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser()
+    if root.is_dir() and os.sep not in raw and not raw.startswith("."):
+        hits = [
+            d for d in root.glob(f"*/{raw}")
+            if d.is_dir()
+            and not d.parent.name.startswith(("_", "."))
+        ]
+        if len(hits) == 1:
+            return str(hits[0].resolve())
     return str(p)
 
 
@@ -2002,6 +2020,39 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "project_path": project_path,
         "source": "operating-layer proof registry",
     }
+    # A proof that will NOT credit must say so at log time, loudly. Before this,
+    # work-log printed a clean summary while cwd_invalid / a failed canary /
+    # a trivial transcript quietly parked the pathway in logged_unverified —
+    # the caller had no signal until a later work-status archaeology dig
+    # (2026-08-10: three re-log rounds before anyone saw cwd_invalid).
+    if verify_cmd and not proof_is_verified(proof):
+        if verify_error == "cwd_invalid":
+            reason = (
+                f"the verifier never ran — cwd '{project_path or evidence_path}' is not a directory. "
+                "Pass --project with the repo's real path, or fix the work item's project value."
+            )
+        elif exit_code not in (0, None):
+            reason = f"the verifier ran and FAILED (exit {exit_code})."
+        elif proof.get("canary_mutant_failed") is False:
+            reason = (
+                "the anti-gaming canary was not tripped — the verifier passed unchanged after a "
+                "byte-flip in a file it names. Make the verifier's first line a load-bearing local "
+                "assertion on a file it reads."
+            )
+        elif proof.get("trivial_verifier"):
+            reason = "the verifier looks trivial (denylisted command or near-empty transcript)."
+        else:
+            reason = "the executed verifier did not meet the crediting predicate."
+        return proof, finding(
+            "proof-logged-unverified",
+            "proof-registry",
+            "warn",
+            f"Proof for pathway '{args.pathway}' is recorded but will NOT credit coverage: {reason}",
+            [line_evidence(evidence_path or "<missing>")],
+            "Fix the verifier or its cwd and re-log; a pathway only flips to proved on an executed, non-trivial, canary-honest exit-0 verifier.",
+            "runtime",
+            "high",
+        )
     return proof, None
 
 
@@ -4501,12 +4552,17 @@ def run_proof_add(args, paths):
     if args.work_id:
         work_item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
     proof, proof_finding = build_proof_record(args, work_item=work_item, projects_root=paths.projects_root)
-    if proof_finding:
+    # No proof at all (e.g. missing evidence) is fatal. A proof accompanied by a
+    # finding is the loud will-not-credit advisory (proof-logged-unverified) —
+    # record the proof AND surface the warning; swallowing either repeats the
+    # silent logged_unverified failure this finding exists to prevent.
+    if proof is None:
         return {
             "records": [],
-            "findings": [proof_finding],
+            "findings": [proof_finding] if proof_finding else [],
             "proofs_path": str(paths.proofs_path),
         }
+    advisory_findings = [proof_finding] if proof_finding else []
     proofs = upsert_proof(paths, proof)
     md_path, html_path = write_proof_report(paths, proofs)
     carry_forward = build_carry_forward_record(proof, work_item)
@@ -4514,7 +4570,7 @@ def run_proof_add(args, paths):
         upsert_carry_forward(paths, carry_forward)
     result = {
         "records": [proof] + ([carry_forward] if carry_forward else []),
-        "findings": [],
+        "findings": advisory_findings,
         "proof_id": proof["proof_id"],
         "proofs_path": str(paths.proofs_path),
         "report": str(md_path),

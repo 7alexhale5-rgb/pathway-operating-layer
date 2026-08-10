@@ -3290,8 +3290,75 @@ def test_pathway_prompt_never_retiers_an_existing_outcome_via_work_start():
           "--max is documented as rigor-only, never widening authority")
 
 
+def test_resolve_project_dir_nesting_and_unverified_proof_loudness():
+    """2026-08-10 regression: a work item storing the bare name of an
+    owner-family-nested project (koho/consultops-live) resolved to no
+    directory, the verifier never ran (cwd_invalid), and the proof parked in
+    logged_unverified with a clean-looking summary. Two guarantees now: the
+    resolver searches one owner-family level down (unique hit only), and a
+    proof that will not credit returns a loud warn finding at log time."""
+    reset()
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("opl_nesting", CLI)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    projects = ROOT / "projects"
+    (projects / "koho" / "consultops-live").mkdir(parents=True)
+    (projects / "flatproj").mkdir()
+    (projects / "_archive" / "shadowed").mkdir(parents=True)
+    (projects / "koho" / "dupe").mkdir()
+    (projects / "prettyfly" / "dupe").mkdir(parents=True)
+
+    check(
+        mod.resolve_project_dir("consultops-live", projects_root=str(projects))
+        == str((projects / "koho" / "consultops-live").resolve()),
+        "owner-family nested project resolves one level down",
+    )
+    check(
+        mod.resolve_project_dir("flatproj", projects_root=str(projects))
+        == str((projects / "flatproj").resolve()),
+        "flat project still resolves first",
+    )
+    check(
+        mod.resolve_project_dir("dupe", projects_root=str(projects)) == "dupe",
+        "ambiguous nested name refuses to guess a cwd",
+    )
+    check(
+        mod.resolve_project_dir("shadowed", projects_root=str(projects)) == "shadowed",
+        "meta directories (_archive) never satisfy the nested search",
+    )
+
+    import argparse
+    ev = write("out/proof-evidence.md", "# evidence\n")
+    args = argparse.Namespace(
+        evidence=str(ev), work_id="W-test", pathway="quality", gate="quality-gate",
+        kind="verify", result="pass", stale_after_days=14, verified_by="",
+        recommendation_id="", verify_cmd="bash -c 'echo ok'", reviewer="",
+        proof_type="executed", canary_target=None, project=None,
+    )
+    proof, warn = mod.build_proof_record(
+        args, work_item={"project": "no-such-project-xyz"}, run_id="R-test",
+        measurement_id_value="M-test", projects_root=str(projects),
+    )
+    check(
+        proof is not None and proof.get("verify_error") == "cwd_invalid",
+        "unresolvable work-item project records cwd_invalid on the proof",
+    )
+    check(
+        warn is not None and warn.get("id") == "proof-logged-unverified"
+        and warn.get("severity") == "warn",
+        "non-crediting proof returns the loud proof-logged-unverified finding",
+    )
+    check(
+        warn is not None and "cwd" in warn.get("message", ""),
+        "the finding names the cwd_invalid reason",
+    )
+
+
 def main():
     tests = [
+        test_resolve_project_dir_nesting_and_unverified_proof_loudness,
         test_source_integrity_no_duplicate_module_level_names,
         test_test_runner_integrity_detects_unregistered_tests,
         test_intel_detection_and_clean,
