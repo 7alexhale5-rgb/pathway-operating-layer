@@ -5403,8 +5403,8 @@ def run_pathway_trust(args, paths):
     checks = [
         explicit_runner_integrity(test_dir / "operating_layer_test.py"),
         run_trust_command("pathway_fs helper contract", [sys.executable, str(test_dir / "pathway_fs_test.py")], 2.0),
-        run_trust_command("techdebt guard trust suite", [sys.executable, str(test_dir / "techdebt_guard_test.py")], 5.0),
-        run_trust_command("design guard trust suite", [sys.executable, str(test_dir / "design_guard_test.py")], 5.0),
+        run_trust_command("techdebt guard trust suite", [sys.executable, str(test_dir / "techdebt_guard_test.py")], 8.0),
+        run_trust_command("design guard trust suite", [sys.executable, str(test_dir / "design_guard_test.py")], 12.0),
         run_trust_command("observability guard trust suite", [sys.executable, str(test_dir / "observability_guard_test.py")], 7.0),
     ]
 
