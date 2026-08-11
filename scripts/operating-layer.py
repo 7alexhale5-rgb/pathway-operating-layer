@@ -834,6 +834,19 @@ def iso_now():
     return utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def local_day():
+    """The calendar day a human would call today, in the machine's own timezone.
+
+    Timestamps INSIDE an artifact stay UTC (see iso_now) because those are instants.
+    A filename date is not an instant. It is the day the operator did the work, and
+    it is what doc_freshness.py and operator-artifacts-supersede.py read to decide
+    whether a document is stale. Stamping it from utc_now() dated every artifact
+    written after 7pm CDT to tomorrow, and a document dated tomorrow can never read
+    as stale. 175 artifacts were misdated this way between 2026-05-22 and 2026-08-11.
+    """
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def parse_ts(value):
     if not value:
         return None
@@ -3308,12 +3321,12 @@ def memory_validation(paths):
 
 
 def report_path(paths):
-    day = utc_now().strftime("%Y-%m-%d")
+    day = local_day()
     return paths.operator_artifacts / f"{day}-operating-layer-report.md"
 
 
 def dated_artifact_path(paths, suffix):
-    day = utc_now().strftime("%Y-%m-%d")
+    day = local_day()
     return paths.operator_artifacts / f"{day}-{suffix}.md"
 
 
