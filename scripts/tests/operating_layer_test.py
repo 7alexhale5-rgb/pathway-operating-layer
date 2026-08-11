@@ -1520,6 +1520,77 @@ def test_learning_dampener_never_suppresses_a_pathway_with_live_findings():
     check(docs_dampened, "docs (no live finding) IS still dampened — the guard is selective, not a blanket off-switch")
 
 
+def test_artifact_filename_dates_use_local_day_not_utc():
+    """An artifact filename must carry the operator's calendar day, never UTC's.
+
+    2026-08-10. report_path() and dated_artifact_path() both stamped the filename
+    from utc_now(). Every run after 7pm CDT was therefore dated TOMORROW, and a
+    document dated tomorrow can never read as stale to doc_freshness.py or to
+    operator-artifacts-supersede.py, which both key on that filename date. 175
+    artifacts were misdated between 2026-05-22 and 2026-08-11 before it was caught.
+
+    The fixture forces two extreme zones 25 hours apart, so at any instant at least
+    one of them disagrees with UTC about what day it is. The final check asserts the
+    split actually happened, so this test can never pass vacuously.
+    """
+    import datetime as _dt
+    import importlib.util
+    import types
+
+    spec = importlib.util.spec_from_file_location("opl_clock_under_test", CLI)
+    opl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(opl)
+    paths = types.SimpleNamespace(operator_artifacts=Path("/tmp/oa-clock-test"))
+
+    def under_tz(tz, fn):
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = tz
+        time.tzset()
+        try:
+            return fn()
+        finally:
+            if previous is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous
+            time.tzset()
+
+    utc_day = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    observed_local_days = []
+
+    for tz in ("Pacific/Kiritimati", "Pacific/Midway"):  # UTC+14 and UTC-11
+        local_day = under_tz(tz, lambda: _dt.datetime.now().strftime("%Y-%m-%d"))
+        observed_local_days.append(local_day)
+
+        dated = under_tz(tz, lambda: opl.dated_artifact_path(paths, "proof-registry").name)
+        check(
+            dated == f"{local_day}-proof-registry.md",
+            f"dated_artifact_path uses the local day in {tz} (got {dated}, local {local_day})",
+        )
+
+        report = under_tz(tz, lambda: opl.report_path(paths).name)
+        check(
+            report == f"{local_day}-operating-layer-report.md",
+            f"report_path uses the local day in {tz} (got {report}, local {local_day})",
+        )
+
+        check(
+            under_tz(tz, opl.local_day) == local_day,
+            f"local_day() tracks the machine timezone in {tz}",
+        )
+
+    check(
+        any(day != utc_day for day in observed_local_days),
+        f"the fixture actually exercised a local/UTC date split (UTC {utc_day}, saw {observed_local_days})",
+    )
+
+    # Guard the other direction: instants inside artifacts must STAY UTC.
+    check(
+        opl.iso_now().endswith("Z") and opl.iso_now()[:10] == utc_day,
+        "iso_now() still reports UTC, because a timestamp is an instant not a day",
+    )
+
+
 def main():
     tests = [
         test_source_integrity_no_duplicate_module_level_names,
@@ -1559,6 +1630,7 @@ def main():
         test_pathway_evaluate_records_independent_verdicts_and_precision,
         test_recommender_engages_findings_over_foundation_on_untracked_project,
         test_learning_dampener_never_suppresses_a_pathway_with_live_findings,
+        test_artifact_filename_dates_use_local_day_not_utc,
     ]
     missing = _unregistered_test_names(globals(), tests)
     check(not missing, f"all module-level test_* callables are registered in main() (missing: {missing})")
