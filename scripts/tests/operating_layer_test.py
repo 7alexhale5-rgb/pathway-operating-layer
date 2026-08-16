@@ -5859,6 +5859,98 @@ Release preflight is complete and rollback is verified.
           "a release proof whose approval is missing from the ledger loses credit at status time")
 
 
+def test_approval_authority_survives_review_findings():
+    """Regressions for the 2026-08-16 adversarial review. Each check fails on the pre-fix code:
+    a long project slug redacted the ledger join key, a spent ticket locked the subject out
+    forever, a widened window was honored, forged corroboration credited, and proof-add could
+    never credit release."""
+    opl = load_cli("approval_findings")
+    reset()
+    # A slug long enough that "work-cover:<work_id>:<pathway>" crosses the 64-char entropy
+    # pattern — this is the exact shape that silently redacted the consumption key.
+    proj = ROOT / "projects" / "pathway-operating-layer-approval-regression"
+    proj.mkdir(parents=True, exist_ok=True)
+    approvals_path = ROOT / "out/operator-intelligence/approvals.ndjson"
+
+    data, _ = run("work-start", ["--project", str(proj),
+                                 "--goal", "production secure long slug waiver regression",
+                                 "--tier", "production-secure"])
+    wid = data["work_id"]
+    consumer = f"work-cover:{wid}:observability"
+    check(len(consumer) >= 64,
+          f"the fixture consumer key is long enough to trip the entropy redactor ({len(consumer)})")
+    check(opl.redact_obj({"consumed_by": consumer})["consumed_by"] == consumer,
+          "the ledger join key survives redaction verbatim")
+
+    reason = "runtime monitoring is live and does not match the runtime receipt contract"
+    run("approval-issue", ["--kind", "production-secure-waiver", "--work-id", wid,
+                           "--pathway", "observability", "--reason", reason])
+    covered, _ = run("work-cover", ["--work-id", wid, "--pathway", "observability", "--na",
+                                    "--reason", reason])
+    entry = next(e for e in covered["records"][0]["itinerary"] if e["pathway"] == "observability")
+    check(entry["status"] == "na" and bool(entry.get("waiver_digest")),
+          "a long-work-id waiver consumes and stamps its row")
+    status, _ = run("work-status", ["--work-id", wid])
+    check({e["pathway"]: e["status"]
+           for e in status["summary"]["itinerary"]}["observability"] == "na",
+          "a long-work-id waived row stays corroborated through status recomputation")
+
+    ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    issued_event = next(e for e in ledger if e.get("event") == "issued")
+    check(bool(issued_event.get("ticket_id")) and bool(issued_event.get("issued_by")),
+          "an issued ticket records its own id and an attributable issuer")
+
+    # A spent ticket must not lock the subject out: a deliberate re-issue is consumable again.
+    reissued, _ = run("approval-issue", ["--kind", "production-secure-waiver", "--work-id", wid,
+                                         "--pathway", "observability", "--reason", reason])
+    check(bool(reissued.get("subject_digest")), "the same subject can be deliberately re-issued")
+    recovered, _ = run("work-cover", ["--work-id", wid, "--pathway", "observability", "--na",
+                                      "--reason", reason])
+    check(bool(recovered.get("records")),
+          "a re-issued ticket is consumable after an earlier ticket was spent")
+
+    # A hand-widened validity window in the ledger is not honored.
+    run("approval-issue", ["--kind", "production-secure-waiver", "--work-id", wid,
+                           "--pathway", "techdebt", "--reason", "debt paid in the same change"])
+    ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    for event in ledger:
+        if (event.get("event") == "issued"
+                and (event.get("subject") or {}).get("pathway") == "techdebt"):
+            event["expires_at"] = "2036-01-01T00:00:00Z"
+    approvals_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in ledger), encoding="utf-8")
+    widened, _ = run("work-cover", ["--work-id", wid, "--pathway", "techdebt", "--na",
+                                    "--reason", "debt paid in the same change"])
+    check("work-cover-production-secure-na-blocked" in ids(widened),
+          "a ledger window widened beyond the authority's TTL is refused")
+
+    # A secret-shaped reason is refused at issue time rather than dying as a mismatch later.
+    unstorable, _ = run("approval-issue", ["--kind", "production-secure-waiver", "--work-id", wid,
+                                           "--pathway", "docs", "--reason", "token: abcdefghijkl"])
+    check("approval-issue-reason-not-storable" in ids(unstorable),
+          "a reason the redactor would rewrite is refused at issue time")
+
+    # Forged corroboration: approval fields on a proof row with no ledger evidence never credit.
+    forged = {
+        "pathway": "release", "result": "pass", "verifier_strength": "executed",
+        "exit_code": 0, "trivial_verifier": False, "canary_mutant_failed": True,
+        "release_snapshot_stable": True, "release_snapshot_errors": [],
+        "template_check": {"valid": True}, "release_credit_scope": "production",
+        "release_receipt_errors": [], "release_verifier_errors": [],
+        "release_verifier_bound": True,
+        "release_artifact_sha256": {f: "a" * 64 for f in opl.RELEASE_RECEIPT_ARTIFACT_FIELDS},
+        "release_approval_verified": True, "release_approval_digest": "b" * 64,
+        "release_approval_consumed_id": "AC-forged", "proof_id": "P-forged",
+        "work_id": wid, "project": proj.name, "release_receipt_sha256": "c" * 64,
+    }
+    check(opl.proof_is_verified(forged) and not opl.proof_credits_pathway(forged, []),
+          "a forged release approval passes the verifier gate but never credits")
+    check(not opl.proved_pathways_from_proofs(wid, [forged], []),
+          "an uncorroborated release proof stays out of the proved map")
+
+
 def main():
     tests = [
         test_resolve_project_dir_nesting_and_unverified_proof_loudness,
@@ -5902,6 +5994,7 @@ def main():
         test_pathway_execution_profile_invariants,
         test_itinerary_coverage_guarantee,
         test_approval_authority_single_use_waiver_and_release_credit,
+        test_approval_authority_survives_review_findings,
         test_proof_add_flips_itinerary_coverage,
         test_proof_add_resolves_bare_project_name_and_flags_invalid_cwd,
         test_proof_requires_verifier_not_just_presence,

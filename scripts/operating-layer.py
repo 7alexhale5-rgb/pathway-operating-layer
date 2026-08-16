@@ -9,6 +9,8 @@ AI/agent readiness, and client/workspace boundaries.
 """
 import argparse
 import ast
+import contextlib
+import fcntl
 import hashlib
 import html
 import json
@@ -1145,6 +1147,14 @@ def _release_envelope_errors(envelope, expected=None, now=None):
     return errors
 
 
+def release_companion_candidate(evidence_path):
+    """The one rule for resolving a release receipt's JSON companion. Shared by the evidence
+    loader and the approval peek so the subject can never bind a different file than the
+    validator reads."""
+    primary = Path(evidence_path).expanduser() if evidence_path else Path()
+    return primary if primary.suffix.lower() == ".json" else primary.with_suffix(".json")
+
+
 def release_receipt_from_evidence(evidence_path, expected=None, now=None, production_approval=False):
     """Load a release receipt from JSON evidence or a same-stem JSON companion.
 
@@ -1153,9 +1163,7 @@ def release_receipt_from_evidence(evidence_path, expected=None, now=None, produc
     depend on reparsing mutable prose. `production_approval` reflects whether the caller located
     a live single-use approval ticket for this exact companion digest (default fail-closed).
     """
-    primary = Path(evidence_path).expanduser() if evidence_path else Path()
-    candidates = [primary] if primary.suffix.lower() == ".json" else [primary.with_suffix(".json")]
-    for candidate in candidates:
+    for candidate in [release_companion_candidate(evidence_path)]:
         if candidate.is_symlink():
             return {
                 "receipt": {}, "receipt_path": str(candidate), "receipt_sha256": "",
@@ -2463,6 +2471,12 @@ def redact_obj(value):
             "work_id", "run_id", "measurement_id", "control_id", "evidence_id",
             "created_by_run_id", "resolved_by_run_id", "resolution_evidence_id",
             "proved_by_run",
+            # Approval-ledger join keys. consumed_by embeds a work_id
+            # ("work-cover:<work_id>:<pathway>"), and a project slug of ~21+ chars pushes the
+            # composite over the 64-char entropy pattern — the stored consumption became
+            # "work-cover:[REDACTED]:..." and the ledger join silently failed (adversarial
+            # review finding, 2026-08-16). All three are engine-generated, never operator text.
+            "consumed_by", "consumption_id", "ticket_id",
         }
         # Exempt a value only when it BOTH sits under a digest-named key AND is a 64-hex string —
         # that is a content hash (artifact/verifier-stdout/verifier-source binding) the entropy
@@ -2728,18 +2742,55 @@ def latest_approval_event(events, digest, event_kind):
     return match
 
 
+@contextlib.contextmanager
+def _approvals_write_lock(paths):
+    """Exclusive lock around the ledger's read-modify-write. append_records rewrites the whole
+    file atomically, which prevents torn files but not lost updates — two unlocked writers can
+    each read a consumed-free ledger, both authorize, and the last write erases the first
+    consumption. Parallel sessions on one repo are a documented reality here."""
+    lock_path = Path(str(paths.approvals_path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _approvals_ledger_over_cap(paths):
+    """A ledger past the NDJSON read cap would be read truncated; rewriting from that read would
+    permanently destroy the newest events (the consumptions). Refuse to write instead."""
+    try:
+        size = Path(paths.approvals_path).stat().st_size
+    except OSError:
+        return False
+    return size > NDJSON_READ_MAX_BYTES
+
+
 def find_active_approval(events, digest, now=None):
-    """Locate a live ticket: issued, unconsumed, unexpired, with a subject that still hashes to
-    its own digest. Returns (issued_event, refusal_reason)."""
+    """Locate a live ticket: issued, unconsumed, unexpired, within the authority's own TTL, with
+    a subject that still hashes to its own digest. Returns (issued_event, refusal_reason).
+
+    Consumption is TICKET-scoped, not digest-scoped: only a consumption referencing the latest
+    issued event's ticket_id blocks it. A fresh issued event appended after a consumption is a
+    new, consumable ticket for the same subject — otherwise one spent ticket would lock a
+    legitimate re-approval out forever (adversarial review finding, 2026-08-16)."""
     now = now or utc_now()
     issued = latest_approval_event(events, digest, "issued")
     if issued is None:
         return None, "no_ticket"
-    if latest_approval_event(events, digest, "consumed") is not None:
-        return None, "consumed"
+    ticket_id = issued.get("ticket_id", "")
+    for event in events or []:
+        if (isinstance(event, dict) and event.get("event") == "consumed"
+                and event.get("subject_digest") == digest
+                and event.get("ticket_id", "") == ticket_id):
+            return None, "consumed"
     issued_at = parse_ts(str(issued.get("issued_at") or ""))
     expires_at = parse_ts(str(issued.get("expires_at") or ""))
     if issued_at is None or expires_at is None or expires_at <= issued_at:
+        return None, "invalid_window"
+    if (expires_at - issued_at).total_seconds() > APPROVAL_TTL_SECONDS:
         return None, "invalid_window"
     if expires_at < now:
         return None, "expired"
@@ -2750,37 +2801,53 @@ def find_active_approval(events, digest, now=None):
 
 
 def consume_approval(paths, subject, consumed_by, now=None):
-    """Single-use consumption bound to one consumer.
+    """Single-use consumption bound to one consumer, under the ledger write lock.
 
     Re-consumption by the SAME consumer is idempotent — a re-logged identical proof or a
-    re-covered itinerary row keeps the decision it already earned — while any other consumer is
-    refused, so one ticket can never authorize two different things. Returns
+    re-covered itinerary row keeps the decision it already earned — while any other consumer
+    needs its own live ticket, so one ticket can never authorize two different things. Returns
     (consumed_event, refusal_reason)."""
     digest = approval_subject_digest(subject)
-    events = approval_events_for(paths)
-    prior = latest_approval_event(events, digest, "consumed")
-    if prior is not None:
-        if prior.get("consumed_by") == consumed_by:
+    with _approvals_write_lock(paths):
+        events = approval_events_for(paths)
+        prior = latest_approval_event(events, digest, "consumed")
+        if prior is not None and prior.get("consumed_by") == consumed_by:
             return prior, ""
-        return None, "consumed"
-    issued, refusal = find_active_approval(events, digest, now=now)
-    if issued is None:
-        return None, refusal
-    record = {
-        "event": "consumed",
-        "kind": issued.get("kind"),
-        "subject_digest": digest,
-        "at": iso_now(),
-        "work_id": subject.get("work_id", ""),
-        "pathway": subject.get("pathway", ""),
-        "consumed_by": consumed_by,
-        "consumption_id": f"AC-{sha_text(digest + '|' + str(consumed_by), 12)}",
-    }
-    # append_records rewrites the whole file atomically, so a true append must carry every
-    # existing event forward. The ledger stays append-only at the semantic level: events are
-    # never edited or removed, only added.
-    write_ndjson(paths.approvals_path, events + [record])
-    return record, ""
+        issued, refusal = find_active_approval(events, digest, now=now)
+        if issued is None:
+            return None, refusal
+        if _approvals_ledger_over_cap(paths):
+            return None, "ledger_over_read_cap"
+        record = {
+            "event": "consumed",
+            "kind": issued.get("kind"),
+            "subject_digest": digest,
+            "ticket_id": issued.get("ticket_id", ""),
+            "at": iso_now(),
+            "work_id": subject.get("work_id", ""),
+            "pathway": subject.get("pathway", ""),
+            "consumed_by": consumed_by,
+            "consumption_id": f"AC-{sha_text(digest + '|' + str(consumed_by), 12)}",
+        }
+        # append_records rewrites the whole file atomically, so a true append must carry every
+        # existing event forward. The ledger stays append-only at the semantic level: events are
+        # never edited or removed, only added.
+        write_ndjson(paths.approvals_path, events + [record])
+        return record, ""
+
+
+def _approval_issuer_identity():
+    """Best-effort attribution for an issued ticket. Never a secret, never authentication."""
+    try:
+        login = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
+        tty = ""
+        try:
+            tty = os.ttyname(sys.stdin.fileno())
+        except Exception:
+            tty = "not-a-tty"
+        return f"uid={os.getuid()} user={login or 'unknown'} ppid={os.getppid()} tty={tty}"
+    except Exception:
+        return "unknown"
 
 
 def release_approval_subject(work_id, project, release_receipt_sha256):
@@ -2803,15 +2870,14 @@ def waiver_subject(work_id, project, pathway, reason):
     }
 
 
-def release_approval_corroborated(proof, events):
-    """The ledger, not the proof row, is the approval trust root.
+def approval_claim_corroborated(digest, expected_subject, consumer, consumption_id, events):
+    """The ledger, not the claiming row, is the approval trust root.
 
-    The digest a release proof claims must map to an issued subject binding this exact
-    work/project/receipt digest and to a consumption bound to this exact proof_id. A proof row
-    forged with approval fields but no ledger evidence does not credit."""
-    if not isinstance(proof, dict):
-        return False
-    digest = str(proof.get("release_approval_digest") or "")
+    One join for both ticket kinds, so the four invariants (well-formed digest, an issued event
+    whose subject is exactly what the claim implies, a consumption by this exact consumer, and a
+    matching consumption id) can never drift apart. Also re-checks the issued window against the
+    authority's own TTL, so a hand-widened expiry in the ledger cannot be honored later."""
+    digest = str(digest or "")
     if not APPROVAL_DIGEST_RE.fullmatch(digest):
         return False
     issued = latest_approval_event(events, digest, "issued")
@@ -2819,13 +2885,36 @@ def release_approval_corroborated(proof, events):
     if issued is None or consumed is None:
         return False
     subject = issued.get("subject") if isinstance(issued.get("subject"), dict) else {}
-    expected = release_approval_subject(
-        proof.get("work_id"), proof.get("project"), proof.get("release_receipt_sha256"))
+    if subject != expected_subject or approval_subject_digest(subject) != digest:
+        return False
+    issued_at = parse_ts(str(issued.get("issued_at") or ""))
+    expires_at = parse_ts(str(issued.get("expires_at") or ""))
+    if issued_at is None or expires_at is None:
+        return False
+    lifetime = (expires_at - issued_at).total_seconds()
+    if lifetime <= 0 or lifetime > APPROVAL_TTL_SECONDS:
+        return False
+    consumed_at = parse_ts(str(consumed.get("at") or ""))
+    if consumed_at is None or not (issued_at <= consumed_at <= expires_at):
+        return False
     return (
-        subject == expected
-        and approval_subject_digest(subject) == digest
-        and consumed.get("consumed_by") == proof.get("proof_id")
-        and consumed.get("consumption_id") == proof.get("release_approval_consumed_id")
+        consumed.get("consumed_by") == consumer
+        and consumed.get("consumption_id") == consumption_id
+    )
+
+
+def release_approval_corroborated(proof, events):
+    """A release proof credits only when its claimed approval maps to an issued subject binding
+    this exact work/project/receipt digest and to a consumption bound to this exact proof_id."""
+    if not isinstance(proof, dict):
+        return False
+    return approval_claim_corroborated(
+        proof.get("release_approval_digest"),
+        release_approval_subject(
+            proof.get("work_id"), proof.get("project"), proof.get("release_receipt_sha256")),
+        proof.get("proof_id"),
+        proof.get("release_approval_consumed_id"),
+        events,
     )
 
 
@@ -2835,21 +2924,27 @@ def waiver_corroborated(entry, work_id, project, events):
     work-cover consumption."""
     if not isinstance(entry, dict):
         return False
-    digest = str(entry.get("waiver_digest") or "")
-    if not APPROVAL_DIGEST_RE.fullmatch(digest):
-        return False
-    issued = latest_approval_event(events, digest, "issued")
-    consumed = latest_approval_event(events, digest, "consumed")
-    if issued is None or consumed is None:
-        return False
-    subject = issued.get("subject") if isinstance(issued.get("subject"), dict) else {}
-    expected = waiver_subject(work_id, project, entry.get("pathway"), entry.get("reason"))
-    return (
-        subject == expected
-        and approval_subject_digest(subject) == digest
-        and consumed.get("consumed_by") == f"work-cover:{work_id}:{entry.get('pathway')}"
-        and consumed.get("consumption_id") == entry.get("waiver_consumed_id")
+    return approval_claim_corroborated(
+        entry.get("waiver_digest"),
+        waiver_subject(work_id, project, entry.get("pathway"), entry.get("reason")),
+        f"work-cover:{work_id}:{entry.get('pathway')}",
+        entry.get("waiver_consumed_id"),
+        events,
     )
+
+
+def proof_credits_pathway(proof, approval_events=None):
+    """The single crediting predicate every consumer must use.
+
+    `proof_is_verified` answers "did a verifier really pass"; this adds the trust-root join a
+    proof row cannot vouch for on its own. Release credit requires ledger corroboration, so a
+    forged row carrying approval fields cannot raise the proof rate, ride a carry-forward baton,
+    or inflate audit metrics (adversarial review finding, 2026-08-16)."""
+    if not proof_is_verified(proof):
+        return False
+    if (proof or {}).get("pathway") != "release":
+        return True
+    return release_approval_corroborated(proof, approval_events or [])
 
 
 def proof_result_is_passing(result):
@@ -3147,10 +3242,10 @@ def first_nonempty_snippet(text, limit=260):
     return ""
 
 
-def build_carry_forward_record(proof, work_item=None):
+def build_carry_forward_record(proof, work_item=None, approval_events=None):
     if not proof or not proof_can_carry_forward(proof):
         return None
-    credits_pathway = proof_is_verified(proof)
+    credits_pathway = proof_credits_pathway(proof, approval_events)
     if credits_pathway:
         pathway_outcome = "proved"
     elif proof.get("pathway") == "observability":
@@ -6635,7 +6730,9 @@ def run_work_cover(args, paths):
             recorded_receipt = recorded_receipt or (
                 proved_by == "[REDACTED]" and bool(pathway_proofs)
             )
-            verified_support = any(proof_is_verified(proof) for proof in pathway_proofs)
+            cover_approval_events = approval_events_for(paths)
+            verified_support = any(
+                proof_credits_pathway(proof, cover_approval_events) for proof in pathway_proofs)
             invalid_recorded_proof = (
                 entry.get("status") == "proved" and recorded_receipt and not verified_support
             )
@@ -6731,6 +6828,17 @@ def run_approval_issue(args, paths):
             "Re-run with --reason; for waivers the reason is content-bound and must match the "
             "work-cover --na reason byte for byte.",
         )
+    # The ledger is written through the redactor. A reason the redactor rewrites would be stored
+    # as different bytes than the digest binds, and the ticket would be stillborn with a refusal
+    # that reads like tampering. Refuse loudly at issue time instead.
+    if redact(reason) != reason:
+        return _refuse(
+            "approval-issue-reason-not-storable",
+            "The reason contains secret-like text that the ledger redactor would rewrite, so the "
+            "ticket could never be consumed.",
+            "Reword the reason without credential-shaped text (no `token:`/`secret=`/`password:` "
+            "phrasing and no 64-character-plus runs), then re-issue.",
+        )
     item = next(
         (w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
     if item is None:
@@ -6774,17 +6882,33 @@ def run_approval_issue(args, paths):
         subject = release_approval_subject(args.work_id, project, receipt_sha)
     digest = approval_subject_digest(subject)
     now = utc_now()
+    issued_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     event = {
         "event": "issued",
         "kind": kind,
         "subject_digest": digest,
+        # Each issuance is its own ticket. Consumption is ticket-scoped, so a spent ticket never
+        # locks out a later, deliberate re-approval of the same subject.
+        "ticket_id": f"AT-{sha_text(digest + '|' + issued_at + '|' + secrets.token_hex(8), 12)}",
         "subject": subject,
-        "issued_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "issued_at": issued_at,
         "expires_at": (now + timedelta(seconds=APPROVAL_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "reason": reason,
         "work_id": args.work_id,
+        # Who ran the issuing command. This does not authenticate Alex — the agent and the
+        # operator share this shell — but it makes the act attributable after the fact, which a
+        # ledger with no issuer at all could not do.
+        "issued_by": _approval_issuer_identity(),
     }
-    write_ndjson(paths.approvals_path, approval_events_for(paths) + [event])
+    with _approvals_write_lock(paths):
+        if _approvals_ledger_over_cap(paths):
+            return _refuse(
+                "approval-issue-ledger-over-cap",
+                "The approvals ledger is past the NDJSON read cap; writing now would destroy the "
+                "newest events.",
+                "Rotate the approvals ledger before issuing another ticket.",
+            )
+        write_ndjson(paths.approvals_path, approval_events_for(paths) + [event])
     next_step = (
         f"work-cover --work-id {args.work_id} --pathway {args.pathway} --na --reason "
         "\"<the exact same reason>\""
@@ -7000,7 +7124,7 @@ def run_work_log(args, paths):
     if proof:
         upsert_proof(paths, proof)
         write_proof_report(paths, read_ndjson(paths.proofs_path))
-        carry_forward = build_carry_forward_record(proof, item)
+        carry_forward = build_carry_forward_record(proof, item, approval_events_for(paths))
         if carry_forward:
             upsert_carry_forward(paths, carry_forward)
     if item:
@@ -7012,7 +7136,7 @@ def run_work_log(args, paths):
         # that makes `proved` — and everything gated on it (coverage, proof rate, autonomy,
         # learning, calibration) — mean a verification actually passed, not that a string was typed.
         proved = (bool(proof) and bool(evidence_path) and Path(evidence_path).is_file()
-                  and proof_is_verified(proof))
+                  and proof_credits_pathway(proof, approval_events_for(paths)))
         itinerary = item.get("itinerary") or []
         if proved and itinerary:
             for entry in itinerary:
@@ -7115,7 +7239,8 @@ def run_proof_add(args, paths):
     work_item = None
     if args.work_id:
         work_item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
-    proof, proof_finding = build_proof_record(args, work_item=work_item, projects_root=paths.projects_root)
+    proof, proof_finding = build_proof_record(
+        args, work_item=work_item, projects_root=paths.projects_root, paths=paths)
     # No proof at all (e.g. missing evidence) is fatal. A proof accompanied by a
     # finding is the loud will-not-credit advisory (proof-logged-unverified) —
     # record the proof AND surface the warning; swallowing either repeats the
@@ -7129,7 +7254,7 @@ def run_proof_add(args, paths):
     advisory_findings = [proof_finding] if proof_finding else []
     proofs = upsert_proof(paths, proof)
     md_path, html_path = write_proof_report(paths, proofs)
-    carry_forward = build_carry_forward_record(proof, work_item)
+    carry_forward = build_carry_forward_record(proof, work_item, approval_events_for(paths))
     if carry_forward:
         upsert_carry_forward(paths, carry_forward)
     result = {
@@ -8862,6 +8987,7 @@ def run_ingest_review(args, paths):
 
 
 def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
+    approval_events = approval_events_for(paths)
     """Pure computation of the recommendation action+proof metric — no file write.
 
     Of pathway-next recommendations, the fraction that got a matching work-log run
@@ -8893,7 +9019,7 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
     def proved(rec):
         rec_ts = parse_ts(rec.get("timestamp"))
         for proof in proofs:
-            if not proof_is_verified(proof):
+            if not proof_credits_pathway(proof, approval_events):
                 continue  # keystone: attested (free-text) proofs never raise the autonomy proof rate
             proof_rec = proof.get("recommendation_id")
             if proof_rec:
@@ -9120,15 +9246,16 @@ def _audit_score(name, score, maximum, evidence, status="measured"):
     }
 
 
-def audit_proof_integrity_snapshot(proofs, active_work_ids):
+def audit_proof_integrity_snapshot(proofs, active_work_ids, approval_events=None):
     """Separate active readiness from historical proof hygiene without rewriting history."""
     active_ids = {work_id for work_id in active_work_ids if work_id}
     active = [proof for proof in proofs if proof.get("work_id") in active_ids]
     scoped = active if active else proofs
-    verified = [proof for proof in scoped if proof_is_verified(proof)]
+    verified = [proof for proof in scoped if proof_credits_pathway(proof, approval_events)]
     historical_unverified = [
         proof for proof in proofs
-        if proof.get("work_id") not in active_ids and not proof_is_verified(proof)
+        if proof.get("work_id") not in active_ids
+        and not proof_credits_pathway(proof, approval_events)
     ]
     return {
         "scope": "active outcomes" if active else "project history (no active outcome)",
@@ -9230,9 +9357,11 @@ def run_pathway_audit(args, paths):
         proof for proof in read_ndjson(paths.proofs_path)
         if proof.get("project") == project_name or proof.get("project_path") == str(project)
     ]
-    verified_proofs = [proof for proof in proofs if proof_is_verified(proof)]
+    audit_approval_events = approval_events_for(paths)
+    verified_proofs = [
+        proof for proof in proofs if proof_credits_pathway(proof, audit_approval_events)]
     proof_integrity = audit_proof_integrity_snapshot(
-        proofs, [item.get("work_id") for item in selected_work])
+        proofs, [item.get("work_id") for item in selected_work], audit_approval_events)
     carry_forward = [
         item for item in read_ndjson(paths.carry_forward_path)
         if item.get("project") == project_name or item.get("project_path") == str(project)
@@ -9617,7 +9746,7 @@ def safe_artifact_name(value):
     return safe_display_text(name or "artifact", limit=80)
 
 
-def latest_recommendation_proof_status(latest_rec, proofs):
+def latest_recommendation_proof_status(latest_rec, proofs, approval_events=None):
     if not latest_rec:
         return "unknown"
     rec_id = latest_rec.get("recommendation_id")
@@ -9632,13 +9761,13 @@ def latest_recommendation_proof_status(latest_rec, proofs):
             matches.append(proof)
     if not matches:
         return "missing"
-    verified = [p for p in matches if proof_is_verified(p)]
+    verified = [p for p in matches if proof_credits_pathway(p, approval_events)]
     if not verified:
         return "unverified"  # keystone: attested-only proofs don't read as proved in the cockpit
     return "stale" if all(proof_is_stale(p) for p in verified) else "proved"
 
 
-def safe_latest_recommendation(latest_rec, proofs):
+def safe_latest_recommendation(latest_rec, proofs, approval_events=None):
     if not latest_rec:
         return None
     return {
@@ -9649,7 +9778,7 @@ def safe_latest_recommendation(latest_rec, proofs):
         "runner_up_pathway": safe_display_text(latest_rec.get("runner_up_pathway"), 40),
         "why_this": safe_display_text(latest_rec.get("why_this") or latest_rec.get("reason") or "Latest recorded recommendation.", 220),
         "why_not_runner_up": safe_display_text(latest_rec.get("why_not_runner_up") or "Runner-up detail unavailable in the current ledger.", 220),
-        "proof_status": latest_recommendation_proof_status(latest_rec, proofs),
+        "proof_status": latest_recommendation_proof_status(latest_rec, proofs, approval_events),
     }
 
 
@@ -9773,7 +9902,9 @@ def build_closeout_queue(cockpit, proofs):
 
 def build_alex_queue(cockpit, latest_rec, metric):
     queue = []
-    if latest_rec and latest_recommendation_proof_status(latest_rec, cockpit.get("proofs_for_status", [])) != "proved":
+    if latest_rec and latest_recommendation_proof_status(
+            latest_rec, cockpit.get("proofs_for_status", []),
+            cockpit.get("approval_events_for_status", [])) != "proved":
         queue.append({
             "kind": "proof-needed",
             "priority": "high",
@@ -9854,10 +9985,12 @@ def build_pfos_cockpit(paths):
     proofs = read_ndjson(paths.proofs_path)
     decisions = sorted(read_ndjson(paths.pathway_decisions_path), key=lambda d: d.get("timestamp", ""), reverse=True)
     cockpit["proofs_for_status"] = proofs
+    cockpit_approval_events = approval_events_for(paths)
+    cockpit["approval_events_for_status"] = cockpit_approval_events
     metric = cockpit.get("metric") or {}
     latest_rec = cockpit.get("latest_recommendation") or {}
     portfolio_items = (read_json_file(paths.portfolio_next_path, {"items": []}).get("items") or [])
-    safe_rec = safe_latest_recommendation(latest_rec, proofs)
+    safe_rec = safe_latest_recommendation(latest_rec, proofs, cockpit_approval_events)
     stale_proofs = [p for p in proofs if proof_is_stale(p)]
     evidence = [safe_proof_summary(p) for p in sorted(proofs, key=lambda p: p.get("timestamp", ""), reverse=True)[:8]]
     portfolio_queue = [safe_portfolio_item(item) for item in portfolio_items[:8]]
