@@ -584,7 +584,11 @@ def itinerary_coverage(item):
 
 WORK_STALE_DAYS = 14
 REVIEW_STALE_DAYS = 14  # a .planning/review/latest-findings.json older than this is not trusted as current
-PRODUCTION_SECURE_WAIVER_STATE = "VERIFIABLE_WAIVER_NOT_CONFIGURED"
+# Flipped from VERIFIABLE_WAIVER_NOT_CONFIGURED on 2026-08-16 when the single-use waiver
+# authority shipped (approval-issue + approvals.ndjson). The constant stays load-bearing as a
+# kill switch: work-cover consults it before any ticket lookup, so setting it back to a
+# non-configured value disables waivers again without touching the ticket machinery.
+PRODUCTION_SECURE_WAIVER_STATE = "CONFIGURED_AND_VERIFIED"
 
 
 def production_secure_waiver_locked(item):
@@ -981,14 +985,20 @@ RELEASE_RECEIPT_ARTIFACT_FIELDS = (
 RELEASE_CONTEXT_FIELDS = ("work_id", "recommendation_id", "target_project")
 RELEASE_MAX_EVIDENCE_AGE_SECONDS = 86_400
 RELEASE_MAX_FUTURE_SKEW_SECONDS = 300
-RELEASE_PRODUCTION_APPROVAL_STATE = "VERIFIABLE_APPROVAL_NOT_CONFIGURED"
+# Flipped from VERIFIABLE_APPROVAL_NOT_CONFIGURED on 2026-08-16 when the single-use approval
+# authority shipped. proof_is_verified still consults it, so it remains the release-credit kill
+# switch; per-proof crediting additionally requires a consumed, ledger-corroborated ticket.
+RELEASE_PRODUCTION_APPROVAL_STATE = "CONFIGURED_AND_VERIFIED"
 
 
-def validate_release_receipt(receipt, artifact_base=None):
+def validate_release_receipt(receipt, artifact_base=None, production_approval=False):
     """Validate a local release receipt without performing a release.
 
     A receipt can prove preview readiness while production stays `not-deployed`.
     Production and external-send claims have stronger, explicit evidence requirements.
+    `production_approval` is True only when the caller has already located a live (or
+    proof-bound consumed) single-use approval ticket for this exact receipt digest; the
+    default keeps every approval-blind caller fail-closed.
     """
     errors = []
     if not isinstance(receipt, dict):
@@ -1004,12 +1014,15 @@ def validate_release_receipt(receipt, artifact_base=None):
     if receipt.get("preview_status") == "ready" and not str(receipt.get("verification_artifact") or "").strip():
         errors.append("preview-ready requires verification_artifact")
     if production == "deployed":
-        # Free text is an attestation, not an approval receipt. Until Pathway has an external,
-        # signature-verified, single-use approval trust root, production credit stays impossible.
-        errors.append(
-            "production deployment requires a verifiable single-use external approval receipt; "
-            f"current state is {RELEASE_PRODUCTION_APPROVAL_STATE}"
-        )
+        # Free text is an attestation, not an approval receipt. Production credit requires a
+        # single-use ticket bound to this receipt's exact digest, consumed through the approval
+        # authority (approval-issue). Approval-blind callers stay fail-closed.
+        if production_approval is not True:
+            errors.append(
+                "production deployment requires a verifiable single-use external approval "
+                "receipt; have Alex issue one with `approval-issue --kind "
+                "release-production-approval` bound to this exact receipt"
+            )
         if rollback not in {"rehearsed", "executed"}:
             errors.append("production deployment requires rehearsed or executed rollback_status")
         if receipt.get("canary_status") not in {"active", "passed"}:
@@ -1039,10 +1052,11 @@ def validate_release_receipt(receipt, artifact_base=None):
                 errors.append(f"{field} must point to an existing companion-directory file")
     if external == "sent":
         # The same approval boundary applies even when no deployment occurred. Free text cannot
-        # prove an external send was authorized or performed.
+        # prove an external send was authorized or performed, and release receipts cannot
+        # authorize sends at all — sends have their own approval channel (approve-send.py).
         errors.append(
             "external send requires a verifiable single-use external approval receipt; "
-            f"current state is {RELEASE_PRODUCTION_APPROVAL_STATE}"
+            "release receipts cannot authorize sends"
         )
         if not approval:
             errors.append("external send requires human_approval attestation")
@@ -1056,7 +1070,7 @@ def release_receipt_supports_send(receipt):
     return not validate_release_receipt(receipt) and receipt.get("external_send_state") == "sent"
 
 
-def release_receipt_credit_scope(receipt, envelope=None):
+def release_receipt_credit_scope(receipt, envelope=None, production_approval=False):
     """Return the release scope a structured receipt can honestly prove.
 
     Only `production` credits the release pathway. Preview readiness is useful planning evidence,
@@ -1064,7 +1078,7 @@ def release_receipt_credit_scope(receipt, envelope=None):
     is still a hold, not release proof. Explicit BLOCKED / NO_RELEASE envelope claims always win
     over caller-supplied `--result pass`.
     """
-    if validate_release_receipt(receipt):
+    if validate_release_receipt(receipt, production_approval=production_approval):
         return ""
     envelope = envelope if isinstance(envelope, dict) else {}
     decision = envelope.get("release_decision")
@@ -1131,12 +1145,13 @@ def _release_envelope_errors(envelope, expected=None, now=None):
     return errors
 
 
-def release_receipt_from_evidence(evidence_path, expected=None, now=None):
+def release_receipt_from_evidence(evidence_path, expected=None, now=None, production_approval=False):
     """Load a release receipt from JSON evidence or a same-stem JSON companion.
 
     Markdown remains the operator/carry-forward artifact. The JSON companion is the typed state
     boundary. Its receipt and digest are copied into the proof record so later credit does not
-    depend on reparsing mutable prose.
+    depend on reparsing mutable prose. `production_approval` reflects whether the caller located
+    a live single-use approval ticket for this exact companion digest (default fail-closed).
     """
     primary = Path(evidence_path).expanduser() if evidence_path else Path()
     candidates = [primary] if primary.suffix.lower() == ".json" else [primary.with_suffix(".json")]
@@ -1153,8 +1168,9 @@ def release_receipt_from_evidence(evidence_path, expected=None, now=None):
         receipt = envelope.get("release_receipt", envelope)
         if not isinstance(receipt, dict):
             continue
-        errors = list(parse_errors) + validate_release_receipt(receipt, candidate.parent)
-        scope = release_receipt_credit_scope(receipt, envelope)
+        errors = list(parse_errors) + validate_release_receipt(
+            receipt, candidate.parent, production_approval=production_approval)
+        scope = release_receipt_credit_scope(receipt, envelope, production_approval=production_approval)
         if scope == "production":
             errors.extend(_release_envelope_errors(envelope, expected, now))
         if not scope and not errors:
@@ -2582,6 +2598,7 @@ class Paths:
         self.recommendations_path = self.operator_intel / "pathway-recommendations.ndjson"
         self.pathway_trust_path = self.operator_intel / "pathway-trust.json"
         self.proofs_path = self.operator_intel / "proofs.ndjson"
+        self.approvals_path = self.operator_intel / "approvals.ndjson"
         self.carry_forward_path = self.operator_intel / "pathway-carry-forward.ndjson"
         self.pathway_run_plans_path = self.operator_intel / "pathway-run-plans.ndjson"
         self.pathway_decisions_path = self.operator_intel / "pathway-decisions.ndjson"
@@ -2685,6 +2702,156 @@ def upsert_proof(paths, proof):
     return proofs
 
 
+APPROVAL_TTL_SECONDS = 900
+APPROVAL_KIND_RELEASE = "release-production-approval"
+APPROVAL_KIND_WAIVER = "production-secure-waiver"
+APPROVAL_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def approval_subject_digest(subject):
+    """Content binding: canonical JSON (sorted keys, compact separators) so key order can never
+    change the digest and any edit to any bound field invalidates the ticket."""
+    canonical = json.dumps(subject, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def approval_events_for(paths):
+    return read_ndjson(paths.approvals_path)
+
+
+def latest_approval_event(events, digest, event_kind):
+    match = None
+    for event in events or []:
+        if (isinstance(event, dict) and event.get("event") == event_kind
+                and event.get("subject_digest") == digest):
+            match = event
+    return match
+
+
+def find_active_approval(events, digest, now=None):
+    """Locate a live ticket: issued, unconsumed, unexpired, with a subject that still hashes to
+    its own digest. Returns (issued_event, refusal_reason)."""
+    now = now or utc_now()
+    issued = latest_approval_event(events, digest, "issued")
+    if issued is None:
+        return None, "no_ticket"
+    if latest_approval_event(events, digest, "consumed") is not None:
+        return None, "consumed"
+    issued_at = parse_ts(str(issued.get("issued_at") or ""))
+    expires_at = parse_ts(str(issued.get("expires_at") or ""))
+    if issued_at is None or expires_at is None or expires_at <= issued_at:
+        return None, "invalid_window"
+    if expires_at < now:
+        return None, "expired"
+    subject = issued.get("subject")
+    if not isinstance(subject, dict) or approval_subject_digest(subject) != digest:
+        return None, "subject_mismatch"
+    return issued, ""
+
+
+def consume_approval(paths, subject, consumed_by, now=None):
+    """Single-use consumption bound to one consumer.
+
+    Re-consumption by the SAME consumer is idempotent — a re-logged identical proof or a
+    re-covered itinerary row keeps the decision it already earned — while any other consumer is
+    refused, so one ticket can never authorize two different things. Returns
+    (consumed_event, refusal_reason)."""
+    digest = approval_subject_digest(subject)
+    events = approval_events_for(paths)
+    prior = latest_approval_event(events, digest, "consumed")
+    if prior is not None:
+        if prior.get("consumed_by") == consumed_by:
+            return prior, ""
+        return None, "consumed"
+    issued, refusal = find_active_approval(events, digest, now=now)
+    if issued is None:
+        return None, refusal
+    record = {
+        "event": "consumed",
+        "kind": issued.get("kind"),
+        "subject_digest": digest,
+        "at": iso_now(),
+        "work_id": subject.get("work_id", ""),
+        "pathway": subject.get("pathway", ""),
+        "consumed_by": consumed_by,
+        "consumption_id": f"AC-{sha_text(digest + '|' + str(consumed_by), 12)}",
+    }
+    # append_records rewrites the whole file atomically, so a true append must carry every
+    # existing event forward. The ledger stays append-only at the semantic level: events are
+    # never edited or removed, only added.
+    write_ndjson(paths.approvals_path, events + [record])
+    return record, ""
+
+
+def release_approval_subject(work_id, project, release_receipt_sha256):
+    return {
+        "kind": APPROVAL_KIND_RELEASE,
+        "work_id": str(work_id or ""),
+        "project": str(project or ""),
+        "stage": "production",
+        "release_receipt_sha256": str(release_receipt_sha256 or ""),
+    }
+
+
+def waiver_subject(work_id, project, pathway, reason):
+    return {
+        "kind": APPROVAL_KIND_WAIVER,
+        "work_id": str(work_id or ""),
+        "project": str(project or ""),
+        "pathway": str(pathway or ""),
+        "reason": str(reason or ""),
+    }
+
+
+def release_approval_corroborated(proof, events):
+    """The ledger, not the proof row, is the approval trust root.
+
+    The digest a release proof claims must map to an issued subject binding this exact
+    work/project/receipt digest and to a consumption bound to this exact proof_id. A proof row
+    forged with approval fields but no ledger evidence does not credit."""
+    if not isinstance(proof, dict):
+        return False
+    digest = str(proof.get("release_approval_digest") or "")
+    if not APPROVAL_DIGEST_RE.fullmatch(digest):
+        return False
+    issued = latest_approval_event(events, digest, "issued")
+    consumed = latest_approval_event(events, digest, "consumed")
+    if issued is None or consumed is None:
+        return False
+    subject = issued.get("subject") if isinstance(issued.get("subject"), dict) else {}
+    expected = release_approval_subject(
+        proof.get("work_id"), proof.get("project"), proof.get("release_receipt_sha256"))
+    return (
+        subject == expected
+        and approval_subject_digest(subject) == digest
+        and consumed.get("consumed_by") == proof.get("proof_id")
+        and consumed.get("consumption_id") == proof.get("release_approval_consumed_id")
+    )
+
+
+def waiver_corroborated(entry, work_id, project, events):
+    """A production-secure N/A row survives status recomputation only when its waiver claim maps
+    back to an issued subject for this exact work/project/pathway/reason and to that row's own
+    work-cover consumption."""
+    if not isinstance(entry, dict):
+        return False
+    digest = str(entry.get("waiver_digest") or "")
+    if not APPROVAL_DIGEST_RE.fullmatch(digest):
+        return False
+    issued = latest_approval_event(events, digest, "issued")
+    consumed = latest_approval_event(events, digest, "consumed")
+    if issued is None or consumed is None:
+        return False
+    subject = issued.get("subject") if isinstance(issued.get("subject"), dict) else {}
+    expected = waiver_subject(work_id, project, entry.get("pathway"), entry.get("reason"))
+    return (
+        subject == expected
+        and approval_subject_digest(subject) == digest
+        and consumed.get("consumed_by") == f"work-cover:{work_id}:{entry.get('pathway')}"
+        and consumed.get("consumption_id") == entry.get("waiver_consumed_id")
+    )
+
+
 def proof_result_is_passing(result):
     """Return True only for an explicit pass-like proof result.
 
@@ -2746,6 +2913,9 @@ def proof_is_verified(proof):
             )
             and proof.get("release_verifier_bound") is True
             and not proof.get("release_verifier_errors")
+            and proof.get("release_approval_verified") is True
+            and bool(APPROVAL_DIGEST_RE.fullmatch(str(proof.get("release_approval_digest") or "")))
+            and bool(proof.get("release_approval_consumed_id"))
         )
     if proof.get("pathway") == "observability":
         verifier_digest = str(
@@ -3119,13 +3289,16 @@ def pathways_referenced_by_text(text):
     return sorted(found, key=pathway_sort_key)
 
 
-def proved_pathways_from_proofs(work_id, proofs):
+def proved_pathways_from_proofs(work_id, proofs, approval_events=None):
     """Evidence side of the itinerary join: every pathway carrying at least one genuinely-verified
     proof (`proof_is_verified` — a re-executed verifier that exited 0) for this work item, mapped
     to the run_id (or proof_id) that earned it. A verified proof proves its pathway no matter which
     command recorded it — an inline work-log, a later `proof-add`, or an earlier ledger row. Without
     this join, verification logged through `proof-add` never reached the itinerary and coverage
-    stalled at `logged_unverified` even after a verifier had passed."""
+    stalled at `logged_unverified` even after a verifier had passed.
+
+    Release proofs additionally require ledger corroboration of their approval claim against
+    `approval_events`; a caller that cannot supply the approvals ledger cannot credit release."""
     proved = {}
     for proof in proofs or []:
         if not isinstance(proof, dict) or proof.get("work_id") != work_id:
@@ -3133,6 +3306,9 @@ def proved_pathways_from_proofs(work_id, proofs):
         pathway = proof.get("pathway")
         if (pathway and pathway not in proved and proof_is_verified(proof)
                 and not proof_is_stale(proof)):
+            if (pathway == "release"
+                    and not release_approval_corroborated(proof, approval_events or [])):
+                continue
             proved[pathway] = proof.get("run_id") or proof.get("proof_id") or ""
     return proved
 
@@ -3701,7 +3877,8 @@ def resolve_project_dir(raw, projects_root=None):
     return str(p)
 
 
-def build_proof_record(args, work_item=None, run_id="", measurement_id_value="", projects_root=None):
+def build_proof_record(args, work_item=None, run_id="", measurement_id_value="", projects_root=None,
+                       paths=None):
     evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
     if not evidence_path or not Path(evidence_path).exists():
         return None, finding(
@@ -3735,8 +3912,34 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "project": project_name,
         "target_project": project_path,
     }
+    proof_id = proof_id_for(
+        evidence_path, args.work_id or "", args.pathway or "", proof_type,
+        args.recommendation_id or "")
+    # Approval peek (no consumption yet): a production release receipt only validates when a
+    # live single-use ticket — or this same proof's earlier consumption — is bound to the exact
+    # companion digest. Consumption itself waits until every other release gate has passed, so a
+    # failing verifier cannot burn Alex's ticket.
+    release_approval_subject_value = None
+    release_approval_available = False
+    if (args.pathway or "") == "release" and paths is not None:
+        _primary = Path(evidence_path).expanduser()
+        _candidate = _primary if _primary.suffix.lower() == ".json" else _primary.with_suffix(".json")
+        _peek_sha = ""
+        if _candidate.is_file() and not _candidate.is_symlink():
+            _peek_sha = sha256_file(_candidate)
+        if _peek_sha:
+            release_approval_subject_value = release_approval_subject(
+                args.work_id or "", project_name, _peek_sha)
+            _peek_digest = approval_subject_digest(release_approval_subject_value)
+            _peek_events = approval_events_for(paths)
+            _active, _refusal = find_active_approval(_peek_events, _peek_digest)
+            _prior = latest_approval_event(_peek_events, _peek_digest, "consumed")
+            release_approval_available = _active is not None or (
+                _prior is not None and _prior.get("consumed_by") == proof_id)
     release_receipt = (
-        release_receipt_from_evidence(evidence_path, proof_context, now=utc_now())
+        release_receipt_from_evidence(
+            evidence_path, proof_context, now=utc_now(),
+            production_approval=release_approval_available)
         if (args.pathway or "") == "release"
         else {
             "receipt": {}, "receipt_path": "", "receipt_sha256": "", "credit_scope": "",
@@ -3931,7 +4134,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         # Any byte change is a TOCTOU violation: the stdout may describe the pre-run state while
         # the ledger would otherwise retain a post-run receipt that says something different.
         release_post_artifact_sha256 = sha256_file(evidence_path)
-        post_receipt = release_receipt_from_evidence(evidence_path, proof_context, now=utc_now())
+        post_receipt = release_receipt_from_evidence(
+            evidence_path, proof_context, now=utc_now(),
+            production_approval=release_approval_available)
         release_post_receipt_sha256 = post_receipt["receipt_sha256"]
         release_post_release_artifact_sha256 = dict(post_receipt["artifact_sha256"])
         if release_post_artifact_sha256 != artifact_sha256:
@@ -4029,8 +4234,39 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         if (args.pathway or "") == "observability"
         else {"markers": {}, "errors": [], "bound": False, "mode": ""}
     )
+    # Consume the release approval ticket LAST, only when every other release gate has already
+    # passed, so a failed verifier, unstable snapshot, or unbound transcript never burns the
+    # single-use ticket. A refusal here records why and the proof simply does not credit.
+    release_approval_verified = False
+    release_approval_digest = ""
+    release_approval_consumed_id = ""
+    release_approval_error = ""
+    if (args.pathway or "") == "release":
+        if paths is None:
+            release_approval_error = "approval_context_unavailable"
+        elif release_approval_subject_value is None:
+            release_approval_error = "no_release_receipt_companion"
+        elif not (
+            exit_code == 0
+            and canary_mutant_failed is True
+            and release_receipt["credit_scope"] == "production"
+            and not release_receipt["errors"]
+            and release_snapshot_stable
+            and not release_snapshot_errors
+            and release_binding["bound"]
+        ):
+            release_approval_error = "release_evidence_not_creditable"
+        else:
+            _consumed_event, _refusal = consume_approval(
+                paths, release_approval_subject_value, proof_id)
+            if _consumed_event is None:
+                release_approval_error = f"approval_{_refusal}"
+            else:
+                release_approval_verified = True
+                release_approval_digest = _consumed_event.get("subject_digest", "")
+                release_approval_consumed_id = _consumed_event.get("consumption_id", "")
     proof = {
-        "proof_id": proof_id_for(evidence_path, args.work_id or "", args.pathway or "", proof_type, args.recommendation_id or ""),
+        "proof_id": proof_id,
         "timestamp": iso_now(),
         "proof_type": proof_type,
         "evidence_id": evidence_id_for_path(evidence_path),
@@ -4079,6 +4315,10 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "release_verifier_markers": release_binding["markers"],
         "release_verifier_errors": release_binding["errors"],
         "release_verifier_bound": release_binding["bound"],
+        "release_approval_verified": release_approval_verified,
+        "release_approval_digest": release_approval_digest,
+        "release_approval_consumed_id": release_approval_consumed_id,
+        "release_approval_error": release_approval_error,
         "observability_receipt": observability_receipt["receipt"],
         "observability_receipt_path": observability_receipt["receipt_path"],
         "observability_receipt_sha256": observability_receipt["receipt_sha256"],
@@ -4151,6 +4391,14 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             )
         elif proof.get("pathway") == "release" and proof.get("canary_mutant_failed") is not True:
             reason = "release proof requires a successful anti-gaming verifier canary."
+        elif proof.get("pathway") == "release" and not proof.get("release_approval_verified"):
+            reason = (
+                "production release credit requires a verified single-use human approval ticket "
+                f"(refusal: {proof.get('release_approval_error') or 'not_consumed'}). Have Alex "
+                "run `approval-issue --kind release-production-approval --work-id <id> "
+                "--release-receipt <receipt.json> --reason \"...\"`, then re-log within its "
+                "15-minute window."
+            )
         elif proof.get("pathway") == "observability" and proof.get("observability_receipt_errors"):
             reason = "the structured observability receipt is not creditable: " + "; ".join(
                 proof.get("observability_receipt_errors", [])[:3]
@@ -5726,7 +5974,8 @@ def work_status_summary(paths, work_id):
     stale = stale_measurements(measurements)
     pathways_seen = sorted(set(r.get("pathway") for r in runs if r.get("pathway")), key=pathway_sort_key)
     proof_records = read_ndjson(paths.proofs_path)
-    proved_pathway_map = proved_pathways_from_proofs(work_id, proof_records)
+    approval_events = approval_events_for(paths)
+    proved_pathway_map = proved_pathways_from_proofs(work_id, proof_records, approval_events)
     missing_core_pathways = [p for p in CORE_PATHWAYS if p not in pathways_seen]
     if item:
         profile = item.get("outcome_profile") or classify_outcome_profile(
@@ -5763,7 +6012,9 @@ def work_status_summary(paths, work_id):
                 and pathway not in proved_pathway_map
                 and (production_secure or recorded_receipt)
             )
-            if (production_secure and entry.get("status") == "na") or unsupported_proved:
+            waived = waiver_corroborated(
+                entry, work_id, (item or {}).get("project_name", ""), approval_events)
+            if (production_secure and entry.get("status") == "na" and not waived) or unsupported_proved:
                 entry["status"] = "required"
                 entry["proved_by_run"] = ""
     # Read-time credit: coverage must derive from the proof EVIDENCE, not only the persisted entry
@@ -5819,9 +6070,9 @@ def work_warnings(item, runs, measurements, open_controls, stale, itinerary_open
     if itinerary_open:
         if production_secure_waiver_locked(item):
             warnings.append(
-                f"{len(itinerary_open)} production-secure pathways still need verified proof; "
-                "N/A waivers are unavailable without a verified waiver authority: "
-                + ", ".join(itinerary_open) + "."
+                f"{len(itinerary_open)} production-secure pathways still need verified proof "
+                "or a verified single-use waiver ticket (approval-issue --kind "
+                "production-secure-waiver): " + ", ".join(itinerary_open) + "."
             )
         else:
             warnings.append(
@@ -6328,21 +6579,38 @@ def run_work_cover(args, paths):
             )],
             "records": [],
         }
+    waiver_consumption = None
     if args.na and production_secure_waiver_locked(item):
-        return {
-            "findings": [finding(
-                "work-cover-production-secure-na-blocked",
-                "daily-work",
-                "error",
-                "Production-secure pathway obligations cannot be waived by a free-text N/A reason.",
-                [line_evidence(paths.work_items_path, source=args.work_id)],
-                "Provide verified pathway proof. A future waiver requires a separately verified, "
-                f"single-use waiver authority; current state is {PRODUCTION_SECURE_WAIVER_STATE}.",
-                "static",
-                "high",
-            )],
-            "records": [],
-        }
+        refusal = "waiver_authority_not_configured"
+        if PRODUCTION_SECURE_WAIVER_STATE == "CONFIGURED_AND_VERIFIED":
+            refusal = "no_ticket"
+            if args.reason:
+                waiver_consumption, consume_refusal = consume_approval(
+                    paths,
+                    waiver_subject(
+                        args.work_id, item.get("project_name", ""), args.pathway, args.reason),
+                    f"work-cover:{args.work_id}:{args.pathway}",
+                )
+                if waiver_consumption is None:
+                    refusal = consume_refusal
+        if waiver_consumption is None:
+            return {
+                "findings": [finding(
+                    "work-cover-production-secure-na-blocked",
+                    "daily-work",
+                    "error",
+                    "Production-secure pathway obligations cannot be waived by a free-text N/A "
+                    f"reason (waiver ticket refusal: {refusal}).",
+                    [line_evidence(paths.work_items_path, source=args.work_id)],
+                    "Provide verified pathway proof, or have Alex issue a single-use waiver — "
+                    "`approval-issue --kind production-secure-waiver --work-id "
+                    f"{args.work_id} --pathway {args.pathway} --reason \"<exact reason>\"` — "
+                    "then re-run this exact work-cover within its 15-minute window.",
+                    "static",
+                    "high",
+                )],
+                "records": [],
+            }
     itinerary = list(item.get("itinerary") or [])
     entry = next((e for e in itinerary if e.get("pathway") == args.pathway), None)
     if args.add:
@@ -6406,8 +6674,15 @@ def run_work_cover(args, paths):
         if entry:
             entry["status"] = "na"
             entry["reason"] = args.reason
+            if waiver_consumption is not None:
+                entry["waiver_digest"] = waiver_consumption.get("subject_digest", "")
+                entry["waiver_consumed_id"] = waiver_consumption.get("consumption_id", "")
         else:
-            itinerary.append({"pathway": args.pathway, "status": "na", "reason": args.reason, "proved_by_run": ""})
+            na_entry = {"pathway": args.pathway, "status": "na", "reason": args.reason, "proved_by_run": ""}
+            if waiver_consumption is not None:
+                na_entry["waiver_digest"] = waiver_consumption.get("subject_digest", "")
+                na_entry["waiver_consumed_id"] = waiver_consumption.get("consumption_id", "")
+            itinerary.append(na_entry)
     item = update_work_item(paths, args.work_id, itinerary=itinerary)
     covered, total, open_required = itinerary_coverage(item)
     return {
@@ -6415,6 +6690,115 @@ def run_work_cover(args, paths):
         "findings": [],
         "work_id": args.work_id,
         "itinerary_coverage": {"covered": covered, "total": total, "open": open_required},
+    }
+
+
+def run_approval_issue(args, paths):
+    """Issue a single-use, content-bound approval or waiver ticket (Alex's deliberate act).
+
+    Mirrors ~/.claude/scripts/approve-send.py: SHA-256 subject digest, 15-minute expiry, single
+    use, append-only audit ledger. This is a forcing function and an audit trail, not a
+    cryptographic barrier — issuance is a separate, deliberate, recorded act bound to reviewed
+    content, and the standing rule is that Alex runs it."""
+    def _refuse(fid, message, remediation):
+        return {
+            "findings": [finding(
+                fid, "approval-authority", "error", message,
+                [line_evidence(paths.approvals_path, source=args.work_id or "")],
+                remediation, "static", "high",
+            )],
+            "records": [],
+        }
+
+    kind = (args.kind or "").strip()
+    if kind not in {APPROVAL_KIND_RELEASE, APPROVAL_KIND_WAIVER}:
+        return _refuse(
+            "approval-issue-unknown-kind",
+            f"approval-issue requires --kind {APPROVAL_KIND_RELEASE} or {APPROVAL_KIND_WAIVER}.",
+            "Re-run with one of the two supported ticket kinds.",
+        )
+    if not args.work_id:
+        return _refuse(
+            "approval-issue-missing-work-id",
+            "approval-issue requires --work-id so the ticket binds one outcome.",
+            "Pass the work_id created by work-start.",
+        )
+    reason = (args.reason or "").strip()
+    if not reason:
+        return _refuse(
+            "approval-issue-missing-reason",
+            "approval-issue requires --reason (why this approval is being granted).",
+            "Re-run with --reason; for waivers the reason is content-bound and must match the "
+            "work-cover --na reason byte for byte.",
+        )
+    item = next(
+        (w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
+    if item is None:
+        return _refuse(
+            "approval-issue-unknown-work-id",
+            f"No work item exists for {args.work_id}; a ticket cannot bind a missing outcome.",
+            "Check the work_id with work-status.",
+        )
+    project = item.get("project_name", "")
+    if kind == APPROVAL_KIND_WAIVER:
+        if (args.pathway or "") not in PATHWAY_CANON_ORDER:
+            return _refuse(
+                "approval-issue-missing-pathway",
+                "A production-secure waiver ticket requires --pathway (a canonical pathway name).",
+                f"Choose one of: {', '.join(PATHWAY_CANON_ORDER)}.",
+            )
+        subject = waiver_subject(args.work_id, project, args.pathway, reason)
+    else:
+        receipt_raw = (getattr(args, "release_receipt", None) or "").strip()
+        if not receipt_raw:
+            return _refuse(
+                "approval-issue-missing-receipt",
+                "A release production approval requires --release-receipt (the reviewed JSON "
+                "companion the ticket binds to).",
+                "Pass the exact release receipt JSON path Alex reviewed.",
+            )
+        receipt_path = Path(receipt_raw).expanduser()
+        if receipt_path.is_symlink() or not receipt_path.is_file():
+            return _refuse(
+                "approval-issue-receipt-unreadable",
+                "The release receipt must be an existing regular file (not a symlink).",
+                "Fix the path and re-run.",
+            )
+        receipt_sha = sha256_file(receipt_path)
+        if not receipt_sha:
+            return _refuse(
+                "approval-issue-receipt-unreadable",
+                "The release receipt could not be hashed.",
+                "Fix the file and re-run.",
+            )
+        subject = release_approval_subject(args.work_id, project, receipt_sha)
+    digest = approval_subject_digest(subject)
+    now = utc_now()
+    event = {
+        "event": "issued",
+        "kind": kind,
+        "subject_digest": digest,
+        "subject": subject,
+        "issued_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + timedelta(seconds=APPROVAL_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reason": reason,
+        "work_id": args.work_id,
+    }
+    write_ndjson(paths.approvals_path, approval_events_for(paths) + [event])
+    next_step = (
+        f"work-cover --work-id {args.work_id} --pathway {args.pathway} --na --reason "
+        "\"<the exact same reason>\""
+        if kind == APPROVAL_KIND_WAIVER
+        else f"work-log --work-id {args.work_id} --pathway release ... (the receipt must stay "
+        "byte-identical to what was just reviewed)"
+    )
+    return {
+        "findings": [],
+        "records": [event],
+        "subject_digest": digest,
+        "expires_in_seconds": APPROVAL_TTL_SECONDS,
+        "single_use": True,
+        "next_step": next_step,
     }
 
 
@@ -6572,7 +6956,7 @@ def run_work_log(args, paths):
     }
     proof = None
     if args.proof_type or args.verified_by or args.recommendation_id or getattr(args, "verify_cmd", None) or getattr(args, "reviewer", None):
-        proof, proof_finding = build_proof_record(args, work_item=item, run_id=run_id, measurement_id_value=measurement["measurement_id"], projects_root=paths.projects_root)
+        proof, proof_finding = build_proof_record(args, work_item=item, run_id=run_id, measurement_id_value=measurement["measurement_id"], projects_root=paths.projects_root, paths=paths)
         if proof_finding:
             findings.append(proof_finding)
         if proof:
@@ -6765,7 +7149,10 @@ def run_proof_add(args, paths):
         item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == proof["work_id"]), None)
         if item:
             itinerary = list(item.get("itinerary") or [])
-            if apply_proof_coverage(itinerary, proved_pathways_from_proofs(proof["work_id"], proofs)):
+            if apply_proof_coverage(
+                    itinerary,
+                    proved_pathways_from_proofs(
+                        proof["work_id"], proofs, approval_events_for(paths))):
                 item = update_work_item(paths, proof["work_id"], itinerary=itinerary)
             covered, total, open_required = itinerary_coverage(item)
             result["work_id"] = proof["work_id"]
@@ -10281,7 +10668,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Operating layer workflow CLI")
     parser.add_argument("subcommand", choices=[
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
-        "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily",
+        "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily", "approval-issue",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
         "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate", "all"
     ])
@@ -10330,6 +10717,7 @@ def build_parser():
     parser.add_argument("--tier", choices=list(PATHWAY_TIERS.keys()), help="work-start: target 'done' tier sizing the required-pathway itinerary (default live).")
     parser.add_argument("--na", action="store_true", help="work-cover: mark the pathway not-applicable (requires --reason).")
     parser.add_argument("--add", action="store_true", help="work-cover: append the pathway to the itinerary as newly required.")
+    parser.add_argument("--release-receipt", help="approval-issue: exact release receipt JSON the single-use production approval binds to.")
     return parser
 
 
@@ -10377,6 +10765,8 @@ def main(argv=None):
         result = run_work_close(args, paths)
     elif args.subcommand == "work-cover":
         result = run_work_cover(args, paths)
+    elif args.subcommand == "approval-issue":
+        result = run_approval_issue(args, paths)
     elif args.subcommand == "work-daily":
         result = run_work_daily(args, paths)
     elif args.subcommand == "proof-add":

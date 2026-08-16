@@ -1,0 +1,46 @@
+# Claims register — waiver/approval authority (2026-08-16)
+claims:
+  - id: terminal-states
+    claim: PRODUCTION_SECURE_WAIVER_STATE (line 587) and RELEASE_PRODUCTION_APPROVAL_STATE (line 984) are terminal fail-closed states with no configuration path
+    impact: high
+    source_ids: [engine-code, proof-integrity-doc]
+    status: verified
+  - id: release-canary-strict
+    claim: proof_is_verified requires canary_mutant_failed is True for release — a None canary (commit distance) does not credit release
+    impact: high
+    source_ids: [engine-code]
+    single_source: true
+    note: single-source acceptable — the code is the running system; contradicting memory-tier guidance was superseded (see CONTRADICTIONS.md)
+    status: verified
+  - id: na-blocked-and-reopened
+    claim: work-cover --na is rejected outright for production-secure items (line 6331) and every production-secure na row reopens at status time (line 5766)
+    impact: high
+    source_ids: [engine-code, engine-suite]
+    status: verified
+  - id: release-envelope-binding
+    claim: release production scope additionally requires envelope work_id/recommendation_id/target_project + fresh issued_at/expires_at and a stdout-bound verifier emitting RELEASE_RECEIPT_SHA256
+    impact: high
+    source_ids: [engine-code, proof-integrity-doc]
+    status: verified
+  - id: envelope-locked
+    claim: the transfern envelope is waiver-locked (profile production-secure-launch + production-mutation overlay) at 9/11 with release+observability open
+    impact: high
+    source_ids: [live-envelope]
+    single_source: true
+    note: single-source acceptable — the ledger is the authoritative state store for envelopes
+    status: verified
+  - id: receipt-shape
+    claim: the transfern release receipt is production-shaped but missing envelope binding fields
+    impact: high
+    source_ids: [transfern-receipt, engine-code]
+    status: verified
+  - id: mirror-pattern
+    claim: approve-send.py pattern = canonical-JSON SHA-256, single use, 900s TTL, append-only log, forcing-function framing
+    impact: high
+    source_ids: [approve-send, hard-block-memory]
+    status: verified
+  - id: suite-green
+    claim: suite is green (768/768) on the committed hardening wave (73d5395)
+    impact: high
+    source_ids: [engine-suite, engine-code]
+    status: verified

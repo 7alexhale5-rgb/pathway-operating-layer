@@ -76,28 +76,57 @@ canary, feature-flag change, rollback, or external send. It does not credit the
 release pathway or satisfy production readiness.
 
 Release pathway credit requires a Markdown evidence artifact plus a same-stem
-structured JSON receipt. Production credit is currently disabled until Pathway
-has an externally verifiable, fresh, single-use human approval receipt bound to
-the work, project, stage, release digest, and durable consumption state. Free
-text such as `human_approval` is only an attestation and cannot authorize a
-release or external send. A future production receipt must also bind an active
-or passed canary, production verification, and rehearsed or executed rollback
-artifacts. Production evidence binds the exact work ID, recommendation ID,
-resolved target project, and a fresh issued/expiry window of no more than 24
-hours. Release artifacts must be regular companion-directory filenames;
-absolute paths, traversal, and symlinks fail closed. The executed verifier must
-also trip Pathway's anti-gaming canary. A
+structured JSON receipt. Production credit additionally requires a consumed
+single-use approval ticket from the approval authority (below), bound to the
+work, project, stage, and the receipt's exact SHA-256; the consumption event in
+the approvals ledger is the durable state later decisions re-verify. Free text
+such as `human_approval` remains an attestation and cannot authorize a release
+or external send. A production receipt must also bind an active or passed
+canary, production verification, and rehearsed or executed rollback artifacts.
+Production evidence binds the exact work ID, recommendation ID, resolved target
+project, and a fresh issued/expiry window of no more than 24 hours. Release
+artifacts must be regular companion-directory filenames; absolute paths,
+traversal, and symlinks fail closed. The executed verifier must also trip
+Pathway's anti-gaming canary. A
 `NO_RELEASE`, `BLOCKED`, all-not-run, preview-only, invalid-template, or missing-
 canary record remains evidence of a hold and cannot be relabeled by passing
 `--result pass`.
 
-Production-secure itinerary obligations are non-waivable while no verified
-waiver authority exists. `work-cover --na` rejects free-text reasons for these
-outcomes, and status/closeout reopens any historical N/A row as required. It also
-reopens a persisted `proved` label whenever the current proof ledger lacks a
-non-stale proof that still passes the current verifier. A production-secure
-outcome closes only from current verified pathway proof, not from an assertion
-or cached status label.
+## Approval Authority (single-use waivers and production approvals)
+
+The approval authority mirrors the external-send approval script
+(`approve-send.py`): a ticket is content-bound by a SHA-256 over its canonical
+JSON subject, expires 15 minutes after issue, is consumable exactly once, and
+every issue and consumption appends to `operator-intelligence/approvals.ndjson`.
+It is a forcing function and an audit trail, not a cryptographic barrier —
+issuing is a separate, deliberate, recorded act bound to reviewed content, and
+the standing rule is that Alex issues every ticket
+(`approval-issue --kind release-production-approval | production-secure-waiver`).
+
+Two subjects exist. A release production approval binds kind, work ID, project,
+stage, and the release receipt's exact SHA-256, so editing one byte of the
+approved receipt orphans the ticket. A production-secure waiver binds kind,
+work ID, project, pathway, and the exact reason text, so `work-cover --na` must
+repeat the reviewed reason byte for byte. Consumption is bound to one consumer
+(the release proof's `proof_id`, or `work-cover:<work_id>:<pathway>`);
+re-consumption by the same consumer is idempotent, any other consumer is
+refused. Consumed, expired, subject-mismatched, or missing tickets fail closed
+with the refusal named. Release proofs consume their ticket only after every
+other release gate has passed, so a failing verifier never burns a ticket.
+
+The proof row is never the trust root: status recomputation re-joins every
+claim against the approvals ledger. A release proof whose claimed approval
+digest lacks a matching issued subject and a consumption bound to that exact
+proof loses credit and reopens; a production-secure `na` row keeps its waiver
+only while the ledger corroborates it.
+
+Production-secure itinerary obligations are otherwise non-waivable.
+`work-cover --na` rejects free-text reasons without a live matching waiver
+ticket, and status/closeout reopens any historical or uncorroborated N/A row as
+required. It also reopens a persisted `proved` label whenever the current proof
+ledger lacks a non-stale proof that still passes the current verifier. A
+production-secure outcome closes only from current verified pathway proof or a
+ledger-corroborated waiver, not from an assertion or cached status label.
 
 Pathway hashes the Markdown evidence, structured receipt, and every referenced
 release artifact before running the verifier. It re-reads and hashes the same

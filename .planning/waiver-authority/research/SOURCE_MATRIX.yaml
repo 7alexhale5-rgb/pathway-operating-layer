@@ -1,0 +1,54 @@
+# Source matrix — waiver/approval authority (2026-08-16)
+# Layer exemptions (single-operator internal engineering build):
+#   market: not applicable — internal tooling, no market dimension
+#   community: not applicable — private operator tooling, no community sources
+#   multimedia: not applicable — no media sources involved
+sources:
+  - id: engine-code
+    layer: implementation
+    date: 2026-08-16
+    credibility: high
+    path: /Users/alexhale/Projects/pathway-operating-layer/scripts/operating-layer.py
+    note: direct Read this session (lines 575-650, 960-1342, 2561-2810, 4020-4180, 5730-5832, 6300-6438)
+  - id: engine-suite
+    layer: local
+    date: 2026-08-16
+    credibility: high
+    path: /Users/alexhale/Projects/pathway-operating-layer/scripts/tests/operating_layer_test.py
+    note: executed this session, 768/768 green on commit 73d5395
+  - id: approve-send
+    layer: internal
+    date: 2026-08-16
+    credibility: high
+    path: /Users/alexhale/.claude/scripts/approve-send.py
+    note: full Read; the shipped pattern this build mirrors
+  - id: live-envelope
+    layer: primary
+    date: 2026-08-16
+    credibility: high
+    path: /Users/alexhale/Projects/memory-vault/operator-intelligence/work-items.ndjson
+    note: probed via work-status --json for W-20260816-transfern-validate-transfern-live--5ff13d
+  - id: transfern-receipt
+    layer: primary
+    date: 2026-08-16
+    credibility: high
+    path: /Users/alexhale/Projects/transfern/docs/release-rollback-rehearsal.json
+    note: full Read; file self-dated 2026-08-16
+  - id: proof-integrity-doc
+    layer: internal
+    date: 2026-08-16
+    credibility: high
+    path: /Users/alexhale/Projects/pathway-operating-layer/docs/pathway-proof-integrity.md
+    note: full diff Read; matches code in every checked claim
+  - id: canary-memory
+    layer: expert
+    date: 2026-08-16
+    credibility: medium
+    path: /Users/alexhale/.claude/projects/-Users-alexhale/memory/feedback_pathway_canary_verifier_pattern.md
+    note: memory tier; release canary strictness re-verified in code this session
+  - id: hard-block-memory
+    layer: expert
+    date: 2026-08-16
+    credibility: medium
+    path: /Users/alexhale/.claude/projects/-Users-alexhale/memory/feedback_release_and_observability_cannot_credit_on_this_machine.md
+    note: memory tier; constants re-verified in code; superseded by this build once shipped

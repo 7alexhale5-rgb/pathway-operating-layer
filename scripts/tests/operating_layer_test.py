@@ -5604,6 +5604,261 @@ def test_artifact_filename_dates_use_local_day_not_utc():
     )
 
 
+def test_approval_authority_single_use_waiver_and_release_credit():
+    """The verifiable single-use waiver/approval authority (SPEC 2026-08-16): content-bound
+    tickets, 15-minute expiry, single-use durable consumption, fail-closed refusals, and
+    status-time ledger corroboration for both waived N/A rows and release production credit."""
+    opl = load_cli("approval_authority")
+    reset()
+    proj = ROOT / "projects" / "approval-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    ev = ROOT / "approval-evidence.txt"
+    ev.write_text("artifact", encoding="utf-8")
+    approvals_path = ROOT / "out/operator-intelligence/approvals.ndjson"
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+
+    # Criterion 1: canonical digest — key order never changes it, any field edit does.
+    subject = {"kind": "production-secure-waiver", "work_id": "W-x", "project": "p",
+               "pathway": "release", "reason": "r"}
+    reordered = {"reason": "r", "pathway": "release", "project": "p", "work_id": "W-x",
+                 "kind": "production-secure-waiver"}
+    check(opl.approval_subject_digest(subject) == opl.approval_subject_digest(reordered),
+          "approval digest is stable under subject key reordering")
+    check(opl.approval_subject_digest({**subject, "reason": "r2"})
+          != opl.approval_subject_digest(subject),
+          "editing any bound field changes the approval digest")
+
+    data, _ = run("work-start", ["--project", str(proj),
+                                 "--goal", "production secure approval authority regression",
+                                 "--tier", "production-secure"])
+    wid = data["work_id"]
+
+    # Criterion 3: production-secure N/A without a ticket stays fail-closed.
+    blocked, _ = run("work-cover", ["--work-id", wid, "--pathway", "observability", "--na",
+                                    "--reason", "watcher and health endpoint are live"])
+    check("work-cover-production-secure-na-blocked" in ids(blocked),
+          "production-secure N/A without a waiver ticket is refused")
+
+    # Criterion 2: approval-issue writes an issued event with a 900-second validity window.
+    issued, _ = run("approval-issue", ["--kind", "production-secure-waiver", "--work-id", wid,
+                                       "--pathway", "observability",
+                                       "--reason", "watcher and health endpoint are live"])
+    check(bool(issued.get("subject_digest")) and issued.get("expires_in_seconds") == 900
+          and issued.get("single_use") is True,
+          "approval-issue returns a digest with a 900-second single-use window")
+    ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    issued_event = ledger[-1]
+    window = (opl.parse_ts(issued_event["expires_at"])
+              - opl.parse_ts(issued_event["issued_at"])).total_seconds()
+    check(issued_event["event"] == "issued" and window == 900,
+          "the issued ledger event carries the exact 15-minute validity window")
+
+    # Criterion 7: a reason edit is a different subject — the ticket does not match.
+    mismatch, _ = run("work-cover", ["--work-id", wid, "--pathway", "observability", "--na",
+                                     "--reason", "a different reason"])
+    check("work-cover-production-secure-na-blocked" in ids(mismatch),
+          "a waiver ticket bound to a different reason cannot be consumed")
+
+    # Criterion 4: the exact subject consumes once and stamps the row with its waiver receipt.
+    covered, _ = run("work-cover", ["--work-id", wid, "--pathway", "observability", "--na",
+                                    "--reason", "watcher and health endpoint are live"])
+    obs_entry = next(e for e in covered["records"][0]["itinerary"]
+                     if e["pathway"] == "observability")
+    check(obs_entry["status"] == "na"
+          and obs_entry.get("waiver_digest") == issued.get("subject_digest")
+          and bool(obs_entry.get("waiver_consumed_id")),
+          "a matching active ticket marks the row N/A with its waiver digest and consumption id")
+    ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    consumed_events = [e for e in ledger if e.get("event") == "consumed"]
+    check(len(consumed_events) == 1
+          and consumed_events[0].get("consumed_by") == f"work-cover:{wid}:observability",
+          "consumption appends one durable ledger event bound to the consuming work-cover")
+
+    # Criterion 5: the consumed ticket cannot be spent by any other consumer.
+    class _ApprovalPaths:
+        pass
+    ns = _ApprovalPaths()
+    ns.approvals_path = approvals_path
+    replayed, replay_refusal = opl.consume_approval(
+        ns, issued_event["subject"], "work-cover:W-other:observability")
+    check(replayed is None and replay_refusal == "consumed",
+          "a consumed ticket is refused for any other consumer")
+
+    # Criterion 6: an expired ticket fails closed.
+    run("approval-issue", ["--kind", "production-secure-waiver", "--work-id", wid,
+                           "--pathway", "techdebt", "--reason", "debt paid in the same change"])
+    ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    for event in ledger:
+        if event.get("event") == "issued" and event.get("subject", {}).get("pathway") == "techdebt":
+            event["issued_at"] = "2026-01-01T00:00:00Z"
+            event["expires_at"] = "2026-01-01T00:15:00Z"
+    approvals_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in ledger), encoding="utf-8")
+    expired, _ = run("work-cover", ["--work-id", wid, "--pathway", "techdebt", "--na",
+                                    "--reason", "debt paid in the same change"])
+    check("work-cover-production-secure-na-blocked" in ids(expired)
+          and any("expired" in json.dumps(f) for f in expired.get("findings", [])),
+          "an expired waiver ticket is refused by name")
+
+    # Criterion 8: status recomputation keeps the corroborated N/A row, reopens a forged one,
+    # and reopens a tampered waiver digest.
+    status, _ = run("work-status", ["--work-id", wid])
+    states = {e["pathway"]: e["status"] for e in status["summary"]["itinerary"]}
+    check(states["observability"] == "na",
+          "a ledger-corroborated waived row survives status recomputation")
+    items = [json.loads(line) for line in work_items_path.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    for item in items:
+        if item.get("work_id") == wid:
+            for entry in item.get("itinerary", []):
+                if entry.get("pathway") == "security":
+                    entry["status"] = "na"
+                    entry["reason"] = "forged free-text waiver"
+                if entry.get("pathway") == "observability":
+                    entry["waiver_digest"] = "0" * 64
+    work_items_path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in items), encoding="utf-8")
+    tampered_status, _ = run("work-status", ["--work-id", wid])
+    tampered_states = {e["pathway"]: e["status"]
+                       for e in tampered_status["summary"]["itinerary"]}
+    check(tampered_states["security"] == "required",
+          "an un-waivered production-secure N/A row still reopens")
+    check(tampered_states["observability"] == "required",
+          "a tampered waiver digest loses its corroboration and the row reopens")
+    recovered, _ = run("work-cover", ["--work-id", wid, "--pathway", "observability", "--na",
+                                      "--reason", "watcher and health endpoint are live"])
+    recovered_entry = next(e for e in recovered["records"][0]["itinerary"]
+                           if e["pathway"] == "observability")
+    check(recovered_entry["status"] == "na"
+          and recovered_entry.get("waiver_digest") == issued.get("subject_digest"),
+          "re-covering with the identical subject restores the earned waiver idempotently")
+
+    # Criteria 9 + 10: release production credit requires the single-use approval ticket.
+    subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.name", "Pathway Test"], check=True)
+    release_guard = proj / "release-guard.txt"
+    release_guard.write_text("BASELINE\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "release-guard.txt"], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m", "fixture baseline"], check=True)
+    release_guard.write_text("PRODUCTION_RELEASE_READY\n", encoding="utf-8")
+    recommendation_id = "REC-approval-authority"
+    release_now = opl.utc_now()
+    release_evidence = write("out/operator-artifacts/approval-release.md", """# Release Verification
+
+## Summary
+Release preflight is complete and rollback is verified.
+
+## What Changed
+- Pinned the rollback sequence.
+
+## More Relevant
+- Production approval authority regression.
+
+## Less Relevant
+- Preview-only planning.
+
+## Next Pathway Must Use
+- Docs must record the approval trail.
+
+## Do Not Do Yet
+- Do not send externally.
+
+## Open Decisions
+- None.
+
+## Active Risk Overlays
+- rollback
+""")
+    receipt_path = write("out/operator-artifacts/approval-release.json", json.dumps({
+        "work_id": wid,
+        "recommendation_id": recommendation_id,
+        "target_project": str(proj.resolve()),
+        "issued_at": release_now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (release_now + opl.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "release_decision": {
+            "decision": "RELEASE", "release_gate": "PASS", "pathway_result": "PASS",
+            "deployed": True, "production_mutation_performed": True,
+            "current_authorized_stage": "PRODUCTION",
+        },
+        "release_receipt": {
+            "preview_status": "ready", "canary_status": "passed", "production_status": "deployed",
+            "rollback_status": "rehearsed", "external_send_state": "not-sent",
+            "feature_flag_state": "disabled", "deploy_artifact": "deploy.json",
+            "verification_artifact": "verification.json", "canary_artifact": "canary.json",
+            "rollback_artifact": "rollback.json", "human_approval": "see approval ledger",
+        },
+    }))
+    for artifact_name in ("deploy.json", "verification.json", "canary.json", "rollback.json"):
+        write(f"out/operator-artifacts/{artifact_name}", json.dumps({"fixture": artifact_name}))
+    receipt_sha = opl.sha256_file(receipt_path)
+    release_verify = (
+        "grep PRODUCTION_RELEASE_READY release-guard.txt && "
+        "printf 'RELEASE_DECISION=RELEASE\\nRELEASE_GATE=PASS\\nPATHWAY_RESULT=PASS\\n"
+        "PRODUCTION_STATUS=DEPLOYED\\nCANARY_STATUS=PASSED\\nROLLBACK_STATUS=REHEARSED\\n"
+        f"RELEASE_RECEIPT_SHA256={receipt_sha}\\n'"
+    )
+    release_log_args = ["--work-id", wid, "--pathway", "release", "--kind", "verify",
+                        "--evidence", str(release_evidence), "--result", "pass",
+                        "--proof-type", "artifact", "--project", str(proj),
+                        "--verify-cmd", release_verify,
+                        "--canary-target", str(release_guard),
+                        "--recommendation-id", recommendation_id]
+    proofs_path = ROOT / "out/operator-intelligence/proofs.ndjson"
+
+    def persisted_release_proof():
+        return next(
+            row for row in (
+                json.loads(line)
+                for line in proofs_path.read_text(encoding="utf-8").splitlines() if line.strip()
+            )
+            if row.get("pathway") == "release" and row.get("work_id") == wid
+        )
+
+    run("work-log", release_log_args)
+    unapproved_proof = persisted_release_proof()
+    check(unapproved_proof.get("release_approval_verified") is False
+          and not opl.proof_is_verified(unapproved_proof),
+          "a production release receipt without an approval ticket cannot credit")
+    unapproved_status, _ = run("work-status", ["--work-id", wid])
+    check({e["pathway"]: e["status"]
+           for e in unapproved_status["summary"]["itinerary"]}["release"] == "required",
+          "release stays open after an unapproved production log attempt")
+
+    approved_issue, _ = run("approval-issue", [
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(receipt_path), "--reason", "fixture production approval"])
+    check(bool(approved_issue.get("subject_digest")),
+          "approval-issue binds a release ticket to the exact receipt digest")
+    run("work-log", release_log_args)
+    approved_proof = persisted_release_proof()
+    check(approved_proof.get("release_approval_verified") is True
+          and bool(approved_proof.get("release_approval_consumed_id"))
+          and approved_proof.get("release_approval_digest") == approved_issue.get("subject_digest")
+          and opl.proof_is_verified(approved_proof),
+          "the same evidence credits once a single-use approval ticket is consumed")
+    approved_status, _ = run("work-status", ["--work-id", wid])
+    check({e["pathway"]: e["status"]
+           for e in approved_status["summary"]["itinerary"]}["release"] == "proved",
+          "release flips to proved through the approved, corroborated proof")
+
+    # Criterion 10 tail: deleting the consumption from the ledger kills the credit at status time.
+    ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    pruned = [event for event in ledger
+              if not (event.get("event") == "consumed"
+                      and event.get("kind") == "release-production-approval")]
+    approvals_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in pruned), encoding="utf-8")
+    uncorroborated_status, _ = run("work-status", ["--work-id", wid])
+    check({e["pathway"]: e["status"]
+           for e in uncorroborated_status["summary"]["itinerary"]}["release"] == "required",
+          "a release proof whose approval is missing from the ledger loses credit at status time")
+
+
 def main():
     tests = [
         test_resolve_project_dir_nesting_and_unverified_proof_loudness,
@@ -5646,6 +5901,7 @@ def main():
         test_project_scoping_no_substring_bleed,
         test_pathway_execution_profile_invariants,
         test_itinerary_coverage_guarantee,
+        test_approval_authority_single_use_waiver_and_release_credit,
         test_proof_add_flips_itinerary_coverage,
         test_proof_add_resolves_bare_project_name_and_flags_invalid_cwd,
         test_proof_requires_verifier_not_just_presence,
