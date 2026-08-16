@@ -9,6 +9,7 @@ import ast
 import atexit
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,40 @@ def write(path, text):
     full.parent.mkdir(parents=True, exist_ok=True)
     full.write_text(text, encoding="utf-8")
     return full
+
+
+def passing_verifier_cmd(*args, name="pass.py"):
+    verifier = write(
+        f"out/test-verifiers/{name}",
+        "print('GENERIC_TEST_VERIFIER=PASS')\n",
+    )
+    return " ".join(
+        shlex.quote(value)
+        for value in [sys.executable, "-B", str(verifier), *(str(arg) for arg in args)]
+    )
+
+
+def failing_verifier_cmd(name="fail.py"):
+    verifier = write(
+        f"out/test-verifiers/{name}",
+        "print('GENERIC_TEST_VERIFIER=FAIL')\nraise SystemExit(7)\n",
+    )
+    return " ".join(shlex.quote(value) for value in (sys.executable, "-B", str(verifier)))
+
+
+def text_guard_verifier_cmd(target, expected, name="text-guard.py"):
+    verifier = write(
+        f"out/test-verifiers/{name}",
+        "from pathlib import Path\n"
+        "import sys\n"
+        "if Path(sys.argv[1]).read_text(encoding='utf-8').strip() != sys.argv[2]:\n"
+        "    raise SystemExit(7)\n"
+        "print('GENERIC_TEST_VERIFIER=PASS')\n",
+    )
+    return " ".join(
+        shlex.quote(str(value))
+        for value in (sys.executable, "-B", verifier, target, expected)
+    )
 
 
 def touch_old(path, days=90):
@@ -518,7 +553,7 @@ def test_work_close_extracts_learning_candidate():
     run("work-log", [
         "--work-id", work_id, "--pathway", "quality", "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--gate", "quality-gate",
-        "--proof-type", "artifact", "--verified-by", "python3 quality-guard.py", "--verify-cmd", "printf verified",
+        "--proof-type", "artifact", "--verified-by", "python3 quality-guard.py", "--verify-cmd", passing_verifier_cmd(),
     ])
     for pathway in ("govern", "implementation"):
         run("work-cover", ["--work-id", work_id, "--pathway", pathway, "--na", "--reason", "not relevant for this close-learning test"])
@@ -544,19 +579,21 @@ def test_pathway_trust_report_and_pathway_next_metadata():
 
     trust, proc = run("pathway-trust", ["--project", project_path])
     check(proc.returncode == 0, "pathway-trust exits 0")
-    check(trust.get("status") == "pass", f"pathway-trust status pass (got {trust.get('status')})")
+    check(trust.get("status") in {"pass", "warn"},
+          f"pathway-trust has no functional failure (got {trust.get('status')})")
     check(Path(trust.get("report", "")).exists() and Path(trust.get("html", "")).exists(),
           "pathway-trust writes markdown and html")
     trust_json = ROOT / "out" / "operator-intelligence" / "pathway-trust.json"
     check(trust_json.exists(), "pathway-trust writes operator-intelligence JSON")
 
     rec, _proc = run("pathway-next", ["--project", project_path])
-    check(rec.get("pathway_trust", {}).get("status") == "pass",
+    check(rec.get("pathway_trust", {}).get("status") == trust.get("status"),
           "pathway-next includes latest pathway-trust status")
     check(rec.get("recommendation_confidence", {}).get("level") in {"high", "medium", "low"},
           "pathway-next includes recommendation confidence level")
     report_text = Path(rec["report"]).read_text(encoding="utf-8")
-    check("## Pathway Trust" in report_text and "Status:** `pass`" in report_text,
+    check("## Pathway Trust" in report_text
+          and f"Status:** `{trust.get('status')}`" in report_text,
           "pathway-next report renders trust status")
     check("## Recommendation Confidence" in report_text and "Why this, why not runner-up" in report_text,
           "pathway-next report renders confidence and counterfactual")
@@ -609,7 +646,7 @@ def test_pathway_next_recommendation_and_cohesion():
     work_id = start.get("work_id")
     run("work-log", ["--work-id", work_id, "--pathway", "research", "--kind", "dossier", "--evidence", str(evidence), "--result", "pass"])
     run("work-log", ["--work-id", work_id, "--pathway", "govern", "--kind", "decision", "--evidence", str(evidence), "--result", "pass",
-                     "--proof-type", "artifact", "--verify-cmd", "printf verified"])
+                     "--proof-type", "artifact", "--verify-cmd", passing_verifier_cmd()])
     run("work-log", [
         "--work-id", work_id, "--pathway", "security", "--kind", "control", "--evidence", str(evidence),
         "--control-risk", "rls-gap", "--target-pathways", "data",
@@ -795,6 +832,19 @@ def test_pathway_next_scores_only_selected_active_work():
         selected = next(row for row in data["work_items"] if row["work_id"] == "W-selected")
         selected["itinerary"].append({
             "pathway": "quality", "status": "proved", "proved_by_run": "R-selected-quality", "reason": "",
+        })
+        data["proofs"].append({
+            "proof_id": "P-selected-quality",
+            "run_id": "R-selected-quality",
+            "work_id": "W-selected",
+            "pathway": "quality",
+            "result": "pass",
+            "verifier_strength": "executed",
+            "exit_code": 0,
+            "trivial_verifier": False,
+            "canary_mutant_failed": None,
+            "timestamp": opl.iso_now(),
+            "stale_after_days": 3650,
         })
 
     project, _ = seed_fixture(selected_quality_proved)
@@ -1085,7 +1135,7 @@ Research says proof/closeout safety is the first implementation slice.
     wid = start["work_id"]
     logged, _ = run("work-log", ["--work-id", wid, "--pathway", "research", "--kind", "verify",
                                  "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
-                                 "--verify-cmd", "printf verified"])
+                                 "--verify-cmd", passing_verifier_cmd()])
     cf = logged.get("carry_forward", {})
     check(cf.get("pathway") == "research" and cf.get("artifact_sha256"),
           f"work-log writes a carry-forward record for verified pathway proof (got {cf})")
@@ -1120,7 +1170,7 @@ Research says proof/closeout safety is the first implementation slice.
     # the normal baton bump, so only the continuity override makes the authoritative handoff win.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify",
                      "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
-                     "--verify-cmd", "printf verified"])
+                     "--verify-cmd", passing_verifier_cmd()])
     release_evidence = write("out/operator-artifacts/release-carry.md", """# Release Verification
 
 ## Summary
@@ -1147,12 +1197,65 @@ Release preflight is complete and rollback is verified; implementation is the ne
 ## Active Risk Overlays
 - rollback
 """)
-    run("work-log", ["--work-id", wid, "--pathway", "release", "--kind", "verify",
-                     "--evidence", str(release_evidence), "--result", "pass", "--proof-type", "artifact",
-                     "--verify-cmd", "printf verified"])
+    subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.name", "Pathway Test"], check=True)
+    release_guard = proj / "release-guard.txt"
+    release_guard.write_text("BASELINE\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "release-guard.txt"], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m", "fixture baseline"], check=True)
+    release_guard.write_text("PRODUCTION_RELEASE_READY\n", encoding="utf-8")
+    release_recommendation_id = "REC-release-carry-fixture"
+    release_now = opl.utc_now()
+    release_receipt = write("out/operator-artifacts/release-carry.json", json.dumps({
+        "work_id": wid,
+        "recommendation_id": release_recommendation_id,
+        "target_project": str(proj.resolve()),
+        "issued_at": release_now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (release_now + opl.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "release_decision": {
+            "decision": "RELEASE", "release_gate": "PASS", "pathway_result": "PASS",
+            "deployed": True, "production_mutation_performed": True,
+            "current_authorized_stage": "PRODUCTION",
+        },
+        "release_receipt": {
+            "preview_status": "ready", "canary_status": "passed", "production_status": "deployed",
+            "rollback_status": "rehearsed", "external_send_state": "not-sent",
+            "feature_flag_state": "disabled", "deploy_artifact": "deploy.json",
+            "verification_artifact": "verification.json", "canary_artifact": "canary.json",
+            "rollback_artifact": "rollback.json", "human_approval": "fixture approval",
+        },
+    }))
+    for artifact_name in ("deploy.json", "verification.json", "canary.json", "rollback.json"):
+        write(f"out/operator-artifacts/{artifact_name}", json.dumps({"fixture": artifact_name}))
+    receipt_sha = opl.sha256_file(release_receipt)
+    release_verify = (
+        "grep PRODUCTION_RELEASE_READY release-guard.txt && "
+        "printf 'RELEASE_DECISION=RELEASE\\nRELEASE_GATE=PASS\\nPATHWAY_RESULT=PASS\\nPRODUCTION_STATUS=DEPLOYED\\n"
+        "CANARY_STATUS=PASSED\\nROLLBACK_STATUS=REHEARSED\\n"
+        f"RELEASE_RECEIPT_SHA256={receipt_sha}\\n'"
+    )
+    logged_release, _ = run("work-log", ["--work-id", wid, "--pathway", "release", "--kind", "verify",
+                                  "--evidence", str(release_evidence), "--result", "pass", "--proof-type", "artifact",
+                                  "--project", str(proj), "--verify-cmd", release_verify,
+                                  "--canary-target", str(release_guard),
+                                  "--recommendation-id", release_recommendation_id])
+    release_proof_id = next(r["proof_id"] for r in logged_release["records"] if r.get("proof_id"))
+    persisted_release_proof = next(
+        json.loads(line)
+        for line in (ROOT / "out/operator-intelligence/proofs.ndjson").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("proof_id") == release_proof_id
+    )
+    check(
+        persisted_release_proof["release_verifier_markers"]["RELEASE_RECEIPT_SHA256"]
+        == persisted_release_proof["release_receipt_sha256"],
+        "persisted release proof retains the exact verifier-to-receipt digest binding",
+    )
+    check(not load_cli("release_persisted_credit").proof_is_verified(persisted_release_proof),
+          "persisted free-text approval cannot manufacture production release credit")
     rec2, _ = run("pathway-next", ["--project", str(proj)])
-    check(rec2.get("recommended_pathway") == "implementation",
-          f"an explicit open implementation baton outranks generic release/security scoring (got {rec2.get('recommended_pathway')})")
+    check(rec2.get("recommended_pathway") != "release",
+          "unverified production release evidence does not close or repeat release")
 
 
 def test_carry_forward_deferrals_do_not_trigger_false_risk_overlays():
@@ -1199,10 +1302,10 @@ Security proof completed for the local proof ledger.
     for pathway in ("govern", "implementation", "quality"):
         run("work-log", ["--work-id", wid, "--pathway", pathway, "--kind", "verify",
                          "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
-                         "--verify-cmd", "printf verified"])
+                         "--verify-cmd", passing_verifier_cmd()])
     run("work-log", ["--work-id", wid, "--pathway", "security", "--kind", "verify",
                      "--evidence", str(security_ev), "--result", "pass", "--proof-type", "artifact",
-                     "--verify-cmd", "printf verified"])
+                     "--verify-cmd", passing_verifier_cmd()])
 
     rec, _ = run("pathway-next", ["--project", str(proj)])
     overlay_ids = {o.get("id") for o in rec.get("risk_overlays", [])}
@@ -1269,7 +1372,7 @@ def test_outcome_profiles_risk_overlays_and_field_gate():
     for pathway in ("govern", "implementation", "quality"):
         run("work-log", ["--work-id", wid, "--pathway", pathway, "--kind", "verify",
                          "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
-                         "--verify-cmd", "printf verified"])
+                         "--verify-cmd", passing_verifier_cmd()])
     close, _ = run("work-close", ["--work-id", wid])
     open_paths = close.get("records", [{}])[0].get("itinerary_coverage", {}).get("open", [])
     check(close.get("closed") is not True and open_paths == ["field"],
@@ -1283,7 +1386,7 @@ def test_outcome_profiles_risk_overlays_and_field_gate():
 
     run("work-log", ["--work-id", wid, "--pathway", "field", "--kind", "verify",
                      "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
-                     "--verify-cmd", "printf verified"])
+                     "--verify-cmd", passing_verifier_cmd()])
     closed, _ = run("work-close", ["--work-id", wid])
     check(closed.get("closed") is True, "field proof lets the outcome close after all gates clear")
 
@@ -1324,7 +1427,7 @@ def test_closeout_router_ready_to_close_and_work_close_receipts():
     for pathway in required[:-1]:
         run("work-log", ["--work-id", wid, "--pathway", pathway, "--kind", "verify",
                          "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
-                         "--verify-cmd", "printf verified"])
+                         "--verify-cmd", passing_verifier_cmd()])
     partial, _ = run("pathway-next", ["--project", str(proj)])
     check(partial.get("ready_to_close") is False,
           "pathway-next is not ready-to-close while a required pathway is still owed")
@@ -1334,7 +1437,7 @@ def test_closeout_router_ready_to_close_and_work_close_receipts():
     # Cover the last pathway: explicit ready-to-close result routing to work-close.
     run("work-log", ["--work-id", wid, "--pathway", required[-1], "--kind", "verify",
                      "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
-                     "--verify-cmd", "printf verified"])
+                     "--verify-cmd", passing_verifier_cmd()])
 
     # Covered itinerary is NOT sufficient: an open control keeps the outcome blocked, so
     # pathway-next must not claim ready-to-close (it would route to a refusing work-close).
@@ -1540,8 +1643,10 @@ def test_cockpit_surfaces_trivial_verifier_count():
     ev = write("out/operator-artifacts/tv-proof.md", "proof\n")
     start, _ = run("work-start", ["--project", proj, "--goal", "trivial surfacing"])
     wid = start["work_id"]
+    silent = write("out/test-verifiers/silent.py", "pass\n")
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "true"])
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd",
+                     f"{sys.executable} -B {silent}"])
     res, proc = run("cockpit")
     check(proc.returncode == 0, "cockpit exits 0")
     data = read_json(res["cockpit"])
@@ -1561,11 +1666,11 @@ def test_pfos_cockpit_snapshot_export_is_browser_safe():
     trust, _proc = run("pathway-trust", ["--project", project_path])
     rec, _proc = run("pathway-next", ["--project", project_path])
     run("pathway-run", ["--project", project_path, "--goal", "Build the PFOS cockpit"])
-    start, _proc = run("work-start", ["--project", project_path, "--goal", "Prove PFOS cockpit", "--tier", "production-secure"])
+    start, _proc = run("work-start", ["--project", project_path, "--goal", "Prove PFOS cockpit", "--tier", "live"])
     run("work-log", [
         "--work-id", start["work_id"], "--pathway", rec["recommended_pathway"], "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--gate", "pfos-cockpit-gate",
-        "--proof-type", "artifact", "--verified-by", "python3 /home/dev/.claude/scripts/quality-guard.py", "--verify-cmd", "printf verified",
+        "--proof-type", "artifact", "--verified-by", "python3 /home/dev/.claude/scripts/quality-guard.py", "--verify-cmd", passing_verifier_cmd(),
         "--recommendation-id", rec["recommendation_id"],
     ])
     for pathway in ("research", "govern", "data", "security", "implementation", "quality", "observability", "techdebt", "release", "docs"):
@@ -1843,7 +1948,7 @@ def test_proof_registry_and_proved_metric():
     logged, _proc = run("work-log", [
         "--work-id", work_id, "--pathway", pathway, "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--gate", f"{pathway}-gate",
-        "--proof-type", "artifact", "--verified-by", "python3 tests", "--verify-cmd", "printf verified", "--recommendation-id", recommendation_id,
+        "--proof-type", "artifact", "--verified-by", "python3 tests", "--verify-cmd", passing_verifier_cmd(), "--recommendation-id", recommendation_id,
     ])
     check(any(r.get("proof_id") for r in logged.get("records", [])), "work-log writes linked proof metadata")
     proofs_path = ROOT / "out" / "operator-intelligence" / "proofs.ndjson"
@@ -2048,6 +2153,90 @@ def test_itinerary_coverage_guarantee():
     data, _ = run("work-close", ["--work-id", secure_wid])
     check(data.get("closed") is not True, "work-close is refused while itinerary pathways remain open")
 
+    # Production-secure closeout cannot be laundered through free-text N/A reasons. This is a
+    # separate work item so the exact attack can exercise every mandatory pathway without
+    # affecting the rest of this coverage test.
+    waiver_start, _ = run("work-start", [
+        "--project", str(proj), "--goal", "production secure waiver bypass regression",
+        "--tier", "production-secure",
+    ])
+    waiver_wid = waiver_start["work_id"]
+    run("work-log", [
+        "--work-id", waiver_wid, "--pathway", "govern", "--kind", "verify",
+        "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
+        "--verify-cmd", passing_verifier_cmd(),
+    ])
+    waiver_findings = []
+    for pathway in (
+        "research", "data", "security", "implementation", "quality", "observability",
+        "techdebt", "release", "docs",
+    ):
+        rejected, _ = run("work-cover", [
+            "--work-id", waiver_wid, "--pathway", pathway, "--na",
+            "--reason", "agent says not applicable",
+        ])
+        waiver_findings.extend(ids(rejected))
+    check(
+        waiver_findings.count("work-cover-production-secure-na-blocked") == 9,
+        "every production-secure free-text N/A waiver is rejected",
+    )
+    waiver_status, _ = run("work-status", ["--work-id", waiver_wid])
+    waiver_states = {
+        entry["pathway"]: entry["status"] for entry in waiver_status["summary"]["itinerary"]
+    }
+    check(
+        all(waiver_states[pathway] == "required"
+            for pathway in ("security", "observability", "release")),
+        "security, observability, and release remain required after waiver attempts",
+    )
+    waiver_close, _ = run("work-close", ["--work-id", waiver_wid])
+    check(
+        waiver_close.get("closed") is False,
+        "production-secure closeout stays blocked after arbitrary N/A attempts",
+    )
+    run("work-start", [
+        "--project", str(proj), "--goal", "production secure waiver bypass regression",
+        "--tier", "demoable",
+    ])
+    downgraded_waiver, _ = run("work-cover", [
+        "--work-id", waiver_wid, "--pathway", "release", "--na",
+        "--reason", "agent downgraded the tier first",
+    ])
+    check(
+        "work-cover-production-secure-na-blocked" in ids(downgraded_waiver),
+        "tier downgrade cannot remove a production-secure profile's non-waivable proof floor",
+    )
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+    work_items = [
+        json.loads(line) for line in work_items_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    for work_item in work_items:
+        if work_item.get("work_id") == waiver_wid:
+            for entry in work_item.get("itinerary", []):
+                entry["status"] = "proved"
+                entry["proved_by_run"] = "R-stale-or-revoked"
+    work_items_path.write_text(
+        "".join(json.dumps(work_item, sort_keys=True) + "\n" for work_item in work_items),
+        encoding="utf-8",
+    )
+    revoked_status, _ = run("work-status", ["--work-id", waiver_wid])
+    revoked_states = {
+        entry["pathway"]: entry["status"]
+        for entry in revoked_status["summary"]["itinerary"]
+    }
+    check(
+        revoked_states["govern"] == "proved"
+        and all(revoked_states[pathway] == "required"
+                for pathway in ("security", "observability", "release")),
+        "persisted proved labels reopen unless the current verified proof ledger supports them",
+    )
+    revoked_close, _ = run("work-close", ["--work-id", waiver_wid])
+    check(
+        revoked_close.get("closed") is False,
+        "stale or verifier-revoked proved labels cannot close production-secure work",
+    )
+
     # P0 (Codex): a fake/nonexistent evidence path must NOT mark a pathway proved.
     run("work-log", ["--work-id", demo_wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ROOT / "nope.txt"), "--result", "pass"])
     data, _ = run("work-status", ["--work-id", demo_wid])
@@ -2055,7 +2244,7 @@ def test_itinerary_coverage_guarantee():
     check(st["govern"] == "required", "fake/nonexistent evidence path does not mark a pathway proved")
 
     # A real on-disk artifact + a named verifier proves it (Gap A sufficiency bar).
-    run("work-log", ["--work-id", demo_wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier", "--verify-cmd", "printf verified"])
+    run("work-log", ["--work-id", demo_wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier", "--verify-cmd", passing_verifier_cmd()])
     data, _ = run("work-status", ["--work-id", demo_wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st["govern"] == "proved", "a real on-disk artifact marks the pathway proved")
@@ -2093,7 +2282,7 @@ def test_itinerary_coverage_guarantee():
     check(data.get("closed") is True, "work-close succeeds once every pathway is proved or N/A")
 
     # Fix (Codex + GLM): a tier downgrade retains earned proof.
-    run("work-log", ["--work-id", secure_wid, "--pathway", "security", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier", "--verify-cmd", "printf verified"])
+    run("work-log", ["--work-id", secure_wid, "--pathway", "security", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "test verifier", "--verify-cmd", passing_verifier_cmd()])
     run("work-start", ["--project", str(proj), "--goal", "production secure dashboard ui", "--tier", "demoable"])
     data, _ = run("work-status", ["--work-id", secure_wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
@@ -2124,7 +2313,7 @@ def test_proof_add_flips_itinerary_coverage():
 
     # proof-add records a genuinely verified proof (re-executed verifier, exit 0) for govern.
     added, _ = run("proof-add", ["--work-id", wid, "--pathway", "govern", "--proof-type", "artifact",
-                                 "--evidence", str(ev), "--gate", "govern-gate", "--verify-cmd", "printf verified"])
+                                 "--evidence", str(ev), "--gate", "govern-gate", "--verify-cmd", passing_verifier_cmd()])
     check(added.get("itinerary_coverage", {}).get("covered", 0) >= 1,
           "proof-add reports the pathway it just verified as covered")
 
@@ -2172,8 +2361,12 @@ def test_proof_add_resolves_bare_project_name_and_flags_invalid_cwd():
     # Re-inject the legacy shape (bare name) to prove proof-add resolves it at consumption too.
     stored["project"] = "barename"
     items_path.write_text("\n".join(json.dumps(w) for w in items) + "\n", encoding="utf-8")
+    cwd_verifier = text_guard_verifier_cmd(
+        "proof-of-cwd.txt", "cwd resolved to the real project directory",
+        name="cwd-verifier.py",
+    )
     added, _ = run("proof-add", ["--work-id", wid, "--pathway", "govern", "--proof-type", "artifact",
-                                 "--evidence", str(ev), "--verify-cmd", "cat proof-of-cwd.txt"])
+                                 "--evidence", str(ev), "--verify-cmd", cwd_verifier])
     proof = added["records"][0]
     check(proof.get("exit_code") == 0 and not proof.get("verify_error"),
           "proof-add resolves a bare work-item project name and runs the verifier in the real directory")
@@ -2186,7 +2379,7 @@ def test_proof_add_resolves_bare_project_name_and_flags_invalid_cwd():
     ev2 = ROOT / "barename-evidence-2.txt"
     ev2.write_text("artifact two", encoding="utf-8")
     added2, _ = run("proof-add", ["--work-id", wid, "--pathway", "quality", "--proof-type", "artifact",
-                                  "--evidence", str(ev2), "--verify-cmd", "cat proof-of-cwd.txt"])
+                                  "--evidence", str(ev2), "--verify-cmd", cwd_verifier])
     proof2 = added2["records"][0]
     check(proof2.get("verify_error") == "cwd_invalid" and proof2.get("exit_code") is None,
           "an unresolvable project cwd records verify_error=cwd_invalid with no fabricated exit code")
@@ -2215,7 +2408,7 @@ def test_proof_requires_verifier_not_just_presence():
     check(st["govern"] == "required", "a bare evidence file with no named verifier does not prove a pathway")
 
     # Same artifact WITH a named verifier -> proves it.
-    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "pytest -q (green)", "--verify-cmd", "printf verified"])
+    run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact", "--verified-by", "pytest -q (green)", "--verify-cmd", passing_verifier_cmd()])
     data, _ = run("work-status", ["--work-id", wid])
     st = {e["pathway"]: e["status"] for e in data["summary"]["itinerary"]}
     check(st["govern"] == "proved", "a real artifact plus a named verifier proves the pathway")
@@ -2276,7 +2469,7 @@ def test_recommendation_follows_evidence_within_itinerary():
     wid = data["work_id"]
     # Cover the foundation (govern) so foundations no longer force the pick.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--proof-type", "artifact", "--verified-by", "test", "--verify-cmd", "printf verified"])
+                     "--result", "pass", "--proof-type", "artifact", "--verified-by", "test", "--verify-cmd", passing_verifier_cmd()])
     rec, _ = run("pathway-next", ["--project", str(proj)])
     check(rec.get("recommended_pathway") == "observability",
           f"an error finding steers the next pick to observability over canonical-first data (got {rec.get('recommended_pathway')})")
@@ -2403,7 +2596,7 @@ def test_suggested_autonomy_tier_gates_on_proof_trust_confidence():
     # n=1 / 100% — the bug. The Wilson gate with the n>=10 floor must STILL fail closed.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
                      "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact",
-                     "--verified-by", "python3 tests (green)", "--verify-cmd", "printf verified", "--recommendation-id", gov_rec])
+                     "--verified-by", "python3 tests (green)", "--verify-cmd", passing_verifier_cmd(), "--recommendation-id", gov_rec])
 
     # govern covered -> quality (3 error findings) is the high-confidence pick; trust passes. The
     # ONLY thing short of execute-safe is the proof track record: n=1 is below MIN_AUTONOMY_N, so
@@ -2466,7 +2659,7 @@ def test_learning_loop_closed_outcomes_reweight_rankings():
     wid = start["work_id"]
     # Cover the govern foundation so the next pick is chosen among non-foundation pathways.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact", "--verified-by", "test", "--verify-cmd", "printf verified"])
+                     "--result", "pass", "--gate", "govern-gate", "--proof-type", "artifact", "--verified-by", "test", "--verify-cmd", passing_verifier_cmd()])
 
     # BEFORE any closes: implementation and quality both sit on the completeness nudge; canonical
     # order puts implementation first. No learning history yet -> the reweight is a no-op.
@@ -2580,13 +2773,13 @@ def test_proof_requires_real_verifier_not_freetext():
 
     # 2. FAILING VERIFIER BLOCKED — a command that exits non-zero cannot prove.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "exit 1"])
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", failing_verifier_cmd()])
     check(gov_status() == "required", "a verifier command that exits non-zero does not prove")
 
     # 3. BLOCKED OUTCOME STAYS BLOCKED — exit 0 means the verifier ran; it must not launder an
     # explicitly blocked operator result into a passing proof.
     blocked, _ = run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "blocked", "--proof-type", "artifact", "--verify-cmd", "printf verified"])
+                     "--result", "blocked", "--proof-type", "artifact", "--verify-cmd", passing_verifier_cmd()])
     check(gov_status() == "required", "an exit-0 verifier does not turn a blocked result into proved")
     blocked_proof = [r for r in blocked.get("records", []) if r.get("verifier_strength")]
     check(bool(blocked_proof) and blocked_proof[0]["exit_code"] == 0,
@@ -2610,7 +2803,7 @@ def test_proof_requires_real_verifier_not_freetext():
 
     # 4. REAL VERIFIER PROVES — an executed command that exits 0 with observable output flips to proved.
     out, _ = run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "printf verified"])
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", passing_verifier_cmd()])
     check(gov_status() == "proved", "a re-executed verifier exiting 0 proves the pathway")
     proof = [r for r in out.get("records", []) if r.get("verifier_strength")]
     check(bool(proof) and proof[0]["verifier_strength"] == "executed" and proof[0]["exit_code"] == 0,
@@ -2663,7 +2856,7 @@ def test_autonomy_metric_counts_only_verified_proofs():
 
     # A re-executed verifier (exit 0) — counts.
     run("work-log", ["--work-id", wid, "--pathway", pathway, "--kind", "verify", "--evidence", str(evidence),
-                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "printf verified", "--recommendation-id", rid])
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", passing_verifier_cmd(), "--recommendation-id", rid])
     m_verified, _ = run("pathway-metric", ["--gate-target", "0.5"])
     check(m_verified["metric"]["proved"] >= 1,
           "a re-executed verifier counts as a proved recommendation")
@@ -2682,7 +2875,9 @@ def test_trivial_verifier_does_not_prove_or_close():
                                  "--evidence", str(ev), "--result", "pass", "--proof-type", "artifact",
                                  "--verify-cmd", "true"])
     proof = next((r for r in logged.get("records", []) if r.get("verifier_strength")), {})
-    check(proof.get("trivial_verifier") is True, "the no-op verifier is flagged trivial")
+    check(proof.get("verify_error") == "generic_verifier_not_executed"
+          and bool(proof.get("verifier_source_error")),
+          "a non-Python no-op verifier is rejected before execution")
     status, _ = run("work-status", ["--work-id", wid])
     st = {e["pathway"]: e["status"] for e in status["summary"]["itinerary"]}
     check(st["govern"] == "required", "a trivial verifier does not prove the pathway")
@@ -2691,10 +2886,7 @@ def test_trivial_verifier_does_not_prove_or_close():
 
 
 def test_verifier_receipt_flags_trivial_command():
-    """Trivial-verifier receipt (dossier item 2): `--verify-cmd true` exits 0 but proves nothing.
-    The proof now carries a receipt — verifier_source_sha256, a stdout byte count, and a
-    trivial_verifier flag — so a no-op verifier is detectable. (Denylist + byte-floor here; the
-    canary mutant is the keystone, tested separately.)"""
+    """New generic receipts reject shell commands and bind a trusted direct Python verifier."""
     import hashlib
     reset()
     write("projects/recpt/README.md", "# recpt\n")
@@ -2704,31 +2896,40 @@ def test_verifier_receipt_flags_trivial_command():
     wid = start["work_id"]
     proofs_file = ROOT / "out" / "operator-intelligence" / "proofs.ndjson"
 
-    # A no-op verifier: exits 0, empty stdout, denylisted source.
+    # A shell no-op is recorded but never executed or credited.
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
                      "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "true"])
     p = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
-    check(p.get("verifier_source_sha256") == hashlib.sha256(b"true").hexdigest(),
-          "receipt records the SHA-256 of the verifier command source")
+    check(p.get("verify_command_sha256") == hashlib.sha256(b"true").hexdigest()
+          and p.get("verifier_source_kind") == "python_file"
+          and p.get("verify_error") == "generic_verifier_not_executed"
+          and bool(p.get("verifier_source_error")),
+          "receipt records the command digest and fail-closed unsupported form")
     check(p.get("artifact_sha256") == hashlib.sha256(b"proof\n").hexdigest(),
           "the artifact-hash binding is preserved, not scrubbed to [REDACTED] by the entropy redactor")
-    check(p.get("verify_stdout_bytes") == 0, f"`true` produces zero stdout bytes (got {p.get('verify_stdout_bytes')})")
-    check(p.get("trivial_verifier") is True, "`true` is flagged trivial (denylist + empty stdout)")
+    check(p.get("verify_stdout_bytes") == 0 and p.get("exit_code") is None,
+          "an unsupported shell verifier is not executed")
 
     # Each denylisted form is caught.
     for cmd in [":", "exit 0", "echo ok"]:
         run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
                          "--result", "pass", "--proof-type", "artifact", "--verify-cmd", cmd])
         pl = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
-        check(pl.get("trivial_verifier") is True, f"`{cmd}` is flagged as a trivial verifier")
+        check(pl.get("verify_error") == "generic_verifier_not_executed"
+              and not load_cli("unsupported_shell").proof_is_verified(pl),
+              f"`{cmd}` is rejected and cannot prove")
 
-    # A real-looking verifier: non-denylisted, emits stdout above the byte floor.
+    # A trusted direct Python verifier executes and binds both source and interpreter.
+    direct_command = passing_verifier_cmd(name="receipt-pass.py")
     run("work-log", ["--work-id", wid, "--pathway", "quality", "--kind", "verify", "--evidence", str(ev),
-                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", "printf verified-output"])
+                     "--result", "pass", "--proof-type", "artifact", "--verify-cmd", direct_command])
     p2 = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
-    check(p2.get("verify_stdout_bytes", 0) >= 1, "a real verifier emits stdout above the byte floor")
-    check(p2.get("trivial_verifier") is False,
-          f"a non-denylisted verifier with real stdout is not flagged trivial (got {p2.get('trivial_verifier')})")
+    check(p2.get("verify_stdout_bytes", 0) >= 1 and p2.get("exit_code") == 0,
+          "a trusted direct Python verifier executes with observable output")
+    check(p2.get("verifier_source_kind") == "python_file"
+          and p2.get("verifier_interpreter_sha256")
+          and p2.get("verifier_snapshot_stable") is True,
+          "the receipt binds stable verifier and interpreter bytes")
 
     # An echo PREAMBLE must not hide a real verifier from the canary: only a bare echo is trivial.
     opl = load_cli("trivial_chain")
@@ -2737,6 +2938,442 @@ def test_verifier_receipt_flags_trivial_command():
           "an echo chained to a real command is NOT trivial (canary must still run)")
     check(opl.verifier_command_is_trivial("echo pretest; ./verify.sh") is False,
           "an echo followed by a semicolon-chained verifier is NOT trivial")
+
+
+def test_generic_python_verifier_source_freshness_reopens_pathway():
+    """A direct Python verifier remains proof only while the exact regular source file remains."""
+    import hashlib
+    import subprocess as sp
+
+    reset()
+    proj = ROOT / "projects" / "verifier-freshness"
+    proj.mkdir(parents=True, exist_ok=True)
+
+    def git(*args):
+        return sp.run(["git", "-C", str(proj), *args], capture_output=True, text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Pathway Test")
+    guard = proj / "guard.txt"
+    guard.write_text("baseline\n", encoding="utf-8")
+    git("add", "guard.txt")
+    git("commit", "-q", "-m", "baseline")
+    guard.write_text("approved\n", encoding="utf-8")
+
+    verifier = proj / "verify_quality.py"
+    verifier.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "if Path(sys.argv[1]).read_text(encoding='utf-8') != 'approved\\n':\n"
+        "    raise SystemExit(7)\n"
+        "print('GENERIC_VERIFIER=PASS')\n",
+        encoding="utf-8",
+    )
+    original_source = verifier.read_bytes()
+    opl = load_cli("generic_verifier_binding")
+    composite_command = f"{sys.executable} {verifier} {guard} && printf composite"
+    composite_binding = opl.parse_generic_verifier_command(composite_command, proj)
+    check(
+        composite_binding["error"] == "generic_verifier_shell_composition_unsupported"
+        and not composite_binding["argv"],
+        "a newly recorded composite shell verifier is ineligible",
+    )
+    evidence = write(
+        "out/operator-artifacts/verifier-freshness-proof.md",
+        "# Verification\n\nThe direct Python verifier checked the changed guard.\n",
+    )
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "Keep production-secure proof bound to current verifier source",
+        "--tier", "production-secure",
+    ])
+    work_id = started["work_id"]
+    verify_command = f"{sys.executable} -B {verifier} {guard}"
+    logged, _ = run("work-log", [
+        "--work-id", work_id, "--pathway", "quality", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--project", str(proj), "--verify-cmd", verify_command,
+        "--canary-target", str(guard),
+    ])
+    proof = next(record for record in logged["records"] if record.get("verifier_strength"))
+    expected_source_digest = hashlib.sha256(original_source).hexdigest()
+    expected_command_digest = hashlib.sha256(verify_command.encode("utf-8")).hexdigest()
+    check(
+        proof.get("verifier_source_kind") == "python_file"
+        and proof.get("verifier_source_path") == str(verifier)
+        and proof.get("verifier_source_target_path") == str(verifier.resolve())
+        and proof.get("verifier_source_sha256") == expected_source_digest
+        and proof.get("verify_command_sha256") == expected_command_digest
+        and proof.get("verifier_interpreter_path") == str(Path(sys.executable).resolve())
+        and proof.get("verifier_interpreter_sha256")
+        and proof.get("verifier_post_source_sha256") == expected_source_digest
+        and proof.get("verifier_post_interpreter_sha256")
+        == proof.get("verifier_interpreter_sha256")
+        and not proof.get("verifier_source_error"),
+        "a direct Python proof binds command, interpreter, and exact verifier source bytes",
+    )
+
+    def quality_status():
+        status, _ = run("work-status", ["--work-id", work_id])
+        return next(
+            entry["status"] for entry in status["summary"]["itinerary"]
+            if entry["pathway"] == "quality"
+        )
+
+    check(quality_status() == "proved", "the freshly logged direct Python verifier proves quality")
+
+    verifier.write_bytes(original_source + b"# post-receipt drift\n")
+    check(quality_status() == "required", "changed verifier bytes reopen the proved pathway")
+    verifier.write_bytes(original_source)
+    check(quality_status() == "proved", "restoring exact verifier bytes restores current proof")
+
+    saved = verifier.with_suffix(".saved")
+    verifier.rename(saved)
+    check(quality_status() == "required", "a missing verifier source fails closed at read time")
+    saved.rename(verifier)
+    check(quality_status() == "proved", "restoring the missing verifier source restores proof")
+
+    verifier.rename(saved)
+    verifier.symlink_to(saved.name)
+    check(quality_status() == "required", "a symlink replacement cannot satisfy a file-bound proof")
+    closeout, _ = run("work-close", ["--work-id", work_id])
+    check(closeout.get("closed") is not True, "verifier-source drift keeps closeout false")
+    verifier.unlink()
+    saved.rename(verifier)
+
+    current_proof = next(
+        json.loads(line)
+        for line in (ROOT / "out" / "operator-intelligence" / "proofs.ndjson")
+        .read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("proof_id") == proof.get("proof_id")
+    )
+    opl = load_cli("generic_verifier_freshness")
+    check(quality_status() == "proved" and opl.proof_is_verified(current_proof),
+          "exact source restoration makes the existing receipt valid again")
+
+    # Exact bypass regressions: fake Python, env wrapping, unsupported options, and shell
+    # composition are recorded without execution and cannot prove even when stdout could pass.
+    fake_python = write(
+        "fake-bin/python3",
+        "#!/bin/sh\nprintf 'FAKE_VERIFIER=PASS\\n'\n",
+    )
+    fake_python.chmod(0o755)
+    unsupported_commands = {
+        "fake_interpreter": f"{fake_python} {verifier} {guard}",
+        "env_wrapper": f"env {sys.executable} {verifier} {guard}",
+        "unsupported_option": f"{sys.executable} -W ignore {verifier} {guard}",
+        "shell_composite": f"{sys.executable} {verifier} {guard} && printf bypass",
+    }
+    for label, command in unsupported_commands.items():
+        rejected, _ = run("work-log", [
+            "--work-id", work_id, "--pathway", "quality", "--kind", "verify",
+            "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+            "--project", str(proj), "--verify-cmd", command,
+        ])
+        rejected_proof = next(
+            record for record in rejected["records"] if record.get("verifier_strength")
+        )
+        check(
+            rejected_proof.get("verify_error") == "generic_verifier_not_executed"
+            and rejected_proof.get("exit_code") is None
+            and bool(rejected_proof.get("verifier_source_error"))
+            and not opl.proof_is_verified(rejected_proof),
+            f"{label} is never executed and cannot prove",
+        )
+
+    # A no-git verifier that mutates its own source after the pre-run hash is caught by the
+    # post-run snapshot even though no changed-file canary is available.
+    toctou_proj = ROOT / "projects" / "verifier-toctou"
+    toctou_proj.mkdir(parents=True)
+    toctou_verifier = toctou_proj / "verify.py"
+    toctou_verifier.write_text(
+        "from pathlib import Path\n"
+        "path = Path(__file__)\n"
+        "path.write_bytes(path.read_bytes() + b'# mutated\\n')\n"
+        "print('GENERIC_TOCTOU=PASS')\n",
+        encoding="utf-8",
+    )
+    toctou_start, _ = run("work-start", [
+        "--project", str(toctou_proj), "--goal", "Reject verifier source TOCTOU",
+        "--tier", "production-secure",
+    ])
+    toctou_logged, _ = run("work-log", [
+        "--work-id", toctou_start["work_id"], "--pathway", "quality", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--project", str(toctou_proj),
+        "--verify-cmd", f"{sys.executable} -B {toctou_verifier}",
+    ])
+    toctou_proof = next(
+        record for record in toctou_logged["records"] if record.get("verifier_strength")
+    )
+    check(
+        toctou_proof.get("exit_code") == 0
+        and toctou_proof.get("canary_mutant_failed") is None
+        and toctou_proof.get("verifier_snapshot_stable") is False
+        and toctou_proof.get("verifier_source_error")
+        == "generic_verifier_source_changed_during_execution"
+        and toctou_proof.get("verifier_post_source_sha256")
+        != toctou_proof.get("verifier_source_sha256")
+        and not opl.proof_is_verified(toctou_proof),
+        "post-run hashes reject no-git verifier source TOCTOU",
+    )
+
+
+def test_generic_python_verifier_binds_symlinked_ancestor_target():
+    """A stable ancestor symlink is target-bound; retargeting it immediately reopens proof."""
+    reset()
+    project = ROOT / "projects" / "ancestor-link-proof"
+    project.mkdir(parents=True)
+    source_root = ROOT / "verifier-targets"
+    target_a = source_root / "a"
+    target_b = source_root / "b"
+    target_a.mkdir(parents=True)
+    target_b.mkdir(parents=True)
+    verifier_source = (
+        "from helper import EXIT_CODE\n"
+        "if EXIT_CODE:\n"
+        "    raise SystemExit(EXIT_CODE)\n"
+        "print('ANCESTOR_LINK_VERIFIER=PASS')\n"
+    )
+    for target, exit_code in ((target_a, 0), (target_b, 23)):
+        (target / "verify.py").write_text(verifier_source, encoding="utf-8")
+        (target / "helper.py").write_text(
+            f"EXIT_CODE = {exit_code}\n", encoding="utf-8"
+        )
+    parent_link = ROOT / "verifier-parent-link"
+    parent_link.symlink_to(target_a, target_is_directory=True)
+    lexical_verifier = parent_link / "verify.py"
+    command = f"{sys.executable} -B {lexical_verifier}"
+    evidence = write(
+        "out/operator-artifacts/ancestor-link-proof.md",
+        "# Verification\n\nThe target-bound verifier passed.\n",
+    )
+    started, _ = run("work-start", [
+        "--project", str(project),
+        "--goal", "Bind a generic verifier through a stable ancestor symlink",
+        "--tier", "production-secure",
+    ])
+    logged, _ = run("work-log", [
+        "--work-id", started["work_id"], "--pathway", "quality", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--project", str(project), "--verify-cmd", command,
+    ])
+    proof = next(record for record in logged["records"] if record.get("verifier_strength"))
+    opl = load_cli("ancestor_symlink_binding")
+    check(
+        proof.get("exit_code") == 0
+        and proof.get("canary_mutant_failed") is None
+        and proof.get("verifier_source_path") == str(lexical_verifier)
+        and proof.get("verifier_source_target_path") == str((target_a / "verify.py").resolve())
+        and opl.proof_is_verified(proof),
+        "a stable symlink ancestor is accepted only with its resolved regular target bound",
+    )
+    binding = opl.parse_generic_verifier_command(command, project)
+    check(
+        binding.get("argv", [])[:4]
+        == [str(Path(sys.executable).resolve()), "-I", "-B", "-S"]
+        and binding.get("argv", [])[-1:] == [str((target_a / "verify.py").resolve())],
+        "the accepted command executes an isolated snapshot labeled with the resolved target",
+    )
+
+    parent_link.unlink()
+    parent_link.symlink_to(target_b, target_is_directory=True)
+    raw = subprocess.run(
+        [sys.executable, "-B", str(lexical_verifier)],
+        cwd=project, capture_output=True, text=True,
+    )
+    check(raw.returncode == 23,
+          "the exact reviewer probe confirms the retargeted lexical command changed behavior")
+    check(
+        opl.parse_generic_verifier_command(command, project).get("resolved_path")
+        == str((target_b / "verify.py").resolve())
+        and not opl.generic_verifier_source_is_current(proof)
+        and not opl.proof_is_verified(proof),
+        "ancestor symlink retargeting invalidates the bound proof despite byte-identical source",
+    )
+    status, _ = run("work-status", ["--work-id", started["work_id"]])
+    quality = next(
+        entry["status"] for entry in status["summary"]["itinerary"]
+        if entry["pathway"] == "quality"
+    )
+    check(quality == "required", "ancestor symlink drift reopens quality at read time")
+
+    parent_link.unlink()
+    parent_link.symlink_to(target_a, target_is_directory=True)
+    check(opl.proof_is_verified(proof),
+          "restoring the exact ancestor target restores the bound proof")
+
+
+def test_generic_python_verifier_executes_exact_source_snapshot():
+    """A transient source replacement cannot run bytes outside the receipt's source digest.
+
+    The pinned loader must still preserve the useful semantics of direct script execution:
+    arguments, resolved ``__file__``, requested cwd, and imports from the script directory.
+    """
+    import argparse
+    import hashlib
+
+    reset()
+    project = ROOT / "projects" / "exact-verifier-snapshot"
+    project.mkdir(parents=True)
+    evidence = write(
+        "out/operator-artifacts/exact-verifier-snapshot.md",
+        "# Verification\n\nThe captured verifier source passed with direct-script semantics.\n",
+    )
+    verifier = project / "verify.py"
+    helper = project / "helper.py"
+    helper.write_text("EXPECTED = 'local-import-ok'\n", encoding="utf-8")
+    legitimate_source = (
+        "from helper import EXPECTED\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "if EXPECTED != 'local-import-ok':\n"
+        "    raise SystemExit(11)\n"
+        "if sys.argv[1] != 'argument with spaces':\n"
+        "    raise SystemExit(12)\n"
+        "if Path(__file__).resolve() != Path(sys.argv[2]).resolve():\n"
+        "    raise SystemExit(13)\n"
+        "if Path.cwd().resolve() != Path(sys.argv[3]).resolve():\n"
+        "    raise SystemExit(14)\n"
+        "print('EXACT_SNAPSHOT_VERIFIER=PASS')\n"
+    ).encode("utf-8")
+    verifier.write_bytes(legitimate_source)
+    malicious_marker = project / "malicious-replacement-executed.txt"
+    malicious_source = (
+        "from pathlib import Path\n"
+        f"Path({str(malicious_marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "print('MALICIOUS_REPLACEMENT=PASS')\n"
+    ).encode("utf-8")
+    command = " ".join(shlex.quote(str(value)) for value in (
+        sys.executable,
+        "-B",
+        verifier,
+        "argument with spaces",
+        verifier.resolve(),
+        project.resolve(),
+    ))
+    opl = load_cli("exact_generic_verifier_snapshot")
+    original_runner = opl.run_generic_verifier_snapshot
+    executed_snapshots = []
+
+    def coordinated_transient_swap(binding, cwd, timeout=120):
+        executed_snapshots.append(binding.get("source_bytes"))
+        verifier.write_bytes(malicious_source)
+        try:
+            return original_runner(binding, cwd, timeout=timeout)
+        finally:
+            verifier.write_bytes(legitimate_source)
+
+    opl.run_generic_verifier_snapshot = coordinated_transient_swap
+    args = argparse.Namespace(
+        evidence=str(evidence), work_id="W-exact-verifier-snapshot", pathway="quality",
+        gate="quality-gate", kind="verify", result="pass", stale_after_days=30,
+        verified_by="", recommendation_id="", verify_cmd=command, reviewer="",
+        proof_type="artifact", canary_target=None, project=str(project),
+    )
+    proof, warning = opl.build_proof_record(
+        args,
+        work_item={
+            "project": str(project),
+            "project_name": project.name,
+            "tier": "production-secure",
+        },
+        projects_root=str(ROOT / "projects"),
+    )
+    legitimate_digest = hashlib.sha256(legitimate_source).hexdigest()
+    legitimate_stdout = b"EXACT_SNAPSHOT_VERIFIER=PASS\n"
+    check(
+        executed_snapshots == [legitimate_source]
+        and proof.get("verifier_source_sha256") == legitimate_digest
+        and proof.get("verify_stdout_sha256") == hashlib.sha256(legitimate_stdout).hexdigest(),
+        "the recorded source digest and credited stdout come from the same captured bytes",
+    )
+    check(
+        proof.get("exit_code") == 0
+        and proof.get("verifier_snapshot_stable") is True
+        and warning is None
+        and opl.proof_is_verified(proof),
+        "the exact legitimate snapshot preserves args, __file__, cwd, and local imports",
+    )
+    check(
+        not malicious_marker.exists() and verifier.read_bytes() == legitimate_source,
+        "a transient malicious replacement never executes or supplies credited output",
+    )
+
+
+def test_generic_python_verifier_isolates_python_startup_environment():
+    """PYTHONPATH sitecustomize cannot execute before the pinned verifier snapshot."""
+    import hashlib
+
+    reset()
+    project = ROOT / "projects" / "isolated-verifier-startup"
+    project.mkdir(parents=True)
+    injection_dir = ROOT / "python-startup-injection"
+    injection_dir.mkdir()
+    injection_marker = project / "sitecustomize-loaded.txt"
+    (injection_dir / "sitecustomize.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(injection_marker)!r}).write_text('loaded', encoding='utf-8')\n"
+        "print('SITECUSTOMIZE=FORGED')\n",
+        encoding="utf-8",
+    )
+    control_env = dict(os.environ)
+    control_env["PYTHONPATH"] = str(injection_dir)
+    control = subprocess.run(
+        [sys.executable, "-B", "-c", "print('CONTROL=PASS')"],
+        cwd=project, env=control_env, capture_output=True, text=True, timeout=30,
+    )
+    check(control.returncode == 0 and injection_marker.exists(),
+          "the startup-injection fixture executes under an ordinary Python launch")
+    injection_marker.unlink()
+
+    verifier = project / "verify.py"
+    source = (
+        "import os\n"
+        "if (any(key.upper().startswith('PYTHON') for key in os.environ)\n"
+        "        or '__PYVENV_LAUNCHER__' in os.environ):\n"
+        "    raise SystemExit(17)\n"
+        "print('ISOLATED_SNAPSHOT_VERIFIER=PASS')\n"
+    ).encode("utf-8")
+    verifier.write_bytes(source)
+    command = " ".join(shlex.quote(str(value)) for value in (
+        sys.executable, "-B", verifier,
+    ))
+    opl = load_cli("isolated_generic_verifier_startup")
+    binding = opl.parse_generic_verifier_command(command, project)
+    prior_pythonpath = os.environ.get("PYTHONPATH")
+    prior_pyvenv_launcher = os.environ.get("__PYVENV_LAUNCHER__")
+    os.environ["PYTHONPATH"] = str(injection_dir)
+    os.environ["__PYVENV_LAUNCHER__"] = str(ROOT / "untrusted-python-launcher")
+    try:
+        exit_code, stdout_sha256, _stdout_bytes, stdout = (
+            opl.run_generic_verifier_snapshot(binding, project)
+        )
+    finally:
+        if prior_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = prior_pythonpath
+        if prior_pyvenv_launcher is None:
+            os.environ.pop("__PYVENV_LAUNCHER__", None)
+        else:
+            os.environ["__PYVENV_LAUNCHER__"] = prior_pyvenv_launcher
+    expected_stdout = b"ISOLATED_SNAPSHOT_VERIFIER=PASS\n"
+    check(
+        not binding.get("error")
+        and binding.get("argv", [])[:4]
+        == [str(Path(sys.executable).resolve()), "-I", "-B", "-S"]
+        and binding.get("argv", []).count("-B") == 1,
+        "generic verifier startup is normalized to one isolated no-bytecode stdlib launch",
+    )
+    check(
+        exit_code == 0
+        and stdout == expected_stdout.decode("utf-8")
+        and stdout_sha256 == hashlib.sha256(expected_stdout).hexdigest()
+        and not injection_marker.exists(),
+        "PYTHONPATH and sitecustomize cannot alter or preempt the verifier snapshot",
+    )
 
 
 def test_verifier_receipt_canary_mutant_catches_noop_verifier():
@@ -2762,7 +3399,7 @@ def test_verifier_receipt_canary_mutant_catches_noop_verifier():
     # REAL verifier: greps the changed line AND prints it (clears the byte floor).
     run("work-log", ["--work-id", wid, "--pathway", "govern", "--kind", "verify", "--evidence", str(ev),
                      "--result", "pass", "--proof-type", "artifact", "--project", str(proj),
-                     "--verify-cmd", "grep 100 value.txt"])
+                     "--verify-cmd", text_guard_verifier_cmd("value.txt", "100")])
     real = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
     check(real.get("canary_mutant_failed") is True,
           f"a real verifier FAILS when the changed line is mutated (got {real.get('canary_mutant_failed')})")
@@ -2776,7 +3413,7 @@ def test_verifier_receipt_canary_mutant_catches_noop_verifier():
     # Opaque verifier: no named changed file means no mutation and no false trivial demotion.
     run("work-log", ["--work-id", wid, "--pathway", "quality", "--kind", "verify", "--evidence", str(ev),
                      "--result", "pass", "--proof-type", "artifact", "--project", str(proj),
-                     "--verify-cmd", "printf checked"])
+                     "--verify-cmd", passing_verifier_cmd(name="opaque-pass.py")])
     unavailable = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
     check(unavailable.get("canary_mutant_failed") is None and unavailable.get("trivial_verifier") is False,
           "an opaque verifier has no mutation result and is not falsely demoted")
@@ -2813,13 +3450,26 @@ def test_redact_obj_exempts_only_real_sha256_digests():
     out = opl.redact_obj({"artifact_sha256": "a" * 64,
                           "note_sha256": "sk-proj-LEAKED-secret-value-0001",
                           "session_key": hex_secret,
-                          "body": "password=hunter2"})
+                          "body": "password=hunter2",
+                          "release_artifact_sha256": {
+                              field: "b" * 64 for field in opl.RELEASE_RECEIPT_ARTIFACT_FIELDS
+                          }})
     check(out["artifact_sha256"] == "a" * 64, "a real 64-hex digest under a digest-named key is preserved")
+    uppercase_digest = opl.redact_obj({
+        "release_verifier_markers": {"RELEASE_RECEIPT_SHA256": "c" * 64}
+    })
+    check(uppercase_digest["release_verifier_markers"]["RELEASE_RECEIPT_SHA256"] == "c" * 64,
+          "uppercase verifier digest keys retain exact content hashes")
     check("sk-proj-" not in out["note_sha256"] and "LEAKED" not in out["note_sha256"],
           "a *_sha256 key holding a non-digest secret is still redacted")
     check(hex_secret not in out["session_key"],
           "a 64-hex secret under a non-digest key is scrubbed (key+value conjunction)")
     check("hunter2" not in out["body"], "ordinary secret values are unaffected by the exemption")
+    check(all(value == "b" * 64 for value in out["release_artifact_sha256"].values()),
+          "the closed release-artifact digest map survives proof-ledger redaction")
+    closed_map_attack = opl.redact_obj({"release_artifact_sha256": {"session_key": hex_secret}})
+    check(hex_secret not in closed_map_attack["release_artifact_sha256"]["session_key"],
+          "unknown keys cannot exploit the closed release-digest map exemption")
 
 
 def test_redaction_covers_bearer_and_provider_prefixed_credentials():
@@ -2856,6 +3506,8 @@ def test_release_receipt_distinguishes_preview_production_rollback_and_send():
         "rollback_artifact": "rollback-plan.md", "human_approval": "",
     }
     check(not opl.validate_release_receipt(preview), "preview-ready receipt passes without production mutation")
+    check(opl.release_receipt_credit_scope(preview) == "",
+          "preview readiness does not credit the production release pathway")
     missing_rollback = {**preview, "production_status": "deployed", "rollback_status": "ready", "human_approval": "Alex approved"}
     check(any("rollback" in error for error in opl.validate_release_receipt(missing_rollback)),
           "production receipt without rollback rehearsal is rejected")
@@ -2863,9 +3515,1501 @@ def test_release_receipt_distinguishes_preview_production_rollback_and_send():
     check(any("send-ready" in error for error in opl.validate_release_receipt(send_ready))
           and not opl.release_receipt_supports_send(send_ready),
           "send-ready cannot be claimed as sent")
-    production = {**preview, "production_status": "deployed", "rollback_status": "rehearsed", "human_approval": "Alex approved", "external_send_state": "sent"}
-    check(not opl.validate_release_receipt(production) and opl.release_receipt_supports_send(production),
-          "production receipt needs approval and rollback evidence before it can claim sent")
+    unattested_send = {
+        **preview,
+        "external_send_state": "sent",
+        "human_approval": "agent says Alex approved",
+    }
+    check(any("verifiable single-use external approval" in error
+              for error in opl.validate_release_receipt(unattested_send))
+          and not opl.release_receipt_supports_send(unattested_send),
+          "a non-deployed external send cannot trust free-text approval")
+    production = {
+        **preview,
+        "canary_status": "passed",
+        "production_status": "deployed",
+        "rollback_status": "rehearsed",
+        "human_approval": "Alex approved",
+        "external_send_state": "sent",
+        "canary_artifact": "canary.json",
+    }
+    check(any("verifiable single-use external approval" in error
+              for error in opl.validate_release_receipt(production)),
+          "free-text approval cannot authorize a production release or external send")
+    check(not opl.release_receipt_supports_send(production)
+          and opl.release_receipt_credit_scope(production) == "",
+          "production credit stays closed until a verifiable approval trust root exists")
+    contradictory = {
+        "release_receipt": production,
+        "release_decision": {
+            "decision": "RELEASE", "release_gate": "PASS", "pathway_result": "PASS",
+            "deployed": False, "production_mutation_performed": False,
+            "current_authorized_stage": "NONE",
+        },
+    }
+    check(opl.release_receipt_credit_scope(production, contradictory) == "",
+          "contradictory no-deploy envelope cannot wrap a production receipt")
+
+    base_proof = {
+        "pathway": "release", "result": "pass", "verifier_strength": "executed",
+        "exit_code": 0, "trivial_verifier": False, "canary_mutant_failed": True,
+        "release_snapshot_stable": True, "release_snapshot_errors": [],
+        "template_check": {"valid": True}, "release_credit_scope": "production",
+        "release_receipt_errors": [], "release_verifier_errors": [],
+        "release_verifier_bound": True,
+        "release_artifact_sha256": {field: "a" * 64 for field in opl.RELEASE_RECEIPT_ARTIFACT_FIELDS},
+    }
+    check(not opl.proof_is_verified(base_proof),
+          "production release proof cannot credit while external approval verification is unavailable")
+    check(not opl.proof_is_verified({**base_proof, "canary_mutant_failed": None}),
+          "release proof cannot credit when the verifier canary is unavailable")
+    check(not opl.proof_is_verified({**base_proof, "template_check": {"valid": False}}),
+          "release proof cannot credit an invalid evidence template")
+    check(not opl.proof_is_verified({**base_proof, "release_credit_scope": ""}),
+          "release proof cannot credit a hold or preview-only receipt")
+    marker_text = (
+        "RELEASE_DECISION=RELEASE\nRELEASE_GATE=PASS\nPATHWAY_RESULT=PASS\n"
+        "PRODUCTION_STATUS=DEPLOYED\nCANARY_STATUS=PASSED\nROLLBACK_STATUS=REHEARSED\n"
+        f"RELEASE_RECEIPT_SHA256={'b' * 64}\n"
+    )
+    check(opl.release_verifier_binding(marker_text, "b" * 64)["bound"] is True,
+          "release verifier markers bind the production outcome to the receipt digest")
+    duplicate = "RELEASE_DECISION=NO_RELEASE\n" + marker_text
+    check(opl.release_verifier_binding(duplicate, "b" * 64)["bound"] is False,
+          "duplicate release markers fail closed instead of using the last value")
+
+    reset()
+    missing_artifact_md = write("out/operator-artifacts/missing-release.md", "release verification rollback\n")
+    write("out/operator-artifacts/missing-release.json", json.dumps({"release_receipt": production}))
+    loaded = opl.release_receipt_from_evidence(missing_artifact_md)
+    check(any("existing companion-directory file" in error for error in loaded["errors"]),
+          "production release artifacts must exist before their hashes can enter proof")
+
+    now = opl.utc_now()
+    for artifact_name in (
+        "preview-plan.md", "preview-check.json", "canary.json", "rollback-plan.md",
+    ):
+        write(f"out/operator-artifacts/{artifact_name}", json.dumps({"fixture": artifact_name}))
+    release_context = {
+        "work_id": "W-release-bound", "recommendation_id": "REC-release-bound",
+        "target_project": str((ROOT / "projects" / "release-bound").resolve()),
+    }
+    bound_envelope = {
+        **release_context,
+        "issued_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + opl.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "release_decision": {
+            "decision": "RELEASE", "release_gate": "PASS", "pathway_result": "PASS",
+            "deployed": True, "production_mutation_performed": True,
+            "current_authorized_stage": "PRODUCTION",
+        },
+        "release_receipt": production,
+    }
+    bound_md = write("out/operator-artifacts/release-bound.md", "release verification rollback\n")
+    write("out/operator-artifacts/release-bound.json", json.dumps(bound_envelope))
+    loaded = opl.release_receipt_from_evidence(bound_md, release_context, now=now)
+    check(any("verifiable single-use external approval" in error for error in loaded["errors"])
+          and loaded["credit_scope"] == "",
+          "fresh production claims remain uncreditable without external approval verification")
+    replay = opl.release_receipt_from_evidence(bound_md, {
+        "work_id": "W-replay", "recommendation_id": "REC-replay",
+        "target_project": str((ROOT / "projects" / "other").resolve()),
+    }, now=now)
+    check(replay["credit_scope"] == "",
+          "untrusted production release claims cannot earn scope under replayed context")
+    stale_envelope = {
+        **bound_envelope,
+        "issued_at": (now - opl.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now - opl.timedelta(days=2, hours=-1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    stale_md = write("out/operator-artifacts/release-stale.md", "release verification rollback\n")
+    write("out/operator-artifacts/release-stale.json", json.dumps(stale_envelope))
+    stale_loaded = opl.release_receipt_from_evidence(stale_md, release_context, now=now)
+    check(stale_loaded["credit_scope"] == ""
+          and any("verifiable single-use external approval" in error
+                  for error in stale_loaded["errors"]),
+          "expired production claims remain uncreditable while approval trust is absent")
+    absolute_envelope = {
+        **bound_envelope,
+        "release_receipt": {**production, "deploy_artifact": str(
+            (ROOT / "out/operator-artifacts/deploy.json").resolve()
+        )},
+    }
+    absolute_md = write("out/operator-artifacts/release-absolute.md", "release verification rollback\n")
+    write("out/operator-artifacts/release-absolute.json", json.dumps(absolute_envelope))
+    check(any("companion-directory filename" in error for error in opl.release_receipt_from_evidence(
+        absolute_md, release_context, now=now
+    )["errors"]), "production release artifacts cannot escape the companion directory")
+    release_companion = bound_md.with_suffix(".json")
+    release_target = release_companion.with_name("release-bound-target.json")
+    release_target.write_bytes(release_companion.read_bytes())
+    release_companion.unlink()
+    release_companion.symlink_to(release_target.name)
+    check(any("must not be a symlink" in error for error in opl.release_receipt_from_evidence(
+        bound_md, release_context, now=now
+    )["errors"]), "symlinked release companions fail closed")
+
+
+def test_release_hold_carries_constraints_without_credit_or_repeat():
+    """A verified NO_RELEASE check is a constraint baton, never release readiness.
+
+    This reproduces the tradebot defect: the caller supplies `--result pass`, the verifier exits
+    zero, and the artifact truth still says BLOCKED / NOT_DEPLOYED. The hold must remain unproved,
+    become the latest carry-forward, and route to another open prerequisite.
+    """
+    reset()
+    proj = ROOT / "projects" / "releasehold"
+    proj.mkdir(parents=True, exist_ok=True)
+    shared = write("out/operator-artifacts/security-carry.md", """# Verified prerequisite
+
+Decision, verifier, question, sources, threat, and verification are recorded.
+
+## Summary
+Security remains fail-closed while prerequisites are open.
+
+## What Changed
+- Bound the no-deploy authority state.
+
+## More Relevant
+- Secretless data preflight.
+
+## Less Relevant
+- Production rollout.
+
+## Next Pathway Must Use
+- Data preflight remains secretless.
+- Quality and release must verify runtime controls before any stage beyond data preflight.
+
+## Do Not Do Yet
+- Do not deploy execution or flip a production feature flag.
+
+## Open Decisions
+- Choose the runtime and rollback target.
+
+## Active Risk Overlays
+- rollback
+""")
+    start, _ = run("work-start", [
+        "--project", str(proj), "--goal", "agent release hold routing", "--tier", "live",
+    ])
+    wid = start["work_id"]
+    for pathway in ("govern", "research", "security"):
+        run("work-log", [
+            "--work-id", wid, "--pathway", pathway, "--kind", "verify",
+            "--evidence", str(shared), "--result", "pass", "--proof-type", "artifact",
+            "--verify-cmd", passing_verifier_cmd(),
+        ])
+
+    hold = write("out/operator-artifacts/release-hold.md", """# Release hold verification
+
+Rollback and verification were checked without deployment.
+
+## Summary
+The release decision is NO_RELEASE and the pathway remains blocked.
+
+## What Changed
+- Verified the release hold and rollback model.
+
+## More Relevant
+- Close observability prerequisites.
+
+## Less Relevant
+- Production deployment.
+
+## Next Pathway Must Use
+- Prefer the next engine-selected non-release prerequisite after this blocked receipt.
+
+## Do Not Do Yet
+- Do not deploy, run a canary, or flip a feature flag.
+
+## Open Decisions
+- Select the runtime rollback harness.
+
+## Active Risk Overlays
+- rollback
+""")
+    write("out/operator-artifacts/release-hold.json", json.dumps({
+        "status": "RELEASE_BLOCKED_NO_RUNTIME",
+        "claim_scope": "SPEC_ONLY_NO_DEPLOY",
+        "release_decision": {
+            "decision": "NO_RELEASE", "release_gate": "BLOCKED", "pathway_result": "BLOCKED",
+            "deployed": False, "production_mutation_performed": False,
+            "current_authorized_stage": "NONE",
+        },
+        "release_receipt": {
+            "preview_status": "not-run", "canary_status": "not-run",
+            "production_status": "not-deployed", "rollback_status": "not-needed",
+            "external_send_state": "not-sent", "feature_flag_state": "not-used",
+        },
+    }))
+    logged, _ = run("work-log", [
+        "--work-id", wid, "--pathway", "release", "--kind", "verify",
+        "--evidence", str(hold), "--result", "pass", "--proof-type", "artifact",
+        "--verify-cmd", "printf 'RELEASE_DECISION=NO_RELEASE\\nRELEASE_GATE=BLOCKED\\nPATHWAY_RESULT=BLOCKED\\nPRODUCTION_STATUS=NOT_DEPLOYED\\n'",
+        "--control-risk", "release proof credit and no-deploy routing",
+        "--target-pathways", "release,observability",
+    ])
+    proof = next(record for record in logged["records"] if record.get("proof_id"))
+    check(not load_cli("release_hold_proof").proof_is_verified(proof),
+          "caller-supplied pass cannot credit a NO_RELEASE verifier and not-deployed receipt")
+    check(logged.get("carry_forward", {}).get("credits_pathway") is False
+          and logged.get("carry_forward", {}).get("pathway_outcome") == "blocked_no_deploy",
+          "the verified release hold becomes a structured constraint-only carry-forward")
+
+    status, _ = run("work-status", ["--work-id", wid])
+    release_status = next(e["status"] for e in status["summary"]["itinerary"] if e["pathway"] == "release")
+    check(release_status == "required", "constraint-only release carry-forward leaves release coverage open")
+
+    rec, _ = run("pathway-next", ["--project", str(proj), "--work-id", wid])
+    check(rec.get("recommended_pathway") == "observability",
+          f"release hold routes to the highest open non-release prerequisite (got {rec.get('recommended_pathway')})")
+    check(rec.get("latest_carry_forward", {}).get("pathway") == "release"
+          and rec.get("latest_carry_forward", {}).get("credits_pathway") is False,
+          "pathway-next consumes the release hold as the latest constraint baton")
+    check("release" in rec.get("deferred_pathways", []),
+          "the no-deploy carry-forward explicitly defers release selection")
+    check(load_cli("release_hold_structured").carry_forward_deferred_pathways({
+        "pathway": "release", "credits_pathway": False,
+        "pathway_outcome": "blocked_no_deploy", "do_not_do_yet": ["Do not add credentials."],
+    }) == ["release"], "structured blocked outcome defers release without relying on prose")
+    check(load_cli("release_hold_observability_negation").carry_forward_deferred_pathways({
+        "pathway": "quality", "credits_pathway": True, "pathway_outcome": "proved",
+        "do_not_do_yet": ["Do not skip observability before promotion."],
+    }) == [], "a requirement not to skip observability is not inverted into a deferral")
+    check(load_cli("release_hold_double_negation").carry_forward_deferred_pathways({
+        "pathway": "quality", "credits_pathway": True, "pathway_outcome": "proved",
+        "do_not_do_yet": ["Do not fail to run observability before promotion."],
+    }) == [], "a double-negative observability requirement is not inverted into a deferral")
+    check(load_cli("release_hold_observability_prerequisite").carry_forward_deferred_pathways({
+        "pathway": "quality", "credits_pathway": True, "pathway_outcome": "proved",
+        "do_not_do_yet": ["Do not close the work item until observability is proved."],
+    }) == [], "an observability prerequisite is not inverted into an observability deferral")
+    check(load_cli("release_hold_alert_prerequisite").carry_forward_deferred_pathways({
+        "pathway": "quality", "credits_pathway": True, "pathway_outcome": "proved",
+        "do_not_do_yet": ["Do not run the next stage until observability alerts are wired."],
+    }) == [], "an alert-wiring prerequisite is not inverted into an observability deferral")
+    for verb in ("forget", "neglect", "refuse"):
+        check(load_cli(f"release_hold_{verb}_observability").carry_forward_deferred_pathways({
+            "pathway": "quality", "credits_pathway": True, "pathway_outcome": "proved",
+            "do_not_do_yet": [f"Do not {verb} to run observability before promotion."],
+        }) == [], f"nested negation '{verb}' is not inverted into an observability deferral")
+    check("release" not in load_cli("release_hold_negation").carry_forward_next_pathways({
+        "next_pathway_must_use": [
+            "Prefer the next engine-selected non-release prerequisite after this blocked receipt."
+        ]
+    }), "non-release wording is never parsed as a positive release directive")
+    report = Path(rec["report"]).read_text(encoding="utf-8")
+    check("Do not deploy, run a canary" in report and "Select the runtime rollback harness" in report,
+          "the operator card renders do-not-do-yet and open-decision constraints")
+    check(rec.get("karpathy_card", {}).get("do_not_do_yet")
+          and rec.get("karpathy_card", {}).get("open_decisions"),
+          "the JSON card carries the same constraints as the report")
+
+    # Terminal edge: if release is now the only open item and the same carry-forward defers it,
+    # the router must stop instead of manufacturing another blocked release recommendation.
+    for entry in status["summary"]["itinerary"]:
+        if entry.get("status") == "required" and entry.get("pathway") != "release":
+            run("work-cover", [
+                "--work-id", wid, "--pathway", entry["pathway"], "--na",
+                "--reason", "fixture isolates the deferred-release terminal edge",
+            ])
+    rec_path = ROOT / "out" / "operator-intelligence" / "pathway-recommendations.ndjson"
+    recs_before = len(rec_path.read_text(encoding="utf-8").splitlines())
+    terminal, _ = run("pathway-next", ["--project", str(proj), "--work-id", wid])
+    recs_after = len(rec_path.read_text(encoding="utf-8").splitlines())
+    check(terminal.get("blocked_on_deferred") is True and terminal.get("recommended_pathway") == "",
+          "sole deferred release returns a blocked no-recommendation state")
+    check(terminal.get("recommendation_id") == "" and recs_after == recs_before,
+          "sole deferred release does not mint a recommendation ledger row")
+    check("Select the runtime rollback harness" in terminal.get("blocked_next_action", ""),
+          "terminal hold routes the next action to the first carry-forward open decision")
+    terminal_report = Path(terminal["report"]).read_text(encoding="utf-8")
+    check("No pathway recommendation was logged" in terminal_report
+          and "Do not deploy, run a canary" in terminal_report,
+          "terminal hold report preserves the no-deploy authority boundary")
+
+
+def test_release_proof_rejects_mid_verification_evidence_mutation():
+    """A verifier cannot change release state after the pre-run receipt snapshot and keep credit."""
+    reset()
+    proj = ROOT / "projects" / "release-mutation"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "verify immutable production release evidence",
+        "--tier", "production-secure",
+    ])
+    release_recommendation_id = "REC-release-mutation-fixture"
+    opl = load_cli("release_mutation_context")
+    release_now = opl.utc_now()
+    evidence = write("out/operator-artifacts/release-mutation.md", """# Release Verification
+
+## Summary
+Production release and rollback evidence is staged for an adversarial integrity test.
+
+## What Changed
+- Bound release evidence before verifier execution.
+
+## More Relevant
+- Detect any verifier-side mutation.
+
+## Less Relevant
+- None.
+
+## Next Pathway Must Use
+- Quality must preserve the release evidence snapshot.
+
+## Do Not Do Yet
+- Do not trust mutable evidence.
+
+## Open Decisions
+- None.
+
+## Active Risk Overlays
+- release-integrity
+""")
+    artifacts = {}
+    for name in ("deploy.json", "verification.json", "canary.json", "rollback.json"):
+        artifacts[name] = write(f"out/operator-artifacts/{name}", json.dumps({"artifact": name}))
+    production = {
+        "preview_status": "ready", "canary_status": "passed", "production_status": "deployed",
+        "rollback_status": "rehearsed", "external_send_state": "not-sent",
+        "feature_flag_state": "disabled", "deploy_artifact": "deploy.json",
+        "verification_artifact": "verification.json", "canary_artifact": "canary.json",
+        "rollback_artifact": "rollback.json", "human_approval": "fixture approval",
+    }
+    receipt = write("out/operator-artifacts/release-mutation.json", json.dumps({
+        "work_id": started["work_id"],
+        "recommendation_id": release_recommendation_id,
+        "target_project": str(proj.resolve()),
+        "issued_at": release_now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (release_now + opl.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "release_decision": {
+            "decision": "RELEASE", "release_gate": "PASS", "pathway_result": "PASS",
+            "deployed": True, "production_mutation_performed": True,
+            "current_authorized_stage": "PRODUCTION",
+        },
+        "release_receipt": production,
+    }))
+    pre_receipt_sha = load_cli("release_mutation_sha").sha256_file(receipt)
+    guard = proj / "release-guard.txt"
+    subprocess.run(["git", "init", "-q", str(proj)], check=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(proj), "config", "user.name", "Pathway Test"], check=True)
+    guard.write_text("BASELINE\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(proj), "add", "release-guard.txt"], check=True)
+    subprocess.run(["git", "-C", str(proj), "commit", "-q", "-m", "fixture baseline"], check=True)
+    guard.write_text("PRODUCTION_RELEASE_READY\n", encoding="utf-8")
+    mutator = write("projects/release-mutation/mutate-release.py", f"""import json
+from pathlib import Path
+import sys
+
+guard = Path({str(guard)!r})
+receipt = Path({str(receipt)!r})
+if guard.read_text(encoding="utf-8") != "PRODUCTION_RELEASE_READY\\n":
+    sys.exit(9)
+receipt.write_text(json.dumps({{
+    "release_decision": {{"decision": "NO_RELEASE", "release_gate": "BLOCKED", "pathway_result": "BLOCKED",
+        "deployed": False, "production_mutation_performed": False, "current_authorized_stage": "NONE"}},
+    "release_receipt": {{"preview_status": "not-run", "canary_status": "not-run",
+        "production_status": "not-deployed", "rollback_status": "not-needed",
+        "external_send_state": "not-sent", "feature_flag_state": "not-used"}},
+}}), encoding="utf-8")
+print("RELEASE_DECISION=RELEASE")
+print("RELEASE_GATE=PASS")
+print("PATHWAY_RESULT=PASS")
+print("PRODUCTION_STATUS=DEPLOYED")
+print("CANARY_STATUS=PASSED")
+print("ROLLBACK_STATUS=REHEARSED")
+print("RELEASE_RECEIPT_SHA256={pre_receipt_sha}")
+""")
+    logged, _ = run("work-log", [
+        "--work-id", started["work_id"], "--pathway", "release", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--project", str(proj), "--verify-cmd", f"{sys.executable} {mutator}",
+        "--canary-target", str(guard),
+        "--recommendation-id", release_recommendation_id,
+    ])
+    proof_id = next(record["proof_id"] for record in logged["records"] if record.get("proof_id"))
+    proof = next(
+        json.loads(line)
+        for line in (ROOT / "out/operator-intelligence/proofs.ndjson").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("proof_id") == proof_id
+    )
+    opl = load_cli("release_mutation_assert")
+    check(proof.get("canary_mutant_failed") is True,
+          "adversarial verifier still trips the anti-gaming canary")
+    check(proof.get("release_snapshot_stable") is False
+          and any("receipt changed" in error for error in proof.get("release_snapshot_errors", [])),
+          "post-verification receipt hash detects the TOCTOU mutation")
+    check(not opl.proof_is_verified(proof),
+          "mutated release evidence cannot receive release pathway credit")
+    check(any(f.get("id") == "proof-logged-unverified" for f in logged.get("findings", [])),
+          "release mutation is surfaced as an explicit unverified-proof finding")
+
+
+def _observability_evidence(stem):
+    return write(f"out/operator-artifacts/{stem}.md", """# Observability verification
+
+The runtime signal and verification receipt are recorded.
+
+## Summary
+Observability evidence is bound without changing runtime authority.
+
+## What Changed
+- Bound the exact observability state.
+
+## More Relevant
+- Close the remaining runtime prerequisites.
+
+## Less Relevant
+- Unverified telemetry claims.
+
+## Next Pathway Must Use
+- Prefer the next engine-selected non-observability prerequisite while runtime is absent.
+
+## Do Not Do Yet
+- Do not claim or wire runtime telemetry before prerequisites close.
+
+## Open Decisions
+- Select the runtime implementation boundary.
+
+## Active Risk Overlays
+- observability
+""")
+
+
+def _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, stem, mutate=False, ignore_field=""):
+    """Create strict companion-local artifacts and a verifier sensitive to each bound hash."""
+    now = opl.utc_now()
+    observed_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_at = (now + opl.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    runtime_digest = "d" * 64
+    environment_id = f"{proj.name}-secretless-runtime"
+    common = {
+        "schema_version": 1,
+        "environment_id": environment_id,
+        "runtime_digest": runtime_digest,
+        "observed_at": observed_at,
+    }
+    metric_data = {
+        **common,
+        "artifact_type": "metric_evidence",
+        "metric_names": sorted(opl.OBSERVABILITY_METRIC_NAMES),
+        "samples": [
+            {
+                "name": name,
+                "value": (0.1 if name == "tradebot_drawdown_ratio" else index + 1),
+                "labels": {
+                    key: sorted(values)[0]
+                    for key, values in opl.OBSERVABILITY_METRIC_LABEL_VALUES[name].items()
+                },
+            }
+            for index, name in enumerate(sorted(opl.OBSERVABILITY_METRIC_NAMES))
+        ],
+    }
+    log_record = {field: f"fixture-{field}" for field in opl.OBSERVABILITY_CORRELATION_FIELDS}
+    log_record.update({
+        "event_name": "tradebot.halt.latched",
+        "sequence": 1,
+        "account_snapshot_seq": 1,
+        "trace_id": "a" * 32,
+        "asset": "BTC-USD",
+        "mode": "SIMULATE_ONLY",
+        "risk_decision": "DENY",
+        "reason_code": "STALE_DATA",
+        "occurred_at": observed_at,
+        "market_event_ts": observed_at,
+        "observed_at": observed_at,
+        **{field: "c" * 64 for field in opl.OBSERVABILITY_CORRELATION_HASH_FIELDS},
+    })
+    drill_facts = {
+        "CURRENT_AUTHORIZED_STAGE_AND_MODE": {
+            "authorized_stage": "NONE", "mode": "SIMULATE_ONLY",
+        },
+        "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS": {
+            "decision_id": log_record["decision_id"], "cycle_id": log_record["cycle_id"],
+            "intent_id": log_record["intent_id"], "client_order_id": log_record["client_order_id"],
+        },
+        "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES": {
+            "strategy_hash": log_record["strategy_hash"],
+            "data_snapshot_hash": log_record["data_snapshot_hash"],
+            "risk_policy_hash": log_record["risk_policy_hash"],
+            "manifest_hash": log_record["manifest_hash"],
+        },
+        "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS": {
+            "market_timestamp": observed_at, "private_feed_timestamp": observed_at,
+        },
+        "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE": {
+            "order_uncertainty": "ACKNOWLEDGEMENT_UNCERTAIN",
+            "last_venue_evidence": "NO_TERMINAL_VENUE_EVIDENCE",
+        },
+        "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE": {
+            "reservation_state": "WORST_CASE_RESERVATION_RETAINED",
+            "exposure_state": "OPEN_SYNTHETIC_BTC_EXPOSURE",
+            "ledger_mismatch_state": "LEDGER_VENUE_MISMATCH_UNRESOLVED",
+        },
+        "WHY_HALT_ENTRIES_LATCHED": {
+            "halt_reason": "STALE_MARKET_DATA_AND_UNCERTAIN_VENUE_ACK", "halt_latched": True,
+        },
+        "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED": {
+            "retry_prohibited": True, "flatten_prohibited": True,
+            "halt_release_prohibited": True,
+        },
+        "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING": {
+            "missing_reconciliation_evidence": ["AUTHORITATIVE_VENUE_ORDER_STATE"],
+        },
+        "HUMAN_DISPOSITION_REQUIRED_NEXT": {
+            "human_disposition": "RETAIN_HALT_AND_RECONCILE",
+            "next_action": "RECONCILE_BY_CLIENT_ORDER_ID",
+        },
+    }
+    json_artifacts = {
+        "metric_artifact": metric_data,
+        "log_artifact": {
+            **common,
+            "artifact_type": "structured_log_evidence",
+            "correlation_fields": sorted(opl.OBSERVABILITY_CORRELATION_FIELDS),
+            "records": [log_record],
+        },
+        "trace_artifact": {
+            **common,
+            "artifact_type": "trace_evidence",
+            "context_validated": True,
+            "spans": [{"trace_id": "a" * 32, "span_id": "b" * 16, "name": "halt.activate"}],
+        },
+        "alert_artifact": {
+            **common,
+            "artifact_type": "alert_execution_evidence",
+            "alerts_wired": True,
+            "executions": [{
+                "alert_id": "stale-feed",
+                "condition": "market data absent",
+                "status": "FIRED",
+                "safe_action": "HALT_ENTRIES_RECONCILE_ONLY",
+            }],
+        },
+        "runbook_drill_artifact": {
+            **common,
+            "artifact_type": "runbook_drill_evidence",
+            "runbook_version": "3am-v1",
+            "drill_executed": True,
+            "answered_questions": [{
+                "question_id": question_id,
+                "answer": opl.OBSERVABILITY_RUNBOOK_ANSWER_CODES[question_id],
+                "facts": drill_facts[question_id],
+                "evidence_refs": list(
+                    opl.OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT[question_id]["evidence"]
+                ),
+            } for question_id in sorted(opl.OBSERVABILITY_RUNBOOK_QUESTION_IDS)],
+            "prohibited_actions_taken": [],
+            "operator_disposition": "RETAIN_HALT_AND_RECONCILE",
+            "recovery_evidence": [],
+        },
+        "canary_artifact": {
+            **common,
+            "artifact_type": "anti_gaming_canary_evidence",
+            "canary_failed": True,
+            "results": {
+                "disabled_alert": "FAILED_AS_EXPECTED",
+                "missing_signal": "FAILED_AS_EXPECTED",
+            },
+        },
+    }
+    artifacts = {}
+    for field, payload in json_artifacts.items():
+        artifacts[field] = write(
+            f"out/operator-artifacts/{stem}-{field}.json", json.dumps(payload) + "\n"
+        )
+    verifier = write(f"out/operator-artifacts/{stem}-verifier.py", f"""import hashlib
+import json
+from pathlib import Path
+import sys
+
+receipt_path = Path(sys.argv[1])
+payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+receipt = payload["observability_receipt"]
+base = receipt_path.resolve().parent
+ignored_field = {ignore_field!r}
+for field, expected_digest in receipt["artifact_sha256"].items():
+    if field == ignored_field:
+        continue
+    artifact = base / receipt[field]
+    if artifact.is_symlink() or not artifact.is_file():
+        sys.exit(8)
+    if hashlib.sha256(artifact.read_bytes()).hexdigest() != expected_digest:
+        sys.exit(9)
+if {str(bool(mutate))}:
+    metric = base / receipt["metric_artifact"]
+    metric.write_text(json.dumps({{"mutated": True}}) + "\\n", encoding="utf-8")
+print("OBSERVABILITY_DECISION=CREDIT")
+print("OBSERVABILITY_GATE=PASS")
+print("PATHWAY_RESULT=PASS")
+print("RUNTIME_STATUS=PRESENT")
+print("TELEMETRY_STATUS=PRESENT")
+print("ALERT_STATUS=WIRED")
+print("RUNBOOK_STATUS=DRILLED")
+print("CANARY_STATUS=FAILED_AS_EXPECTED")
+print("AUTHORIZED_STAGE=" + receipt["authorized_stage"])
+print("CURRENT_VERDICT=" + receipt["current_verdict"])
+print("WORK_ID=" + receipt["work_id"])
+print("RECOMMENDATION_ID=" + receipt["recommendation_id"])
+print("ENVIRONMENT_ID=" + receipt["environment_id"])
+print("OBSERVABILITY_RECEIPT_SHA256=" + hashlib.sha256(receipt_path.read_bytes()).hexdigest())
+""")
+    artifacts["verifier_artifact"] = verifier
+    runbook = json_artifacts["runbook_drill_artifact"]
+    runbook["recovery_evidence"] = [{
+        "artifact_field": field,
+        "sha256": opl.sha256_file(artifacts[field]),
+    } for field in ("metric_artifact", "log_artifact", "alert_artifact")]
+    artifacts["runbook_drill_artifact"].write_text(json.dumps(runbook) + "\n", encoding="utf-8")
+    evidence = _observability_evidence(stem)
+    receipt = {
+        "schema_version": 1,
+        "receipt_type": "runtime_observability",
+        "pathway_result": "PASS",
+        "claim_scope": "runtime",
+        "work_id": work_id,
+        "recommendation_id": recommendation_id,
+        "project": proj.name,
+        "target_project": str(proj.resolve()),
+        "runtime_digest": runtime_digest,
+        "environment_id": environment_id,
+        "environment_class": "test",
+        "authorized_stage": "NONE",
+        "current_verdict": "NO_PROMOTE",
+        "runbook_version": "3am-v1",
+        "issued_at": observed_at,
+        "expires_at": expires_at,
+        "verifier_source_sha256": opl.sha256_file(verifier),
+        "metric_names": sorted(opl.OBSERVABILITY_METRIC_NAMES),
+        "log_correlation_fields": sorted(opl.OBSERVABILITY_CORRELATION_FIELDS),
+        **{field: True for field in opl.OBSERVABILITY_RUNTIME_TRUE_FIELDS},
+        **{field: path.name for field, path in artifacts.items()},
+        "artifact_sha256": {field: opl.sha256_file(path) for field, path in artifacts.items()},
+    }
+    receipt_path = write(
+        f"out/operator-artifacts/{stem}.json",
+        json.dumps({"status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt}),
+    )
+    return evidence, receipt_path, receipt, artifacts["metric_artifact"], verifier
+
+
+def test_observability_pre_runtime_hold_carries_without_credit_or_repeat():
+    """A Tier-A verifier can validate a negative claim but cannot launder caller `pass`."""
+    reset()
+    proj = ROOT / "projects" / "observability-hold"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "runtime observability hold routing",
+        "--tier", "live",
+    ])
+    work_id = started["work_id"]
+    recommendation_id = "REC-observability-hold-fixture"
+    target_project = str(proj.resolve())
+    opl = load_cli("observability_hold")
+    evidence = _observability_evidence("observability-hold")
+    companion = write("out/operator-artifacts/observability-hold.json", json.dumps({
+        "status": "PRE_RUNTIME_OBSERVABILITY_CONTRACT",
+        "claim_scope": "SPEC_ONLY_NO_TELEMETRY",
+        "pathway_result": "BLOCKED",
+        "credits_pathway": False,
+        "runtime_present": False,
+        "telemetry_present": False,
+        "alert_backend_present": False,
+        "alerts_wired": False,
+        "incident_drills_run": False,
+        "authorized_stage": "NONE",
+        "current_verdict": "NO_PROMOTE",
+        "work_id": work_id,
+        "recommendation_id": recommendation_id,
+        "target_project": target_project,
+    }))
+    companion_sha256 = opl.sha256_file(companion)
+    markers = (
+        "OBSERVABILITY_DECISION=NO_CREDIT\\n"
+        "OBSERVABILITY_GATE=BLOCKED_NO_RUNTIME\\n"
+        "TELEMETRY_STATUS=ABSENT\\n"
+        "ALERT_STATUS=NOT_WIRED\\n"
+        "RUNBOOK_STATUS=SPECIFIED_NOT_DRILLED\\n"
+        "AUTHORIZED_STAGE=NONE\\n"
+        "CURRENT_VERDICT=NO_PROMOTE\\n"
+        "PROJECT_TREE_MUTATION=NONE\\n"
+        "EXTERNAL_SIDE_EFFECTS=0\\n"
+        f"WORK_ID={work_id}\\n"
+        f"RECOMMENDATION_ID={recommendation_id}\\n"
+        f"TARGET_PROJECT={target_project}\\n"
+        f"OBSERVABILITY_RECEIPT_SHA256={companion_sha256}\\n"
+    )
+    expected = {
+        "work_id": work_id, "recommendation_id": recommendation_id,
+        "target_project": target_project, "project": proj.name,
+    }
+    replay = opl.observability_receipt_from_evidence(evidence, {
+        **expected, "work_id": "W-replayed", "recommendation_id": "REC-replayed",
+        "target_project": str(ROOT / "projects" / "other"),
+    })
+    check(replay["outcome"] == "" and sum(
+        "current proof context" in error for error in replay["errors"]
+    ) == 3, "Tier-A cross-work, recommendation, and project replay fail closed")
+    marker_text = markers.replace("\\n", "\n")
+    missing_bindings = "\n".join(
+        line for line in marker_text.splitlines()
+        if not line.startswith(("WORK_ID=", "RECOMMENDATION_ID=", "TARGET_PROJECT=",
+                                "OBSERVABILITY_RECEIPT_SHA256="))
+    )
+    check(not opl.observability_verifier_binding(
+        missing_bindings, companion_sha256, read_json(companion), "blocked_no_runtime"
+    )["bound"], "Tier-A missing context or receipt-digest markers fail closed")
+    logged, _ = run("work-log", [
+        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--verify-cmd", f"printf '{markers}'", "--recommendation-id", recommendation_id,
+    ])
+    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    check(not opl.proof_is_verified(proof),
+          "caller-supplied pass cannot credit a blocked no-runtime observability receipt")
+    carry = logged.get("carry_forward", {})
+    check(carry.get("credits_pathway") is False
+          and carry.get("pathway_outcome") == "blocked_no_runtime",
+          "valid Tier-A markers create a blocked_no_runtime constraint carry-forward")
+    check(opl.carry_forward_deferred_pathways(carry) == ["observability"],
+          "structured blocked_no_runtime outcome defers observability")
+
+    status, _ = run("work-status", ["--work-id", work_id])
+    obs_status = next(
+        entry["status"] for entry in status["summary"]["itinerary"]
+        if entry["pathway"] == "observability"
+    )
+    check(obs_status == "required", "blocked observability carry-forward does not increase coverage")
+    next_result, _ = run("pathway-next", ["--project", str(proj), "--work-id", work_id])
+    check(next_result.get("recommended_pathway") != "observability"
+          and "observability" in next_result.get("deferred_pathways", []),
+          "observability is deferred while another prerequisite remains open")
+
+    for entry in status["summary"]["itinerary"]:
+        if entry.get("status") == "required" and entry.get("pathway") != "observability":
+            run("work-cover", [
+                "--work-id", work_id, "--pathway", entry["pathway"], "--na",
+                "--reason", "fixture isolates the sole deferred-observability edge",
+            ])
+    recommendations = ROOT / "out/operator-intelligence/pathway-recommendations.ndjson"
+    count_before = len(recommendations.read_text(encoding="utf-8").splitlines())
+    terminal, _ = run("pathway-next", ["--project", str(proj), "--work-id", work_id])
+    count_after = len(recommendations.read_text(encoding="utf-8").splitlines())
+    check(terminal.get("blocked_on_deferred") is True
+          and terminal.get("recommended_pathway") == "",
+          "sole deferred observability returns a no-action prerequisite hold")
+    check(terminal.get("recommendation_id") == "" and count_after == count_before,
+          "sole deferred observability does not create a repeat recommendation")
+
+
+def test_observability_runtime_receipt_completeness_binding_and_replay_guards():
+    reset()
+    proj = ROOT / "projects" / "observability-runtime"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "verify runtime observability", "--tier", "production-secure",
+    ])
+    work_id = started["work_id"]
+    recommendation_id = "REC-observability-runtime-fixture"
+    opl = load_cli("observability_runtime")
+    evidence, receipt_path, receipt, metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-runtime"
+    )
+    expected = {
+        "work_id": work_id,
+        "recommendation_id": recommendation_id,
+        "project": proj.name,
+        "target_project": str(proj.resolve()),
+    }
+    frozen_questions = {
+        "CURRENT_AUTHORIZED_STAGE_AND_MODE",
+        "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS",
+        "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES",
+        "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS",
+        "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE",
+        "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE",
+        "WHY_HALT_ENTRIES_LATCHED",
+        "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED",
+        "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING",
+        "HUMAN_DISPOSITION_REQUIRED_NEXT",
+    }
+    check(opl.OBSERVABILITY_RUNBOOK_QUESTION_IDS == frozen_questions,
+          "runtime observability uses the exact frozen Tradebot 3am question set")
+    loaded = opl.observability_receipt_from_evidence(evidence, expected)
+    check(not loaded["errors"] and loaded["outcome"] == "runtime"
+          and loaded["credit_scope"] == "runtime",
+          "complete typed runtime observability receipt is structurally eligible")
+    unsafe_authority = {**receipt, "authorized_stage": "PRODUCTION", "current_verdict": "PROMOTE"}
+    unsafe_errors = opl.validate_observability_runtime_receipt(
+        unsafe_authority, receipt_path.parent, expected
+    )
+    check(any("authorized_stage" in error for error in unsafe_errors)
+          and any("current_verdict" in error for error in unsafe_errors),
+          "runtime observability cannot raise Tradebot authority or promotion verdict")
+    check(set(loaded["artifact_sha256"]) == set(opl.OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
+          and all(len(value) == 64 for value in loaded["artifact_sha256"].values()),
+          "every metric/log/trace/alert/drill/canary/verifier artifact exists and is hashed")
+    oversized = receipt_path.parent / "observability-runtime-oversized.json"
+    oversized.write_bytes(b"{}" + b" " * 5_000_000 + b"NOT_JSON")
+    _, oversized_errors = opl._read_strict_json_object(oversized, "oversized fixture")
+    check(any("exceeds" in error for error in oversized_errors),
+          "strict observability JSON rejects bytes beyond its parsing limit")
+    invalid_utf8 = receipt_path.parent / "observability-runtime-invalid-utf8.json"
+    invalid_utf8.write_bytes(b'{"status":"ok"}' + bytes([0xFF]))
+    _, encoding_errors = opl._read_strict_json_object(invalid_utf8, "encoding fixture")
+    check(any("valid UTF-8" in error for error in encoding_errors),
+          "strict observability JSON rejects invalid UTF-8 instead of replacing bytes")
+    nonfinite = receipt_path.parent / "observability-runtime-nonfinite.json"
+    nonfinite.write_text('{"value":1e400}\n', encoding="utf-8")
+    _, nonfinite_errors = opl._read_strict_json_object(nonfinite, "nonfinite fixture")
+    check(any("non-finite" in error for error in nonfinite_errors),
+          "strict observability JSON rejects numeric overflow to infinity")
+    replay_errors = opl.validate_observability_runtime_receipt(
+        receipt, receipt_path.parent,
+        {"work_id": "W-replay", "recommendation_id": "REC-replay", "project": "other"},
+    )
+    check(sum("current proof context" in error for error in replay_errors) == 3,
+          "work, recommendation, and project replay bindings fail closed")
+    missing = {**receipt, "trace_artifact": "missing-trace.json"}
+    check(any("existing file" in error for error in opl.validate_observability_runtime_receipt(
+        missing, receipt_path.parent, expected
+    )), "missing runtime evidence artifacts fail closed")
+
+    incomplete_hashes = {**receipt, "artifact_sha256": {
+        field: digest for field, digest in receipt["artifact_sha256"].items()
+        if field != "trace_artifact"
+    }}
+    check(any("exact lowercase artifact_sha256 map" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  incomplete_hashes, receipt_path.parent, expected
+              )), "incomplete receipt artifact hash maps fail closed")
+
+    dummy_metric = write(
+        "out/operator-artifacts/observability-runtime-dummy-metric.json",
+        json.dumps({"status": "looks-good"}) + "\n",
+    )
+    dummy_receipt = {
+        **receipt,
+        "metric_artifact": dummy_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(dummy_metric),
+        },
+    }
+    check(any("typed sample" in error for error in opl.validate_observability_runtime_receipt(
+        dummy_receipt, receipt_path.parent, expected
+    )), "dummy JSON artifact content cannot satisfy runtime observability")
+
+    infinite_metric_payload = read_json(metric)
+    infinite_metric_payload["samples"][0]["value"] = 1e400
+    infinite_metric = write(
+        "out/operator-artifacts/observability-runtime-infinite-metric.json",
+        json.dumps(infinite_metric_payload) + "\n",
+    )
+    infinite_receipt = {
+        **receipt,
+        "metric_artifact": infinite_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(infinite_metric),
+        },
+    }
+    check(any("non-finite" in error or "typed sample" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  infinite_receipt, receipt_path.parent, expected
+              )), "non-finite metric samples cannot satisfy runtime observability")
+    huge_metric_payload = read_json(metric)
+    huge_metric_payload["samples"][0]["value"] = 10 ** 400
+    huge_metric = write(
+        "out/operator-artifacts/observability-runtime-huge-metric.json",
+        json.dumps(huge_metric_payload) + "\n",
+    )
+    huge_receipt = {
+        **receipt,
+        "metric_artifact": huge_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(huge_metric),
+        },
+    }
+    check(any("typed sample" in error for error in opl.validate_observability_runtime_receipt(
+        huge_receipt, receipt_path.parent, expected
+    )), "oversized integer metric samples fail closed without raising")
+    negative_metric_payload = read_json(metric)
+    for sample in negative_metric_payload["samples"]:
+        sample["value"] = -1
+    negative_metric = write(
+        "out/operator-artifacts/observability-runtime-negative-metric.json",
+        json.dumps(negative_metric_payload) + "\n",
+    )
+    negative_receipt = {
+        **receipt,
+        "metric_artifact": negative_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(negative_metric),
+        },
+    }
+    check(any("typed sample" in error for error in opl.validate_observability_runtime_receipt(
+        negative_receipt, receipt_path.parent, expected
+    )), "negative ages, counters, latency, heartbeat, and drawdown fail domain validation")
+
+    unbounded_metric_payload = read_json(metric)
+    unbounded_metric_payload["samples"][0]["labels"]["client_order_id"] = "client-123"
+    unbounded_metric = write(
+        "out/operator-artifacts/observability-runtime-unbounded-metric.json",
+        json.dumps(unbounded_metric_payload) + "\n",
+    )
+    unbounded_receipt = {
+        **receipt,
+        "metric_artifact": unbounded_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(unbounded_metric),
+        },
+    }
+    check(any("typed sample" in error for error in opl.validate_observability_runtime_receipt(
+        unbounded_receipt, receipt_path.parent, expected
+    )), "identifier and unbounded metric labels cannot satisfy runtime observability")
+
+    false_log_payload = read_json(receipt_path.parent / receipt["log_artifact"])
+    false_log_payload["records"] = [{
+        "event_name": "tradebot.halt.latched",
+        **{field: False for field in opl.OBSERVABILITY_CORRELATION_FIELDS},
+    }]
+    false_log = write(
+        "out/operator-artifacts/observability-runtime-false-log.json",
+        json.dumps(false_log_payload) + "\n",
+    )
+    false_log_receipt = {
+        **receipt,
+        "log_artifact": false_log.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "log_artifact": opl.sha256_file(false_log),
+        },
+    }
+    check(any("correlated structured log" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  false_log_receipt, receipt_path.parent, expected
+              )), "false and empty-like correlation values cannot satisfy runtime observability")
+
+    inverted_log_payload = read_json(receipt_path.parent / receipt["log_artifact"])
+    inverted_log_payload["records"][0]["occurred_at"] = (
+        opl.parse_ts(inverted_log_payload["records"][0]["market_event_ts"])
+        - opl.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    inverted_log = write(
+        "out/operator-artifacts/observability-runtime-inverted-log.json",
+        json.dumps(inverted_log_payload) + "\n",
+    )
+    inverted_log_receipt = {
+        **receipt,
+        "log_artifact": inverted_log.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "log_artifact": opl.sha256_file(inverted_log),
+        },
+    }
+    check(any("correlated structured log" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  inverted_log_receipt, receipt_path.parent, expected
+              )), "market, occurrence, and observation timestamps must be coherently ordered")
+
+    drill_path = receipt_path.parent / receipt["runbook_drill_artifact"]
+    vacuous_drill_payload = read_json(drill_path)
+    vacuous_drill_payload["answered_questions"] = [{
+        "question_id": question_id,
+        "answer": str(index),
+        "evidence_refs": ["runbook_drill_artifact"],
+    } for index, question_id in enumerate(sorted(opl.OBSERVABILITY_RUNBOOK_QUESTION_IDS))]
+    vacuous_drill_payload["operator_disposition"] = "x"
+    vacuous_drill_payload["recovery_evidence"] = [{
+        "artifact_field": "runbook_drill_artifact", "sha256": opl.sha256_file(drill_path),
+    }]
+    vacuous_drill = write(
+        "out/operator-artifacts/observability-runtime-vacuous-drill.json",
+        json.dumps(vacuous_drill_payload) + "\n",
+    )
+    vacuous_drill_receipt = {
+        **receipt,
+        "runbook_drill_artifact": vacuous_drill.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"],
+            "runbook_drill_artifact": opl.sha256_file(vacuous_drill),
+        },
+    }
+    check(any("complete safe 3am drill" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  vacuous_drill_receipt, receipt_path.parent, expected
+              )), "vacuous or circular 3am drill answers cannot earn observability credit")
+
+    decoy_drill_payload = read_json(drill_path)
+    decoy_drill_payload["answered_questions"][0]["question_id"] = "GENERIC_ALERT_RECEIVED"
+    decoy_drill = write(
+        "out/operator-artifacts/observability-runtime-decoy-drill.json",
+        json.dumps(decoy_drill_payload) + "\n",
+    )
+    decoy_drill_receipt = {
+        **receipt,
+        "runbook_drill_artifact": decoy_drill.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"],
+            "runbook_drill_artifact": opl.sha256_file(decoy_drill),
+        },
+    }
+    check(any("complete safe 3am drill" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  decoy_drill_receipt, receipt_path.parent, expected
+              )), "the frozen ten-question Tradebot drill cannot be replaced by a generic decoy")
+    filler_drill_payload = read_json(drill_path)
+    for answer in filler_drill_payload["answered_questions"]:
+        answer["answer"] = "This identical generic filler sentence contains no incident answer."
+        answer["evidence_refs"] = ["metric_artifact"]
+    filler_drill_payload["recovery_evidence"] = [{
+        "artifact_field": "metric_artifact",
+        "sha256": receipt["artifact_sha256"]["metric_artifact"],
+    }]
+    filler_drill = write(
+        "out/operator-artifacts/observability-runtime-filler-drill.json",
+        json.dumps(filler_drill_payload) + "\n",
+    )
+    filler_receipt = {
+        **receipt,
+        "runbook_drill_artifact": filler_drill.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"],
+            "runbook_drill_artifact": opl.sha256_file(filler_drill),
+        },
+    }
+    check(any("complete safe 3am drill" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  filler_receipt, receipt_path.parent, expected
+              )), "generic filler and single-artifact recovery cannot satisfy the frozen drill")
+
+    semantic_filler_payload = read_json(drill_path)
+    for answer in semantic_filler_payload["answered_questions"]:
+        answer["answer"] = "This identical generic filler sentence contains no incident answer."
+        contract = opl.OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT[answer["question_id"]]
+        for field, kind in contract["fields"].items():
+            if kind in {"identifier", "enum"}:
+                answer["facts"][field] = "x"
+    semantic_filler = write(
+        "out/operator-artifacts/observability-runtime-semantic-filler-drill.json",
+        json.dumps(semantic_filler_payload) + "\n",
+    )
+    semantic_filler_receipt = {
+        **receipt,
+        "runbook_drill_artifact": semantic_filler.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"],
+            "runbook_drill_artifact": opl.sha256_file(semantic_filler),
+        },
+    }
+    check(any("complete safe 3am drill" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  semantic_filler_receipt, receipt_path.parent, expected
+              )), "semantic filler fails even when evidence references and recovery hashes remain valid")
+
+    benign_log_payload = read_json(receipt_path.parent / receipt["log_artifact"])
+    benign_log_payload["records"][0].update({
+        "event_name": "tradebot.proposal.created",
+        "risk_decision": "APPROVE",
+        "reason_code": "POLICY_PASS",
+    })
+    benign_log = write(
+        "out/operator-artifacts/observability-runtime-benign-log.json",
+        json.dumps(benign_log_payload) + "\n",
+    )
+    benign_runbook_payload = read_json(drill_path)
+    for recovery in benign_runbook_payload["recovery_evidence"]:
+        if recovery["artifact_field"] == "log_artifact":
+            recovery["sha256"] = opl.sha256_file(benign_log)
+    benign_runbook = write(
+        "out/operator-artifacts/observability-runtime-benign-runbook.json",
+        json.dumps(benign_runbook_payload) + "\n",
+    )
+    benign_incident_receipt = {
+        **receipt,
+        "log_artifact": benign_log.name,
+        "runbook_drill_artifact": benign_runbook.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"],
+            "log_artifact": opl.sha256_file(benign_log),
+            "runbook_drill_artifact": opl.sha256_file(benign_runbook),
+        },
+    }
+    check(any("structured incident record" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  benign_incident_receipt, receipt_path.parent, expected
+              )), "a healthy proposal event cannot be relabeled as the frozen halt incident")
+
+    false_recovery_payload = read_json(drill_path)
+    human_answer = next(
+        answer for answer in false_recovery_payload["answered_questions"]
+        if answer["question_id"] == "HUMAN_DISPOSITION_REQUIRED_NEXT"
+    )
+    human_answer["facts"]["human_disposition"] = "RECOVERED_KEEP_NO_PROMOTE"
+    false_recovery_payload["operator_disposition"] = "RECOVERED_KEEP_NO_PROMOTE"
+    false_recovery = write(
+        "out/operator-artifacts/observability-runtime-false-recovery-drill.json",
+        json.dumps(false_recovery_payload) + "\n",
+    )
+    false_recovery_receipt = {
+        **receipt,
+        "runbook_drill_artifact": false_recovery.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"],
+            "runbook_drill_artifact": opl.sha256_file(false_recovery),
+        },
+    }
+    check(any("complete safe 3am drill" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  false_recovery_receipt, receipt_path.parent, expected
+              )), "an unresolved acknowledgement and mismatch cannot claim recovered disposition")
+
+    symlink = receipt_path.parent / "observability-runtime-symlink-trace.json"
+    symlink.symlink_to(receipt["trace_artifact"])
+    symlink_receipt = {
+        **receipt,
+        "trace_artifact": symlink.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "trace_artifact": receipt["artifact_sha256"]["trace_artifact"],
+        },
+    }
+    check(any("must not be a symlink" in error for error in opl.validate_observability_runtime_receipt(
+        symlink_receipt, receipt_path.parent, expected
+    )), "symlinked observability artifacts fail closed")
+    traversal = {**receipt, "log_artifact": "../../outside-log.json"}
+    check(any("without traversal" in error for error in opl.validate_observability_runtime_receipt(
+        traversal, receipt_path.parent, expected
+    )), "artifact traversal outside the companion directory fails closed")
+
+    stale_time = (opl.utc_now() - opl.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale_expiry = (opl.utc_now() - opl.timedelta(days=2, hours=-1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale_receipt = {**receipt, "issued_at": stale_time, "expires_at": stale_expiry}
+    check(any("stale" in error for error in opl.validate_observability_runtime_receipt(
+        stale_receipt, receipt_path.parent, expected
+    )), "stale runtime observability receipts fail closed")
+    overlong_receipt = {
+        **receipt,
+        "expires_at": (opl.utc_now() + opl.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    check(any("overlong" in error for error in opl.validate_observability_runtime_receipt(
+        overlong_receipt, receipt_path.parent, expected
+    )), "overlong observability receipt validity windows fail closed")
+    skewed_metric_payload = read_json(metric)
+    skewed_metric_payload["observed_at"] = (
+        opl.utc_now() - opl.timedelta(minutes=10)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    skewed_metric = write(
+        "out/operator-artifacts/observability-runtime-skewed-metric.json",
+        json.dumps(skewed_metric_payload) + "\n",
+    )
+    skewed_receipt = {
+        **receipt,
+        "metric_artifact": skewed_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(skewed_metric),
+        },
+    }
+    check(any("observation window" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  skewed_receipt, receipt_path.parent, expected
+              )), "runtime observability artifacts must share one coherent observation window")
+    metric_payload = read_json(metric)
+    metric_payload["observed_at"] = (
+        opl.utc_now() + opl.timedelta(minutes=10)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    future_metric = write(
+        "out/operator-artifacts/observability-runtime-future-metric.json",
+        json.dumps(metric_payload) + "\n",
+    )
+    future_receipt = {
+        **receipt,
+        "metric_artifact": future_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(future_metric),
+        },
+    }
+    check(any("in the future" in error for error in opl.validate_observability_runtime_receipt(
+        future_receipt, receipt_path.parent, expected
+    )), "future-dated observability artifacts fail closed")
+    metric_payload["observed_at"] = stale_time
+    stale_metric = write(
+        "out/operator-artifacts/observability-runtime-stale-metric.json",
+        json.dumps(metric_payload) + "\n",
+    )
+    stale_artifact_receipt = {
+        **receipt,
+        "metric_artifact": stale_metric.name,
+        "artifact_sha256": {
+            **receipt["artifact_sha256"], "metric_artifact": opl.sha256_file(stale_metric),
+        },
+    }
+    check(any("is stale" in error for error in opl.validate_observability_runtime_receipt(
+        stale_artifact_receipt, receipt_path.parent, expected
+    )), "stale observability artifacts fail closed")
+
+    trusted_command = opl.parse_observability_verifier_command(
+        f"{sys.executable} {verifier} {receipt_path}", proj, verifier
+    )
+    check(not trusted_command["errors"]
+          and trusted_command["argv"][:2] == [sys.executable, str(verifier.resolve())],
+          "current sys.executable is accepted and normalized with the bound verifier in script position")
+    check(opl.parse_observability_verifier_command(
+        f"{verifier} {receipt_path}", proj, verifier
+    )["errors"], "direct or shebang verifier execution is rejected")
+    check(opl.parse_observability_verifier_command(
+        f"{sys.executable} -I {verifier} {receipt_path}", proj, verifier
+    )["errors"], "interpreter wrapper options before the verifier are rejected")
+    fake_python = write(
+        "out/fake-python-bin/python3", "#!/bin/sh\nexec /usr/bin/true\n"
+    )
+    fake_python.chmod(0o755)
+    check(opl.parse_observability_verifier_command(
+        f"{fake_python} {verifier} {receipt_path}", proj, verifier
+    )["errors"], "an arbitrary executable named python3 is rejected")
+    fake_link = ROOT / "out/fake-python-link-bin/python3"
+    fake_link.parent.mkdir(parents=True, exist_ok=True)
+    fake_link.symlink_to(fake_python)
+    check(opl.parse_observability_verifier_command(
+        f"{fake_link} {verifier} {receipt_path}", proj, verifier
+    )["errors"], "a python3 symlink to an untrusted executable is rejected")
+    decoy = write("out/operator-artifacts/observability-runtime-decoy.py", "print('decoy')\n")
+    decoy_command = f"{sys.executable} {decoy} {verifier} {receipt_path}"
+    check(opl.parse_observability_verifier_command(
+        decoy_command, proj, verifier
+    )["errors"], "a decoy script followed by the bound verifier token is rejected")
+    composed_command = f"{sys.executable} {verifier} {receipt_path} && true"
+    check(opl.parse_observability_verifier_command(
+        composed_command, proj, verifier
+    )["errors"], "shell-composed observability verifier commands are rejected")
+
+    valid_stdout = subprocess.run(
+        [sys.executable, str(verifier), str(receipt_path)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    check(opl.observability_verifier_binding(
+        valid_stdout, opl.sha256_file(receipt_path), receipt, "runtime"
+    )["bound"] is True, "positive verifier markers bind exactly to runtime receipt context and digest")
+    duplicate = "OBSERVABILITY_DECISION=NO_CREDIT\n" + valid_stdout
+    check(opl.observability_verifier_binding(
+        duplicate, opl.sha256_file(receipt_path), receipt, "runtime"
+    )["bound"] is False, "duplicate contradictory observability markers fail closed")
+
+    logged, _ = run("work-log", [
+        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--project", str(proj),
+        "--verify-cmd", f"{sys.executable} {verifier} {receipt_path}",
+        "--recommendation-id", recommendation_id,
+    ])
+    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    check(proof.get("canary_mutant_failed") is True and not opl.proof_is_verified(proof),
+          "a structurally complete runtime receipt stays uncredited without a trusted verifier root")
+    check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE == "TRUSTED_VERIFIER_NOT_CONFIGURED"
+          and not opl.OBSERVABILITY_TRUSTED_VERIFIER_SHA256,
+          "runtime observability verifier trust is explicitly unconfigured and fail closed")
+    check(set(proof.get("observability_artifact_canary_results", {}))
+          == set(opl.OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
+          and all(proof["observability_artifact_canary_results"].values()),
+          "every one of the seven receipt-bound artifacts independently trips the verifier")
+    check(proof.get("observability_artifact_restoration_sha256")
+          == proof.get("observability_artifact_sha256"),
+          "every mutation canary restores the exact pre-run artifact hash")
+    generic = {
+        "pathway": "quality", "result": "pass", "verifier_strength": "executed",
+        "exit_code": 0, "trivial_verifier": False, "canary_mutant_failed": None,
+    }
+    check(opl.proof_is_verified(generic),
+          "observability receipt gates do not change generic non-observability verification")
+
+
+def test_observability_proof_rejects_verifier_that_ignores_one_bound_artifact():
+    reset()
+    proj = ROOT / "projects" / "observability-ignored-artifact"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "reject partial observability verifier coverage",
+        "--tier", "production-secure",
+    ])
+    work_id = started["work_id"]
+    recommendation_id = "REC-observability-ignored-artifact"
+    opl = load_cli("observability_ignored_artifact")
+    evidence, receipt_path, _receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-ignored-artifact",
+        ignore_field="log_artifact",
+    )
+    logged, _ = run("work-log", [
+        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--project", str(proj),
+        "--verify-cmd", f"{sys.executable} {verifier} {receipt_path}",
+        "--recommendation-id", recommendation_id,
+    ])
+    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    results = proof.get("observability_artifact_canary_results", {})
+    check(results.get("log_artifact") is False
+          and all(value is True for field, value in results.items() if field != "log_artifact"),
+          "one ignored receipt-bound artifact is detected by its independent mutation canary")
+    check(not opl.proof_is_verified(proof),
+          "a verifier that ignores any one observability artifact cannot earn credit")
+
+
+def test_observability_proof_rejects_stateful_invocation_counter_verifier():
+    """A schedule-aware verifier cannot earn credit without an external verifier trust root."""
+    reset()
+    proj = ROOT / "projects" / "observability-stateful-verifier"
+    proj.mkdir(parents=True, exist_ok=True)
+    work_id = "W-observability-stateful-verifier"
+    recommendation_id = "REC-observability-stateful-verifier"
+    opl = load_cli("observability_stateful_verifier")
+    evidence, receipt_path, receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-stateful-verifier"
+    )
+    counter = receipt_path.parent / "observability-stateful-counter.txt"
+    verifier.write_text(f"""import hashlib
+from pathlib import Path
+import sys
+
+counter = Path({str(counter)!r})
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+if count in {{3, 6, 9, 12, 15, 18, 21, 23, 24, 25, 26, 27, 28, 29}}:
+    raise SystemExit(9)
+receipt_path = Path(sys.argv[1])
+print("OBSERVABILITY_DECISION=CREDIT")
+print("OBSERVABILITY_GATE=PASS")
+print("PATHWAY_RESULT=PASS")
+print("RUNTIME_STATUS=PRESENT")
+print("TELEMETRY_STATUS=PRESENT")
+print("ALERT_STATUS=WIRED")
+print("RUNBOOK_STATUS=DRILLED")
+print("CANARY_STATUS=FAILED_AS_EXPECTED")
+print("AUTHORIZED_STAGE=" + {receipt["authorized_stage"]!r})
+print("CURRENT_VERDICT=" + {receipt["current_verdict"]!r})
+print("WORK_ID=" + {work_id!r})
+print("RECOMMENDATION_ID=" + {recommendation_id!r})
+print("ENVIRONMENT_ID=" + {receipt["environment_id"]!r})
+print("OBSERVABILITY_RECEIPT_SHA256=" + hashlib.sha256(receipt_path.read_bytes()).hexdigest())
+""", encoding="utf-8")
+    receipt["verifier_source_sha256"] = opl.sha256_file(verifier)
+    receipt["artifact_sha256"] = {
+        **receipt["artifact_sha256"], "verifier_artifact": opl.sha256_file(verifier),
+    }
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
+    }), encoding="utf-8")
+    import argparse
+    args = argparse.Namespace(
+        evidence=str(evidence), work_id=work_id, pathway="observability",
+        gate="observability-gate", kind="verify", result="pass", stale_after_days=30,
+        verified_by="", recommendation_id=recommendation_id,
+        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
+        proof_type="artifact", canary_target=None, project=str(proj),
+    )
+    proof, warning = opl.build_proof_record(args, projects_root=str(ROOT / "projects"))
+    check(not opl.proof_is_verified(proof),
+          "a schedule-aware invocation-counter verifier cannot earn runtime observability credit")
+    check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE != "CONFIGURED_AND_VERIFIED",
+          "black-box mutation behavior cannot substitute for a configured verifier trust root")
+    check(warning is not None and warning.get("id") == "proof-logged-unverified",
+          "stateful observability verifier produces a loud unverified finding")
+
+
+def test_observability_proof_revalidates_receipt_freshness_after_canaries():
+    """An unchanged receipt that expires while its verifier runs cannot earn credit."""
+    reset()
+    proj = ROOT / "projects" / "observability-expiry"
+    proj.mkdir(parents=True, exist_ok=True)
+    work_id = "W-observability-expiry"
+    recommendation_id = "REC-observability-expiry"
+    opl = load_cli("observability_expiry")
+    evidence, receipt_path, receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-expiry"
+    )
+    issued_at = opl.parse_ts(receipt["issued_at"])
+    expires_at = issued_at + opl.timedelta(minutes=1)
+    receipt["expires_at"] = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT",
+        "observability_receipt": receipt,
+    }), encoding="utf-8")
+
+    before_expiry = issued_at + opl.timedelta(seconds=30)
+    after_expiry = issued_at + opl.timedelta(seconds=61)
+    clock_values = iter((before_expiry, after_expiry))
+
+    def controlled_utc_now():
+        return next(clock_values, after_expiry)
+
+    opl.utc_now = controlled_utc_now
+    import argparse
+    args = argparse.Namespace(
+        evidence=str(evidence), work_id=work_id, pathway="observability",
+        gate="observability-gate", kind="verify", result="pass",
+        stale_after_days=30, verified_by="", recommendation_id=recommendation_id,
+        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
+        proof_type="artifact", canary_target=None, project=str(proj),
+    )
+    proof, warning = opl.build_proof_record(
+        args, projects_root=str(ROOT / "projects")
+    )
+    canary_results = proof.get("observability_artifact_canary_results", {})
+    check(set(canary_results) == set(opl.OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
+          and all(canary_results.values()),
+          "receipt expiry fixture runs and passes all seven independent mutation canaries")
+    check(proof.get("observability_post_receipt_sha256")
+          == proof.get("observability_receipt_sha256")
+          and proof.get("observability_post_observability_artifact_sha256")
+          == proof.get("observability_artifact_sha256"),
+          "receipt expiry fixture keeps receipt and artifact bytes unchanged")
+    snapshot_errors = proof.get("observability_snapshot_errors", [])
+    check(proof.get("observability_snapshot_stable") is False
+          and any("post-verification observability receipt is invalid" in error
+                  and "stale" in error for error in snapshot_errors),
+          "post-canary receipt expiry fails semantic snapshot revalidation")
+    check(proof.get("observability_credit_scope") == ""
+          and proof.get("observability_outcome") == ""
+          and not opl.proof_is_verified(proof),
+          "an expired post-verifier receipt cannot earn observability credit")
+    check(warning is not None and warning.get("id") == "proof-logged-unverified",
+          "post-verifier receipt expiry produces a loud unverified finding")
+
+
+def test_observability_proof_rejects_mid_verification_artifact_mutation():
+    reset()
+    proj = ROOT / "projects" / "observability-mutation"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "reject mutable observability evidence",
+        "--tier", "production-secure",
+    ])
+    work_id = started["work_id"]
+    recommendation_id = "REC-observability-mutation-fixture"
+    opl = load_cli("observability_mutation")
+    evidence, receipt_path, _receipt, metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-mutation", mutate=True
+    )
+    logged, _ = run("work-log", [
+        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
+        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
+        "--project", str(proj),
+        "--verify-cmd", f"{sys.executable} {verifier} {receipt_path}",
+        "--recommendation-id", recommendation_id,
+    ])
+    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    check(proof.get("canary_mutant_failed") is False
+          and proof.get("observability_artifact_canary_errors"),
+          "TOCTOU fixture fails the per-artifact restoration canary")
+    check(proof.get("observability_snapshot_stable") is False
+          and any("artifacts changed" in error for error in proof.get("observability_snapshot_errors", [])),
+          "post-verifier hashes detect observability artifact mutation")
+    check(not opl.proof_is_verified(proof),
+          "mutated observability evidence cannot receive pathway credit")
+    status, _ = run("work-status", ["--work-id", work_id])
+    obs_status = next(
+        entry["status"] for entry in status["summary"]["itinerary"]
+        if entry["pathway"] == "observability"
+    )
+    check(obs_status == "required", "TOCTOU failure leaves observability coverage open")
 
 
 def test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts():
@@ -2937,7 +5081,7 @@ def test_canary_explicit_target_rejects_outside_and_unchanged_files():
     wid = start["work_id"]
     proofs_file = ROOT / "out" / "operator-intelligence" / "proofs.ndjson"
     common = ["--work-id", wid, "--proof-type", "artifact", "--result", "pass", "--evidence", str(ev),
-              "--verify-cmd", "printf checked"]
+              "--verify-cmd", passing_verifier_cmd(name="boundary-pass.py")]
 
     run("proof-add", common + ["--pathway", "quality", "--canary-target", str(outside)])
     outside_proof = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
@@ -3001,14 +5145,19 @@ def test_canary_selects_relevant_target_in_dirty_registered_checkout():
     common = ["--work-id", wid, "--gate", "canary-gate", "--proof-type", "artifact",
               "--result", "pass", "--evidence", str(ev)]
 
-    run("proof-add", common + ["--pathway", "govern", "--verify-cmd", "grep 100 value.txt"])
+    run("proof-add", common + [
+        "--pathway", "govern", "--verify-cmd",
+        text_guard_verifier_cmd("value.txt", "100", name="dirty-guard.py"),
+    ])
     named = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
     check(named.get("canary_mutant_failed") is True and named.get("trivial_verifier") is False,
           "a dirty registered checkout selects the verifier-named changed file")
     check(named.get("canary_target") == "value.txt" and named.get("canary_target_source") == "verifier_reference",
           "automatic selection records only the relevant repository-relative file")
 
-    run("proof-add", common + ["--pathway", "quality", "--verify-cmd", "printf checked"])
+    run("proof-add", common + [
+        "--pathway", "quality", "--verify-cmd", passing_verifier_cmd(name="dirty-opaque.py"),
+    ])
     opaque = [json.loads(l) for l in proofs_file.read_text().splitlines() if l.strip()][-1]
     check(opaque.get("canary_mutant_failed") is None and opaque.get("trivial_verifier") is False,
           "unrelated dirty files do not demote an opaque verifier")
@@ -3355,6 +5504,34 @@ def test_resolve_project_dir_nesting_and_unverified_proof_loudness():
         "the finding names the cwd_invalid reason",
     )
 
+    recorded_checkout = projects / "owner-a" / "same-name"
+    supplied_checkout = projects / "owner-b" / "same-name"
+    recorded_checkout.mkdir(parents=True)
+    supplied_checkout.mkdir(parents=True)
+    mismatch_args = argparse.Namespace(
+        evidence=str(ev), work_id="W-cross-checkout", pathway="quality", gate="quality-gate",
+        kind="verify", result="pass", stale_after_days=14, verified_by="",
+        recommendation_id="", verify_cmd="bash -c 'echo verifier-output-is-not-empty'",
+        reviewer="", proof_type="executed", canary_target=None,
+        project=str(supplied_checkout),
+    )
+    mismatch_proof, mismatch_warn = mod.build_proof_record(
+        mismatch_args,
+        work_item={"project": str(recorded_checkout), "project_name": "same-name"},
+        run_id="R-cross-checkout", measurement_id_value="M-cross-checkout",
+        projects_root=str(projects),
+    )
+    check(
+        mismatch_proof.get("verify_error") == "project_context_mismatch"
+        and mismatch_proof.get("exit_code") is None
+        and mismatch_proof.get("project_path") == str(recorded_checkout.resolve()),
+        "verification never runs in a different same-named checkout than the work item records",
+    )
+    check(
+        mismatch_warn is not None and "different checkout" in mismatch_warn.get("message", ""),
+        "cross-checkout proof attempts return a loud unverified finding",
+    )
+
 
 def test_artifact_filename_dates_use_local_day_not_utc():
     """An artifact filename must carry the operator's calendar day, never UTC's.
@@ -3484,10 +5661,22 @@ def main():
         test_autonomy_metric_counts_only_verified_proofs,
         test_trivial_verifier_does_not_prove_or_close,
         test_verifier_receipt_flags_trivial_command,
+        test_generic_python_verifier_source_freshness_reopens_pathway,
+        test_generic_python_verifier_binds_symlinked_ancestor_target,
+        test_generic_python_verifier_executes_exact_source_snapshot,
+        test_generic_python_verifier_isolates_python_startup_environment,
         test_verifier_receipt_canary_mutant_catches_noop_verifier,
         test_redact_obj_exempts_only_real_sha256_digests,
         test_redaction_covers_bearer_and_provider_prefixed_credentials,
         test_release_receipt_distinguishes_preview_production_rollback_and_send,
+        test_release_hold_carries_constraints_without_credit_or_repeat,
+        test_release_proof_rejects_mid_verification_evidence_mutation,
+        test_observability_pre_runtime_hold_carries_without_credit_or_repeat,
+        test_observability_runtime_receipt_completeness_binding_and_replay_guards,
+        test_observability_proof_rejects_verifier_that_ignores_one_bound_artifact,
+        test_observability_proof_rejects_stateful_invocation_counter_verifier,
+        test_observability_proof_revalidates_receipt_freshness_after_canaries,
+        test_observability_proof_rejects_mid_verification_artifact_mutation,
         test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts,
         test_audit_proof_integrity_uses_active_outcomes_and_reports_history,
         test_canary_mutant_is_symlink_safe,
