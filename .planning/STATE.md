@@ -1,81 +1,75 @@
 # Pathway Operating Layer - Present State
 
-Updated: 2026-08-12
-Active work ID: none
-Current outcome: the two Pathway proof-integrity outcomes stay closed. A large second wave of work is
-still uncommitted in a mixed dirty worktree, and that worktree is what the green suite currently
-measures.
+Updated: 2026-08-16
+Active work ID: none (the engine repo itself; the transfern envelope is tracked in the ledger)
+Current outcome: the verifiable single-use waiver/approval authority is BUILT and committed.
+Release production credit and production-secure N/A waivers are now reachable through
+content-bound, single-use, Alex-issued tickets in `operator-intelligence/approvals.ndjson`.
 
-Every number below was read from the running system on 2026-08-12, not carried forward from the
-previous version of this file. The prior version was self-dated 2026-07-11 and had drifted 12 commits
-behind. Its `514/514` suite count is superseded.
+Every number below was read from the running system on 2026-08-16.
 
 ## Verified now
 
-- HEAD is `fcdf0b4`, dated 2026-08-10, "fix(trust): give the two thin guard probes real timing
-  headroom". Twelve commits landed in the last 30 days.
-- The suite at HEAD passes `621/621 checks`.
-- The suite against the current dirty worktree passes `768/768 checks`. The higher number belongs to
-  uncommitted code, so do not quote it as the shipped count.
-- Four files are modified and uncommitted: `scripts/operating-layer.py`,
-  `scripts/tests/operating_layer_test.py`, `docs/pathway-proof-integrity.md`, and this file. The diff
-  is about 4,756 added and 118 removed lines. The three code and doc files were last edited on
-  2026-08-12 at 14:24, so this is recent in-flight work, not a 32-day-old leftover.
-- Unpushed commit count is UNKNOWN, not zero. Branch `main` has no upstream configured, so the
-  local-versus-remote question cannot be measured here.
-- The central ledger holds 2,707 proof records, 298 work items, and 1,707 carry-forward rows.
+- HEAD is `5e8b0dc` "fix(approval): close the adversarial review's findings on the ticket
+  authority". `e82d9cc` built the authority; `73d5395` committed the previously-dirty
+  2026-08-12/13 hardening wave as its own boundary, resolving follow-up 5 of the prior STATE.md.
+- The suite passes `799/799 checks` at HEAD (768 pre-existing + 31 new: the authority's twelve
+  acceptance criteria plus a regression per review finding).
+- `PRODUCTION_SECURE_WAIVER_STATE` and `RELEASE_PRODUCTION_APPROVAL_STATE` now read
+  `CONFIGURED_AND_VERIFIED` and remain kill switches. Spec + research dossier:
+  `.planning/waiver-authority/`.
+- A Fable adversarial critic returned REQUEST_CHANGES on `e82d9cc`. Every finding is closed in
+  `5e8b0dc`, each with a regression verified to FAIL against `e82d9cc` (six named failures plus
+  a missing predicate) and pass now. The critic was one model family: Codex and GLM passes were
+  not authorized this session, so the second-family gap is real and stated.
+- Findings closed: the redactor corrupted the ledger join for project slugs of ~21+ characters;
+  a spent ticket locked its subject out permanently; corroboration was enforced in one caller
+  only (now `proof_credits_pathway` everywhere); readers did not re-check the issued window;
+  ledger writes were unlocked and could rewrite from a truncated read; `proof-add` could never
+  credit release. Refuted: `--na --add` cannot burn a ticket.
+- The authority is proved end to end on a real outcome, not only in tests. See below.
 
-## Closeout truth, unchanged history
+## Proved on a real outcome
 
-- `W-20260706-pathway-operating-layer-raise-pathway-command-to-3402fb` closed with an active-proof
-  audit score of `100/100`.
-- `W-20260629-pathway-operating-layer-elevate-pathway-to-world-2819f3` closed after `7/7` required
-  pathway proofs were ready.
-- That closed selected-scope audit had zero document drift, `12/12` active proof integrity, and
-  `11/11` itinerary coverage. Those are dated results from July, kept as history.
+`W-20260816-transfern-validate-transfern-live--5ff13d` closed the same day at **11 of 11**,
+readiness `ready`, no warnings — the first production release credit on this machine.
 
-## Delivered surface
+- Release: proof `P-24b158b1f864`, `release_credit_scope=production`,
+  `canary_mutant_failed=True` (a genuine trip, not an unavailable canary),
+  `release_verifier_bound=True`, `release_approval_verified=True`, consumption `AC-bda0046984fc`.
+- Observability: waived, not faked. The Tier-B runtime contract is frozen to a trading system's
+  metrics and drill questions and cannot describe that project, while its real monitoring is
+  live (health endpoint plus a launchd watcher, 6 of 6 by its own verifier, checked this
+  session). The waiver reason records exactly that.
+- Audit trail: four events in `operator-intelligence/approvals.ndjson`, two issued and two
+  consumed, each bound to its consumer.
 
-- `pathway-audit` reports score, dimensions, metric snapshot, document drift, refinements, a Markdown
-  and HTML report, and a local audit signal.
-- Proof scoring separates current active-outcome integrity from historical attestation-only records.
-- The canonical pathway catalog, verifier templates, secret redaction, release-receipt validation, and
-  audit payload lineage checks are covered by the suite.
-- Closeout proof artifacts live under `.planning/full-cycle-pathway-marketplace/`.
-- Since the last version of this file: `pathway --max` shipped as a rigor-only modifier with a guard
-  test, the security pathway became read-only-then-fix, artifact names use the operator's local day
-  instead of UTC, owner-family-nested projects resolve so a nested repo's proof can credit, and a
-  proof that will not credit now emits a loud warning instead of failing quietly.
+## Known constraints (unchanged by design)
+
+- Observability Tier-B runtime credit stays disabled (`TRUSTED_VERIFIER_NOT_CONFIGURED`,
+  empty trusted digest set). The waiver is the honest route for projects whose real monitoring
+  does not match the tradebot runtime contract.
+- External-send (`sent`) release receipts stay fail-closed; sends use approve-send.py.
+- The authority is a forcing function and audit trail, not a cryptographic barrier — the same
+  trust model as approve-send.py, stated in code and docs.
 
 ## Follow-up queue
 
-1. **Closed.** `pathway-next` now routes a fully covered itinerary to an explicit ready-to-close
-   recommendation. `ready_to_close` appears 11 times in the live CLI.
-2. **Partly closed.** `work-close` returns `report` and `html` in its success response, but the
-   success branch still omits the closed `work_id`. Only the not-closed branch carries it. Add
-   `work_id` to the success return.
-3. **Needs re-measuring, not just planning.** The old figure of `27` historical attestation-only proof
-   records no longer matches the ledger. Five records now carry the type `attested` out of 2,707
-   total. Re-derive the real migration backlog from the current ledger before scheduling that work.
-4. **New defect, found 2026-08-12.** The anti-gaming canary cannot fail a Python verifier that names
-   its own source file as the canary target. For every pathway except `release` and `observability`,
-   `work-log` runs `run_generic_verifier_snapshot`, which captures the verifier's source bytes up
-   front and feeds that snapshot to the interpreter. The canary then mutates the file on disk, but the
-   snapshot is immune, so the mutant still exits 0 and the proof is stamped
-   `canary_mutant_failed: False` and `trivial_verifier: True`. The trap is that
-   `select_canary_target` still reports a valid-looking target of `verifier_named_changed_file`, so it
-   reads like the canary worked. Calling `run_canary_mutant` directly on the same command returns
-   `True`, which is how the contradiction surfaced. Found while proving the agent-assurance quality
-   lane. The working shape is to make the verify command name the data artifact it reads, so the
-   canary mutates the receipt instead of the verifier.
-5. Decide the commit boundary for the uncommitted wave described above. It has been sitting dirty
-   through at least one full day of edits.
+1. **Partly closed (carried).** `work-close` success branch still omits the closed `work_id`.
+2. **Needs re-measuring (carried).** Attestation-only proof migration backlog: re-derive from
+   the current ledger before scheduling.
+3. **Closed 2026-08-16.** The memory asserting a permanent 10-of-12 local ceiling was rewritten
+   against the shipped authority, including the release-canary recipe that actually worked.
+4. **Open, from the review.** Issuance records an issuer string but nothing authenticates it:
+   an agent and the operator share this shell. The honest next step is a PreToolUse hook that
+   denies `approval-issue` from agent-driven Bash, mirroring `external-send-guard.py`.
+5. **Open, from the review.** A second model family never reviewed this code. Run Codex or GLM
+   over `e82d9cc..5e8b0dc` when Alex authorizes an external critic send.
 
 ## Guardrails
 
 - Keep audit scoring read-only and local.
-- Preserve the separation between active proof evidence and historical migration debt.
-- Do not commit the mixed worktree without first isolating the intended diff and reviewing it. That
-  rule held on 2026-07-11 and still holds, only now the diff is far larger.
-- Stamp this file with its own date on every edit. A current-state doc with no date of its own may not
-  assert present-tense status, and file modification time is never that date.
+- Never edit the two state constants to make a number go green; they flip only with the
+  verification machinery that makes them true (done 2026-08-16, suite-gated).
+- Stamp this file with its own date on every edit. A current-state doc with no date of its own
+  may not assert present-tense status, and file modification time is never that date.
