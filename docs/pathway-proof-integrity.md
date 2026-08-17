@@ -128,6 +128,29 @@ ledger lacks a non-stale proof that still passes the current verifier. A
 production-secure outcome closes only from current verified pathway proof or a
 ledger-corroborated waiver, not from an assertion or cached status label.
 
+### Agent Bash issuance guard
+
+When loaded, the PreToolUse hook blocks agents from issuing approval tickets
+through direct Bash commands. It checks both `tool_input.command` and
+`tool_input.cmd`. It blocks direct `operating-layer.py approval-issue` calls
+before the shell starts. There is no override flag or environment escape.
+Fresh-session proof remains pending until Alex trusts the new Codex hook.
+
+The same tracked hook covers three settings files:
+
+- Claude: `~/.claude/settings.json`
+- Codex: `~/.codex/hooks.json`
+- GLM and Kimi: `~/.claude/glm-routing/claude-config/settings.json`
+
+Alex reviews the full command before issue. Alex then runs it in a normal
+Terminal or iTerm window. That manual path does not use agent PreToolUse hooks.
+
+This is still a forcing function, not human identity proof. It blocks clear
+agent Bash forms, including common wrappers and nested shells. Encoded commands,
+renamed script copies, direct engine imports, later-built commands, and other
+process tools remain outside its mechanical scope. Every approval still relies
+on the content-bound ticket, short expiry, single use, and durable ledger.
+
 Pathway hashes the Markdown evidence, structured receipt, and every referenced
 release artifact before running the verifier. It re-reads and hashes the same
 bundle after the verifier and anti-gaming canary finish. Any pre/post mismatch

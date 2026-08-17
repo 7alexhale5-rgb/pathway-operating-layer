@@ -1,20 +1,23 @@
 # Pathway Operating Layer - Present State
 
-Updated: 2026-08-16
-Active work ID: none (the engine repo itself; the transfern envelope is tracked in the ledger)
-Current outcome: the verifiable single-use waiver/approval authority is BUILT and committed.
-Release production credit and production-secure N/A waivers are now reachable through
-content-bound, single-use, Alex-issued tickets in `operator-intelligence/approvals.ndjson`.
+Updated: 2026-08-17
+Active work ID: `W-20260817-pathway-operating-layer-block-agent-driven-bash--2064b8`
+Current outcome: the approval authority is shipped. Its agent Bash issuance guard is built,
+wired, and statically verified. Codex trust and fresh-session probes still need Alex.
 
-Every number below was read from the running system on 2026-08-16.
+Guard numbers below were read from the running system on 2026-08-17.
+Authority history was last proved on 2026-08-16.
 
 ## Verified now
 
-- HEAD is `5e8b0dc` "fix(approval): close the adversarial review's findings on the ticket
-  authority". `e82d9cc` built the authority; `73d5395` committed the previously-dirty
-  2026-08-12/13 hardening wave as its own boundary, resolving follow-up 5 of the prior STATE.md.
-- The suite passes `799/799 checks` at HEAD (768 pre-existing + 31 new: the authority's twelve
-  acceptance criteria plus a regression per review finding).
+- The clean build baseline is `3c7fd07`. The current guard diff passes `1088/1088 checks`.
+  `e82d9cc` built the authority, and `5e8b0dc` closed its first review findings.
+- One tracked guard now serves Claude, Codex, GLM, and Kimi. Both installed links resolve to
+  that source. All three settings files parse and name the guard once in their Bash matcher.
+- The guard's direct fixtures deny issuance with exit `2`. Safe Pathway commands exit `0`.
+  Its latest local 120-run timing was 17.303ms p95.
+- The live approvals ledger stayed at four lines with SHA-256
+  `31f4b8cd3432e711746faa0a4065bd6ebfac1f108d55c4ea2c2649e7d7ec7dd7`.
 - `PRODUCTION_SECURE_WAIVER_STATE` and `RELEASE_PRODUCTION_APPROVAL_STATE` now read
   `CONFIGURED_AND_VERIFIED` and remain kill switches. Spec + research dossier:
   `.planning/waiver-authority/`.
@@ -52,6 +55,8 @@ readiness `ready`, no warnings — the first production release credit on this m
 - External-send (`sent`) release receipts stay fail-closed; sends use approve-send.py.
 - The authority is a forcing function and audit trail, not a cryptographic barrier — the same
   trust model as approve-send.py, stated in code and docs.
+- The Bash guard blocks known direct forms. Encoded commands, renamed copies, direct imports,
+  and other process tools stay outside its mechanical boundary.
 
 ## Follow-up queue
 
@@ -60,9 +65,9 @@ readiness `ready`, no warnings — the first production release credit on this m
    the current ledger before scheduling.
 3. **Closed 2026-08-16.** The memory asserting a permanent 10-of-12 local ceiling was rewritten
    against the shipped authority, including the release-canary recipe that actually worked.
-4. **Open, from the review.** Issuance records an issuer string but nothing authenticates it:
-   an agent and the operator share this shell. The honest next step is a PreToolUse hook that
-   denies `approval-issue` from agent-driven Bash, mirroring `external-send-guard.py`.
+4. **Implemented, live proof pending.** The PreToolUse guard denies known direct
+   `approval-issue` Bash forms. Alex still needs to trust the new Codex hook. Fresh Claude,
+   Codex, GLM, and Kimi sessions must then run the harmless blocked and allowed probes.
 5. **Open, from the review.** A second model family never reviewed this code. Run Codex or GLM
    over `e82d9cc..5e8b0dc` when Alex authorizes an external critic send.
 

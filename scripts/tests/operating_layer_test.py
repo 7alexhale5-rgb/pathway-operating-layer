@@ -7,6 +7,7 @@ Exit 0 = all pass; non-zero = failures.
 """
 import ast
 import atexit
+import hashlib
 import json
 import os
 import shlex
@@ -20,6 +21,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CLI = (HERE / ".." / "operating-layer.py").resolve()
+REPO = HERE.parent.parent
+APPROVAL_GUARD = REPO / "hooks" / "approval-issue-guard.py"
+APPROVAL_GUARD_VERIFIER = REPO / "scripts" / "verify-approval-issue-guard.py"
+INSTALLER = REPO / "install.sh"
+APPROVAL_GUARD_DENIAL = (
+    "DENIED: approval-issue is reserved for Alex. "
+    "Review the exact command, then run it in a normal Terminal.\n"
+)
 _TEST_ROOT_PARENT = Path("/private/tmp").resolve()
 ROOT = _TEST_ROOT_PARENT / f"operating-layer-test-{uuid.uuid4().hex}"
 ROOT.mkdir(mode=0o700)
@@ -144,6 +153,21 @@ def ids(data):
 
 def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def run_approval_guard(payload, env=None, raw=False):
+    hook_env = os.environ.copy()
+    if env:
+        hook_env.update(env)
+    hook_input = payload if raw else json.dumps(payload)
+    return subprocess.run(
+        [sys.executable, str(APPROVAL_GUARD)],
+        input=hook_input,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env=hook_env,
+    )
 
 
 def assert_no_secret_output(text, label):
@@ -5604,6 +5628,392 @@ def test_artifact_filename_dates_use_local_day_not_utc():
     )
 
 
+def test_approval_issue_guard_blocks_agent_shell_issuance():
+    """The PreToolUse guard blocks only executable approval issuance commands."""
+    waiver = "--kind production-secure-waiver --work-id W-test --pathway release"
+    release = "--kind release-production-approval --work-id W-test --release-receipt r.json"
+    deeply_nested = f"operating-layer.py approval-issue {waiver}"
+    for _ in range(5):
+        deeply_nested = f"bash -c {shlex.quote(deeply_nested)}"
+    blocked = [
+        ("PATH executable", f"operating-layer.py approval-issue {waiver}"),
+        ("absolute executable", f"{CLI} approval-issue {waiver}"),
+        ("live Claude symlink", f"~/.claude/scripts/operating-layer.py approval-issue {waiver}"),
+        ("relative script", f"./scripts/operating-layer.py approval-issue {waiver}"),
+        ("python script", f"python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("python flag", f"python3 -B scripts/operating-layer.py approval-issue {waiver}"),
+        ("python value flag", "python3 --check-hash-based-pycs always "
+         f"scripts/operating-layer.py approval-issue {waiver}"),
+        ("leading assignment", f"TEST_ONLY=1 operating-layer.py approval-issue {waiver}"),
+        ("env wrapper", f"env TEST_ONLY=1 python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("env split string", f"env -S 'python3 scripts/operating-layer.py approval-issue {waiver}'"),
+        ("env split argv", f"env -S python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("env split equals", f"env --split-string=python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("command env split", f"command env -S 'python3 scripts/operating-layer.py approval-issue {waiver}'"),
+        ("exec env split", f"exec env -S 'python3 scripts/operating-layer.py approval-issue {waiver}'"),
+        ("time env split", f"time env -S 'python3 scripts/operating-layer.py approval-issue {waiver}'"),
+        ("builtin command env split", f"builtin command env -S 'python3 scripts/operating-layer.py approval-issue {waiver}'"),
+        ("env split option", f"env -S '-i python3' scripts/operating-layer.py approval-issue {waiver}"),
+        ("env split separator", f"env -S -- python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("env split equals option", f"env --split-string='-i python3' scripts/operating-layer.py approval-issue {waiver}"),
+        ("env search path", f"env -P /usr/bin python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("nested env search path", f"command env -P /usr/bin python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("command wrapper", f"command python3 scripts/operating-layer.py approval-issue {waiver}"),
+        ("exec wrapper", f"exec operating-layer.py approval-issue {waiver}"),
+        ("time wrapper", f"time -p operating-layer.py approval-issue {waiver}"),
+        ("nohup wrapper", f"nohup operating-layer.py approval-issue {waiver}"),
+        ("nice wrapper", f"nice -n 5 operating-layer.py approval-issue {waiver}"),
+        ("leading redirection", f"> /tmp/approval-guard-test.log operating-layer.py approval-issue {waiver}"),
+        ("global options", f"operating-layer.py --json --claude-home /tmp/x approval-issue {waiver}"),
+        ("abbreviated global option", f"operating-layer.py --claude-ho /tmp/x approval-issue {waiver}"),
+        ("shorter global option", f"operating-layer.py --claude /tmp/x approval-issue {waiver}"),
+        ("output global option", f"operating-layer.py --out /tmp/x approval-issue {waiver}"),
+        ("bash c", f"bash -c 'operating-layer.py approval-issue {waiver}'"),
+        ("nested exec", f"bash -c 'exec operating-layer.py approval-issue {waiver}'"),
+        ("nested nice", f"bash -c 'nice operating-layer.py approval-issue {waiver}'"),
+        ("bash lc", f"/bin/bash -lc 'python3 scripts/operating-layer.py approval-issue {waiver}'"),
+        ("bash norc", f"bash --norc -c 'operating-layer.py approval-issue {waiver}'"),
+        ("bash rcfile", f"bash --rcfile /tmp/empty -c 'operating-layer.py approval-issue {waiver}'"),
+        ("sh c", f"sh -c 'operating-layer.py approval-issue {waiver}'"),
+        ("zsh lc", f"zsh -lc 'operating-layer.py approval-issue {waiver}'"),
+        ("five nested shells", deeply_nested),
+        ("semicolon chain", f"true; operating-layer.py approval-issue {waiver}"),
+        ("newline chain", f"true\noperating-layer.py approval-issue {waiver}"),
+        ("and chain", f"true && operating-layer.py approval-issue {waiver}"),
+        ("or chain", f"false || operating-layer.py approval-issue {waiver}"),
+        ("subshell", f"(operating-layer.py approval-issue {waiver})"),
+        ("brace group", f"{{ operating-layer.py approval-issue {waiver}; }}"),
+        ("negated command", f"! operating-layer.py approval-issue {waiver}"),
+        ("if condition", f"if operating-layer.py approval-issue {waiver}; then true; fi"),
+        ("nested brace group", f"bash -c '{{ operating-layer.py approval-issue {waiver}; }}'"),
+        ("quoted executable", f"operating'-'layer.py approval-issue {waiver}"),
+        ("inner quoted executable", f"operat''ing-layer.py approval-issue {waiver}"),
+        ("inner quoted executable suffix", f"operating-la''yer.py approval-issue {waiver}"),
+        ("case-folded script", f"python3 scripts/OPERATING-LAYER.PY approval-issue {waiver}"),
+        ("quoted join", f"operating-layer.py approval'-'issue {waiver}"),
+        ("inner quoted subcommand", f"operating-layer.py approv''al-issue {waiver}"),
+        ("inner quoted subcommand suffix", f"operating-layer.py approval-is''sue {waiver}"),
+        ("continued executable", f"operating-\\\nlayer.py approval-issue {waiver}"),
+        ("continued subcommand", f"operating-layer.py approval-\\\nissue {waiver}"),
+        ("ANSI-C quoted join", f"operating-layer.py approval$'-'issue {waiver}"),
+        ("ANSI-C quoted subcommand", f"operating-layer.py $'approval-issue' {waiver}"),
+        ("ANSI-C quoted executable", f"$'operating-layer.py' approval-issue {waiver}"),
+        ("locale quoted subcommand", f"operating-layer.py $\"approval-issue\" {waiver}"),
+        ("approval issue help", "operating-layer.py approval-issue --help"),
+        ("release ticket", f"operating-layer.py approval-issue {release}"),
+    ]
+    for label, command in blocked:
+        proc = run_approval_guard({"tool_name": "Bash", "tool_input": {"command": command}})
+        check(proc.returncode == 2, f"approval guard blocks {label} with exit 2")
+        check(proc.stdout == "", f"approval guard writes no stdout for {label}")
+        check(proc.stderr == APPROVAL_GUARD_DENIAL,
+              f"approval guard gives the exact manual Terminal message for {label}")
+
+    cmd_proc = run_approval_guard({
+        "tool_name": "Bash",
+        "tool_input": {"cmd": f"operating-layer.py approval-issue {waiver}"},
+    })
+    check(cmd_proc.returncode == 2, "approval guard supports the Codex cmd payload")
+    check(cmd_proc.stdout == "", "approval guard writes no stdout for a cmd payload")
+    check(cmd_proc.stderr == APPROVAL_GUARD_DENIAL,
+          "approval guard gives the exact denial for a cmd payload")
+
+    mixed_proc = run_approval_guard({
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "true",
+            "cmd": f"operating-layer.py approval-issue {waiver}",
+        },
+    })
+    check(mixed_proc.returncode == 2, "approval guard checks both command fields")
+    check(mixed_proc.stdout == "", "approval guard writes no stdout for mixed fields")
+    check(mixed_proc.stderr == APPROVAL_GUARD_DENIAL,
+          "approval guard gives the exact denial for mixed fields")
+
+    malformed = run_approval_guard({
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "python3 scripts/operating-layer.py approval-issue --reason 'unterminated",
+        },
+    })
+    check(malformed.returncode == 2, "approval guard blocks runner-first malformed shell text")
+    check(malformed.stdout == "", "approval guard malformed fallback writes no stdout")
+    check(malformed.stderr == APPROVAL_GUARD_DENIAL,
+          "approval guard malformed fallback gives the exact denial")
+
+    for variable in ("CLAUDE_HOOK_FORCE", "EXTERNAL_SEND_APPROVED"):
+        proc = run_approval_guard(
+            {"tool_name": "Bash", "tool_input": {"command": blocked[0][1]}},
+            env={variable: "1"},
+        )
+        check(proc.returncode == 2, f"approval guard has no {variable} override")
+        check(proc.stderr == APPROVAL_GUARD_DENIAL,
+              f"approval guard keeps the exact denial with {variable}")
+
+
+def test_approval_issue_guard_allows_non_issuance_text_and_fail_open_inputs():
+    """Search, help, tests, reads, prose, and malformed hook data stay usable."""
+    allowed_commands = [
+        ("other subcommand", "operating-layer.py work-status --work-id approval-issue"),
+        ("top-level help", "operating-layer.py --help"),
+        ("test runner", "python3 scripts/tests/operating_layer_test.py"),
+        ("ripgrep", "rg 'approval-issue' hooks scripts"),
+        ("git grep", "git grep approval-issue"),
+        ("printf prose", "printf '%s\\n' 'operating-layer.py approval-issue --help'"),
+        ("documentation read", "sed -n '/approval-issue/p' docs/pathway-proof-integrity.md"),
+        ("commit text", "git commit -m 'Document approval-issue guard'"),
+        ("approval ledger read", "wc -l ~/.claude/operator-intelligence/approvals.ndjson"),
+        ("malformed search", "rg 'approval-issue"),
+        ("python short help", "python3 -h scripts/operating-layer.py approval-issue --help"),
+        ("python long help", "python3 --help scripts/operating-layer.py approval-issue --help"),
+        ("python short version", "python3 -V scripts/operating-layer.py approval-issue --help"),
+        ("python long version", "python3 --version scripts/operating-layer.py approval-issue --help"),
+        ("python environment help", "python3 --help-env scripts/operating-layer.py approval-issue --help"),
+        ("python xoptions help", "python3 --help-xoptions scripts/operating-layer.py approval-issue --help"),
+        ("python all help", "python3 --help-all scripts/operating-layer.py approval-issue --help"),
+        ("bash help", "bash --help -c 'operating-layer.py approval-issue --help'"),
+        ("sh help", "sh --help -c 'operating-layer.py approval-issue --help'"),
+        ("zsh version", "zsh --version -c 'operating-layer.py approval-issue --help'"),
+        ("bash shopt filename", "bash -Ocmdhist 'operating-layer.py approval-issue --help'"),
+        ("safe option value", "operating-layer.py --goal approval-issue pathway-next --help"),
+        ("plain here-doc", "cat <<EOF\noperating-layer.py approval-issue --help\nEOF"),
+        ("quoted here-doc", "cat <<'DOC'\noperating-layer.py approval-issue --help\nDOC"),
+    ]
+    for label, command in allowed_commands:
+        proc = run_approval_guard({"tool_name": "Bash", "tool_input": {"command": command}})
+        check(proc.returncode == 0, f"approval guard allows {label}")
+        check(proc.stdout == "" and proc.stderr == "",
+              f"approval guard is silent for {label}")
+
+    allowed_payloads = [
+        ("empty payload", {}),
+        ("missing tool input", {"tool_name": "Bash"}),
+        ("missing command", {"tool_name": "Bash", "tool_input": {}}),
+        ("non-string command", {"tool_name": "Bash", "tool_input": {"command": ["approval-issue"]}}),
+        ("unrelated tool", {
+            "tool_name": "Read",
+            "tool_input": {"command": "operating-layer.py approval-issue --help"},
+        }),
+    ]
+    for label, payload in allowed_payloads:
+        proc = run_approval_guard(payload)
+        check(proc.returncode == 0, f"approval guard allows {label}")
+        check(proc.stdout == "" and proc.stderr == "",
+              f"approval guard is silent for {label}")
+
+    invalid = run_approval_guard("{not-json", raw=True)
+    check(invalid.returncode == 0, "approval guard fails open on invalid JSON")
+    check(invalid.stdout == "" and invalid.stderr == "",
+          "approval guard is silent on invalid JSON")
+
+
+def test_approval_issue_guard_installer_uses_one_canonical_source():
+    """The installer links both agent homes to the repo-owned guard."""
+    reset()
+    claude_home = ROOT / "installer-claude"
+    codex_home = ROOT / "installer-codex"
+    env = os.environ.copy()
+    env.update({
+        "CLAUDE_HOME": str(claude_home),
+        "PATHWAY_CODEX_HOME": str(codex_home),
+    })
+    proc = subprocess.run(
+        ["bash", str(INSTALLER)], capture_output=True, text=True, timeout=30, env=env,
+    )
+    check(proc.returncode == 0, f"guard installer succeeds in temp homes ({proc.stderr.strip()})")
+    for agent, link in (
+        ("Claude", claude_home / "hooks" / "approval-issue-guard.py"),
+        ("Codex", codex_home / "hooks" / "approval-issue-guard.py"),
+    ):
+        check(link.is_symlink(), f"guard installer creates the {agent} symlink")
+        check(link.resolve() == APPROVAL_GUARD.resolve(),
+              f"guard installer points {agent} at the canonical repo source")
+
+
+def test_approval_issue_guard_repeatable_verifier():
+    """The verifier proves live wiring without touching a real approval command."""
+    reset()
+    claude_home = ROOT / "verify-claude"
+    codex_home = ROOT / "verify-codex"
+    isolated_settings = ROOT / "verify-isolated" / "settings.json"
+    ledger = ROOT / "fake-approvals.ndjson"
+    ledger_bytes = b'{"event":"issued","ticket_id":"AC-test-only"}\n'
+    ledger.write_bytes(ledger_bytes)
+
+    install_env = os.environ.copy()
+    install_env.update({
+        "CLAUDE_HOME": str(claude_home),
+        "PATHWAY_CODEX_HOME": str(codex_home),
+    })
+    installed = subprocess.run(
+        ["bash", str(INSTALLER)], capture_output=True, text=True, timeout=30, env=install_env,
+    )
+    check(installed.returncode == 0,
+          f"verifier fixture installs guard links ({installed.stderr.strip()})")
+
+    claude_hook = claude_home / "hooks" / "approval-issue-guard.py"
+    codex_hook = codex_home / "hooks" / "approval-issue-guard.py"
+    claude_settings = claude_home / "settings.json"
+    codex_settings = codex_home / "hooks.json"
+
+    def settings_payload(command, after=False, duplicate=False):
+        guard = {"type": "command", "command": command, "timeout": 5}
+        handlers = [{"type": "command", "command": "python3 /tmp/earlier-hook.py"}, guard]
+        if duplicate:
+            handlers.insert(1, dict(guard))
+        if after:
+            handlers.append({"type": "command", "command": "python3 /tmp/later-hook.py"})
+        return {
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Read", "hooks": []},
+                    {"matcher": "Bash", "hooks": handlers},
+                ],
+            },
+        }
+
+    def save_settings(path, command, **changes):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(settings_payload(command, **changes), indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    claude_command = f"python3 {claude_hook}"
+    codex_command = f"python3 {codex_hook}"
+    save_settings(claude_settings, claude_command)
+    save_settings(codex_settings, codex_command)
+    save_settings(isolated_settings, claude_command)
+    settings_before = {
+        path: path.read_bytes()
+        for path in (claude_settings, codex_settings, isolated_settings)
+    }
+
+    verifier_cmd = [
+        sys.executable,
+        str(APPROVAL_GUARD_VERIFIER),
+        "--repo-hook", str(APPROVAL_GUARD),
+        "--claude-hook", str(claude_hook),
+        "--codex-hook", str(codex_hook),
+        "--claude-settings", str(claude_settings),
+        "--codex-settings", str(codex_settings),
+        "--isolated-settings", str(isolated_settings),
+        "--ledger", str(ledger),
+        "--runs", "4",
+    ]
+
+    def verify():
+        return subprocess.run(
+            verifier_cmd, capture_output=True, text=True, timeout=30,
+        )
+
+    def verify_source(source, runs="1"):
+        command = list(verifier_cmd)
+        command[command.index("--repo-hook") + 1] = str(source)
+        command[command.index("--runs") + 1] = runs
+        return subprocess.run(
+            command, capture_output=True, text=True, timeout=30,
+        )
+
+    def point_installed_links(source):
+        for link in (claude_hook, codex_hook):
+            link.unlink()
+            link.symlink_to(source)
+
+    def verifier_json(proc):
+        try:
+            return json.loads(proc.stdout)
+        except (TypeError, ValueError):
+            return {}
+
+    passed = verify()
+    summary = verifier_json(passed)
+    check(passed.returncode == 0,
+          f"repeatable approval guard verifier passes its complete fixture ({passed.stderr.strip()})")
+    check(summary.get("status") == "pass", "approval guard verifier returns a JSON pass status")
+    check(summary.get("run_count") == 4, "approval guard verifier honors its run-count override")
+    check(summary.get("settings_checked") == 3,
+          "approval guard verifier reports all three settings files")
+    check(summary.get("symlinks_checked") == 2,
+          "approval guard verifier reports both installed links")
+    check(summary.get("blocked_fixtures") == 15 and summary.get("allowed_fixtures") == 12,
+          "approval guard verifier runs fixtures through source and both installed links")
+    check(isinstance(summary.get("p95_ms"), (int, float)) and summary.get("p95_ms") < 50,
+          "approval guard verifier reports p95 below 50ms")
+    check(summary.get("ledger_unchanged") is True and ledger.read_bytes() == ledger_bytes,
+          "approval guard verifier leaves fake ledger bytes unchanged")
+    check(summary.get("ledger_sha256") == hashlib.sha256(ledger_bytes).hexdigest(),
+          "approval guard verifier reports the fake ledger SHA-256")
+    check(summary.get("ledger_line_count") == 1,
+          "approval guard verifier reports the fake ledger line count")
+    check(all(path.read_bytes() == before for path, before in settings_before.items()),
+          "approval guard verifier leaves all settings bytes unchanged")
+
+    save_settings(codex_settings, codex_command, after=True)
+    not_last = verify()
+    check(not_last.returncode != 0 and "last" in not_last.stdout.lower(),
+          "approval guard verifier rejects a guard that is not last")
+    save_settings(codex_settings, codex_command)
+
+    save_settings(isolated_settings, claude_command, duplicate=True)
+    duplicate = verify()
+    check(duplicate.returncode != 0 and "exactly one" in duplicate.stdout.lower(),
+          "approval guard verifier rejects duplicate guard entries")
+    save_settings(isolated_settings, claude_command)
+
+    claude_settings.write_text("{bad-json", encoding="utf-8")
+    invalid = verify()
+    check(invalid.returncode != 0 and "valid json" in invalid.stdout.lower(),
+          "approval guard verifier rejects invalid settings JSON")
+    save_settings(claude_settings, claude_command)
+
+    slow_hook = ROOT / "slow-approval-guard.py"
+    slow_hook.write_text(
+        "import subprocess, sys, time\n"
+        "time.sleep(0.06)\n"
+        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
+        "input=sys.stdin.read(), capture_output=True, text=True)\n"
+        "sys.stdout.write(proc.stdout)\n"
+        "sys.stderr.write(proc.stderr)\n"
+        "raise SystemExit(proc.returncode)\n",
+        encoding="utf-8",
+    )
+    point_installed_links(slow_hook)
+    slow = verify_source(slow_hook)
+    check(slow.returncode != 0 and "p95" in slow.stdout.lower(),
+          "approval guard verifier rejects a hook at or above the p95 limit")
+
+    mutating_hook = ROOT / "mutating-approval-guard.py"
+    mutating_hook.write_text(
+        "import subprocess, sys\n"
+        "from pathlib import Path\n"
+        f"with Path({str(ledger)!r}).open('ab') as handle:\n"
+        "    handle.write(b'test-only-change\\n')\n"
+        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
+        "input=sys.stdin.read(), capture_output=True, text=True)\n"
+        "sys.stdout.write(proc.stdout)\n"
+        "sys.stderr.write(proc.stderr)\n"
+        "raise SystemExit(proc.returncode)\n",
+        encoding="utf-8",
+    )
+    point_installed_links(mutating_hook)
+    changed_ledger = verify_source(mutating_hook)
+    check(changed_ledger.returncode != 0
+          and "ledger bytes changed" in changed_ledger.stdout.lower(),
+          "approval guard verifier rejects any ledger mutation")
+
+    ledger.write_bytes(ledger_bytes)
+    point_installed_links(APPROVAL_GUARD)
+
+    codex_hook.unlink()
+    codex_hook.symlink_to(CLI)
+    wrong_link = verify()
+    check(wrong_link.returncode != 0 and "tracked source" in wrong_link.stdout.lower(),
+          "approval guard verifier rejects a link to the wrong source")
+    check(ledger.read_bytes() == ledger_bytes,
+          "approval guard verifier failure paths leave fake ledger bytes unchanged")
+
+
 def test_approval_authority_single_use_waiver_and_release_credit():
     """The verifiable single-use waiver/approval authority (SPEC 2026-08-16): content-bound
     tickets, 15-minute expiry, single-use durable consumption, fail-closed refusals, and
@@ -5993,6 +6403,10 @@ def main():
         test_project_scoping_no_substring_bleed,
         test_pathway_execution_profile_invariants,
         test_itinerary_coverage_guarantee,
+        test_approval_issue_guard_blocks_agent_shell_issuance,
+        test_approval_issue_guard_allows_non_issuance_text_and_fail_open_inputs,
+        test_approval_issue_guard_installer_uses_one_canonical_source,
+        test_approval_issue_guard_repeatable_verifier,
         test_approval_authority_single_use_waiver_and_release_credit,
         test_approval_authority_survives_review_findings,
         test_proof_add_flips_itinerary_coverage,
