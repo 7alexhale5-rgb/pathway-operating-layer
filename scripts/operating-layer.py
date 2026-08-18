@@ -987,6 +987,12 @@ RELEASE_RECEIPT_ARTIFACT_FIELDS = (
 RELEASE_CONTEXT_FIELDS = ("work_id", "recommendation_id", "target_project")
 RELEASE_MAX_EVIDENCE_AGE_SECONDS = 86_400
 RELEASE_MAX_FUTURE_SKEW_SECONDS = 300
+RELEASE_PROVIDER_ACTION_KIND = "release-provider-action"
+RELEASE_PROVIDER_ACTIONS = {
+    "apply-product-migration",
+    "deploy-canary",
+    "promote-public-stage",
+}
 # Flipped from VERIFIABLE_APPROVAL_NOT_CONFIGURED on 2026-08-16 when the single-use approval
 # authority shipped. proof_is_verified still consults it, so it remains the release-credit kill
 # switch; per-proof crediting additionally requires a consumed, ledger-corroborated ticket.
@@ -1229,6 +1235,99 @@ def release_verifier_binding(stdout, receipt_sha256):
     errors.extend(f"release verifier emitted duplicate marker {key}" for key in sorted(duplicate_keys))
     if not receipt_sha256 or markers.get("RELEASE_RECEIPT_SHA256", "").lower() != receipt_sha256.lower():
         errors.append("release verifier must emit the exact RELEASE_RECEIPT_SHA256")
+    return {"markers": markers, "errors": errors, "bound": not errors}
+
+
+def release_provider_action_from_evidence(evidence_path):
+    """Load one frozen provider-action authorization without treating it as final release state."""
+    candidate = Path(evidence_path).expanduser() if evidence_path else Path()
+    errors = []
+    if candidate.suffix.lower() != ".json":
+        errors.append("release provider action requires a JSON authorization artifact")
+    if candidate.is_symlink():
+        errors.append("release provider action authorization must not be a symlink")
+    if not candidate.is_file():
+        errors.append("release provider action authorization must be an existing file")
+    authorization = {}
+    if not errors:
+        authorization, parse_errors = _read_strict_json_object(
+            candidate, "release provider action authorization")
+        errors.extend(parse_errors)
+    action = authorization.get("action") if isinstance(authorization, dict) else None
+    if action not in RELEASE_PROVIDER_ACTIONS:
+        errors.append("release provider action authorization has an unknown action")
+    receipt_path = ""
+    receipt_sha256 = ""
+    if candidate.is_file() and not candidate.is_symlink():
+        try:
+            receipt_path = str(candidate.resolve())
+            receipt_sha256 = sha256_file(candidate)
+        except OSError:
+            errors.append("release provider action authorization could not be resolved")
+    return {
+        "receipt": authorization,
+        "receipt_path": receipt_path,
+        "receipt_sha256": receipt_sha256,
+        "credit_scope": "",
+        "errors": errors,
+        "artifact_sha256": {},
+        "action": action if isinstance(action, str) else "",
+    }
+
+
+def release_provider_action_verifier_binding(stdout, expected_action, receipt_sha256):
+    """Bind one intermediate provider action to exact output, action, and authorization bytes.
+
+    This contract deliberately has no final-release markers. A successful provider action may
+    consume its ticket, but it cannot claim deployment, canary, rollback, or release credit.
+    """
+    allowed = {
+        "PROVIDER_ACTION", "PROVIDER_ACTION_PROOF", "PATHWAY_RESULT",
+        "RELEASE_RECEIPT_SHA256",
+    }
+    markers = {}
+    duplicates = set()
+    extra_markers = set()
+    unexpected_output = False
+    for line in (stdout or "").splitlines():
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=([^\r\n]+)", line)
+        if not match:
+            unexpected_output = True
+            continue
+        key, value = match.group(1), match.group(2)
+        if key not in allowed:
+            extra_markers.add(key)
+            continue
+        if key in markers:
+            duplicates.add(key)
+            continue
+        markers[key] = value
+    errors = []
+    if unexpected_output:
+        errors.append("provider-action verifier emitted unexpected output")
+    errors.extend(
+        f"provider-action verifier emitted extra marker {key}"
+        for key in sorted(extra_markers)
+    )
+    errors.extend(
+        f"provider-action verifier emitted duplicate marker {key}"
+        for key in sorted(duplicates)
+    )
+    if expected_action not in RELEASE_PROVIDER_ACTIONS:
+        errors.append("provider-action evidence names an unknown action")
+    emitted_action = markers.get("PROVIDER_ACTION", "")
+    if emitted_action not in RELEASE_PROVIDER_ACTIONS:
+        errors.append("provider-action verifier emitted an unknown action")
+    elif emitted_action != expected_action:
+        errors.append("provider-action verifier action does not match the authorization")
+    if markers.get("PROVIDER_ACTION_PROOF") != "PASS":
+        errors.append("provider-action verifier must emit PROVIDER_ACTION_PROOF=PASS")
+    if markers.get("PATHWAY_RESULT") != "PASS":
+        errors.append("provider-action verifier must emit PATHWAY_RESULT=PASS")
+    if not receipt_sha256 or markers.get("RELEASE_RECEIPT_SHA256") != receipt_sha256:
+        errors.append("provider-action verifier must emit the exact RELEASE_RECEIPT_SHA256")
+    if set(markers) != allowed:
+        errors.append("provider-action verifier must emit exactly the four required markers")
     return {"markers": markers, "errors": errors, "bound": not errors}
 
 
@@ -2993,6 +3092,8 @@ def proof_is_verified(proof):
             and not generic_verifier_source_is_current(proof)):
         return False
     if proof.get("pathway") == "release":
+        if proof.get("release_provider_action_contract") is True:
+            return False
         if RELEASE_PRODUCTION_APPROVAL_STATE != "CONFIGURED_AND_VERIFIED":
             return False
         return (
@@ -3987,6 +4088,10 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "high",
         )
     proof_type = args.proof_type or "artifact"
+    release_provider_action_contract = (
+        (args.pathway or "") == "release"
+        and (args.kind or "") == RELEASE_PROVIDER_ACTION_KIND
+    )
     template_check = check_verifier_template(args.pathway or "", safe_read_text(evidence_path, max_bytes=64_000))
     cli_project_path = resolve_project_dir(getattr(args, "project", None), projects_root)
     project_path = cli_project_path
@@ -4032,7 +4137,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             release_approval_available = _active is not None or (
                 _prior is not None and _prior.get("consumed_by") == proof_id)
     release_receipt = (
-        release_receipt_from_evidence(
+        release_provider_action_from_evidence(evidence_path)
+        if release_provider_action_contract
+        else release_receipt_from_evidence(
             evidence_path, proof_context, now=utc_now(),
             production_approval=release_approval_available)
         if (args.pathway or "") == "release"
@@ -4041,6 +4148,12 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "errors": [], "artifact_sha256": {},
         }
     )
+    if release_provider_action_contract:
+        template_check = {
+            "valid": not release_receipt["errors"],
+            "template_id": "release-provider-action-v1",
+            "missing": list(release_receipt["errors"]),
+        }
     observability_receipt = (
         observability_receipt_from_evidence(evidence_path, proof_context, now=utc_now())
         if (args.pathway or "") == "observability"
@@ -4080,7 +4193,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             verify_cmd.strip().encode("utf-8", "replace")
         ).hexdigest()
         verifier_source_sha256 = verify_command_sha256
-        if (args.pathway or "") not in {"release", "observability"}:
+        if (release_provider_action_contract
+                or (args.pathway or "") not in {"release", "observability"}):
             generic_binding = parse_generic_verifier_command(verify_cmd, verify_cwd)
             verifier_source_kind = generic_binding["kind"]
             verifier_source_path = generic_binding["path"]
@@ -4100,6 +4214,39 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             # flip a pathway to proved.
             verify_error = "cwd_invalid"
             canary_target_reason = "cwd_invalid"
+        elif release_provider_action_contract:
+            # Provider actions are already complete when logged. Re-run the fixed read-only
+            # verifier once, then bind its exact four-marker output to the frozen authorization.
+            # Do not mutate production evidence to manufacture an anti-gaming canary.
+            if verifier_source_error:
+                verify_error = "release_provider_action_verifier_not_executed"
+                canary_target_reason = verifier_source_error
+                verifier_snapshot_stable = False
+            else:
+                _t0 = time.monotonic()
+                exit_code, verify_stdout_sha256, verify_stdout_bytes, verify_stdout = (
+                    run_generic_verifier_snapshot(generic_binding, verify_cwd)
+                )
+                first_run_secs = time.monotonic() - _t0
+                trivial_verifier = verify_stdout_bytes < STDOUT_BYTE_FLOOR
+                canary_target_reason = (
+                    "provider_action_contract_bound"
+                    if not trivial_verifier and first_run_secs <= CANARY_MAX_VERIFY_SECONDS
+                    else "provider_action_verifier_trivial_or_slow"
+                )
+                verifier_post_source_sha256 = sha256_file(generic_binding["resolved_path"])
+                verifier_post_interpreter_sha256 = sha256_file(
+                    generic_binding["interpreter_path"]
+                )
+                verifier_snapshot_stable = (
+                    generic_verifier_snapshot_is_stable(generic_binding)
+                    and verifier_post_source_sha256 == verifier_source_sha256
+                    and verifier_post_interpreter_sha256 == verifier_interpreter_sha256
+                )
+                if not verifier_snapshot_stable:
+                    verifier_source_error = (
+                        "release_provider_action_verifier_source_changed_during_execution"
+                    )
         elif ((args.pathway or "") == "observability"
               and observability_receipt.get("receipt_kind") == "runtime"):
             command_check = parse_observability_verifier_command(
@@ -4222,7 +4369,40 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
     release_post_artifact_sha256 = artifact_sha256
     release_post_receipt_sha256 = release_receipt["receipt_sha256"]
     release_post_release_artifact_sha256 = dict(release_receipt["artifact_sha256"])
-    if (args.pathway or "") == "release":
+    if release_provider_action_contract:
+        # The authorization is the approval subject. It must stay byte-for-byte stable from the
+        # approval peek through verifier completion and ticket consumption.
+        release_post_artifact_sha256 = sha256_file(evidence_path)
+        post_receipt = release_provider_action_from_evidence(evidence_path)
+        release_post_receipt_sha256 = post_receipt["receipt_sha256"]
+        if release_post_artifact_sha256 != artifact_sha256:
+            release_snapshot_errors.append(
+                "release provider action authorization changed during verifier execution"
+            )
+        if post_receipt["receipt_path"] != release_receipt["receipt_path"]:
+            release_snapshot_errors.append(
+                "release provider action authorization path changed during verifier execution"
+            )
+        if release_post_receipt_sha256 != release_receipt["receipt_sha256"]:
+            release_snapshot_errors.append(
+                "release provider action authorization digest changed during verifier execution"
+            )
+        if post_receipt["action"] != release_receipt["action"]:
+            release_snapshot_errors.append(
+                "release provider action changed during verifier execution"
+            )
+        if post_receipt["errors"]:
+            release_snapshot_errors.append(
+                "post-verification release provider action authorization is invalid: "
+                + "; ".join(post_receipt["errors"][:3])
+            )
+        release_snapshot_stable = not release_snapshot_errors
+        if release_snapshot_errors:
+            release_receipt = {
+                **release_receipt,
+                "errors": list(release_receipt["errors"]) + release_snapshot_errors,
+            }
+    elif (args.pathway or "") == "release":
         # Release evidence is security state, not passive documentation. Snapshot the complete
         # evidence bundle before running an operator-controlled verifier, then re-read it only
         # after the verifier and canary have finished and the canary target has been restored.
@@ -4258,7 +4438,16 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             }
     release_binding = (
         release_verifier_binding(verify_stdout, release_receipt["receipt_sha256"])
-        if (args.pathway or "") == "release"
+        if (args.pathway or "") == "release" and not release_provider_action_contract
+        else {"markers": {}, "errors": [], "bound": False}
+    )
+    release_provider_action_binding = (
+        release_provider_action_verifier_binding(
+            verify_stdout,
+            release_receipt.get("action", ""),
+            release_receipt["receipt_sha256"],
+        )
+        if release_provider_action_contract
         else {"markers": {}, "errors": [], "bound": False}
     )
     observability_snapshot_stable = True
@@ -4336,12 +4525,25 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
     release_approval_digest = ""
     release_approval_consumed_id = ""
     release_approval_error = ""
+    release_provider_action_verified = False
     if (args.pathway or "") == "release":
         if paths is None:
             release_approval_error = "approval_context_unavailable"
         elif release_approval_subject_value is None:
             release_approval_error = "no_release_receipt_companion"
-        elif not (
+        elif release_provider_action_contract and not (
+            verifier_strength == "executed"
+            and exit_code == 0
+            and not trivial_verifier
+            and not verifier_source_error
+            and verifier_snapshot_stable
+            and not release_receipt["errors"]
+            and release_snapshot_stable
+            and not release_snapshot_errors
+            and release_provider_action_binding["bound"]
+        ):
+            release_approval_error = "release_provider_action_not_verified"
+        elif not release_provider_action_contract and not (
             exit_code == 0
             and canary_mutant_failed is True
             and release_receipt["credit_scope"] == "production"
@@ -4360,6 +4562,7 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 release_approval_verified = True
                 release_approval_digest = _consumed_event.get("subject_digest", "")
                 release_approval_consumed_id = _consumed_event.get("consumption_id", "")
+                release_provider_action_verified = release_provider_action_contract
     proof = {
         "proof_id": proof_id,
         "timestamp": iso_now(),
@@ -4410,6 +4613,13 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "release_verifier_markers": release_binding["markers"],
         "release_verifier_errors": release_binding["errors"],
         "release_verifier_bound": release_binding["bound"],
+        "release_provider_action": release_receipt.get("action", "")
+        if release_provider_action_contract else "",
+        "release_provider_action_contract": release_provider_action_contract,
+        "release_provider_action_verified": release_provider_action_verified,
+        "release_provider_action_verifier_markers": release_provider_action_binding["markers"],
+        "release_provider_action_verifier_errors": release_provider_action_binding["errors"],
+        "release_provider_action_verifier_bound": release_provider_action_binding["bound"],
         "release_approval_verified": release_approval_verified,
         "release_approval_digest": release_approval_digest,
         "release_approval_consumed_id": release_approval_consumed_id,
@@ -4449,7 +4659,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
     # a trivial transcript quietly parked the pathway in logged_unverified —
     # the caller had no signal until a later work-status archaeology dig
     # (2026-08-10: three re-log rounds before anyone saw cwd_invalid).
-    if verify_cmd and not proof_is_verified(proof):
+    if (verify_cmd and not proof_is_verified(proof)
+            and not proof.get("release_provider_action_verified")):
         if verify_error == "cwd_invalid":
             reason = (
                 f"the verifier never ran — cwd '{project_path or evidence_path}' is not a directory. "
@@ -4476,6 +4687,25 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             )
         elif proof.get("template_check", {}).get("valid") is False:
             reason = "the evidence artifact does not satisfy the pathway verifier template."
+        elif (proof.get("pathway") == "release"
+              and proof.get("release_provider_action_contract") is True
+              and proof.get("release_receipt_errors")):
+            reason = "the provider-action authorization is invalid: " + "; ".join(
+                proof.get("release_receipt_errors", [])[:3]
+            )
+        elif (proof.get("pathway") == "release"
+              and proof.get("release_provider_action_contract") is True
+              and proof.get("release_provider_action_verifier_errors")):
+            reason = "the provider-action verifier output is invalid: " + "; ".join(
+                proof.get("release_provider_action_verifier_errors", [])[:3]
+            )
+        elif (proof.get("pathway") == "release"
+              and proof.get("release_provider_action_contract") is True
+              and not proof.get("release_approval_verified")):
+            reason = (
+                "the provider action did not consume its exact single-use approval ticket "
+                f"(refusal: {proof.get('release_approval_error') or 'not_consumed'})."
+            )
         elif proof.get("pathway") == "release" and proof.get("release_receipt_errors"):
             reason = "the structured release receipt is not creditable: " + "; ".join(
                 proof.get("release_receipt_errors", [])[:3]

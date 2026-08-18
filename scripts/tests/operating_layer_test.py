@@ -6269,6 +6269,221 @@ Release preflight is complete and rollback is verified.
           "a release proof whose approval is missing from the ledger loses credit at status time")
 
 
+def test_release_provider_action_consumes_approval_without_release_credit():
+    """A provider action has its own closed verifier contract. It may consume the exact
+    production approval after the action ran, but it is not the final release receipt and can
+    never close the release pathway."""
+    opl = load_cli("release_provider_action")
+    reset()
+    proj = ROOT / "projects" / "provider-action-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "ship a production release through approved provider actions",
+        "--tier", "live",
+    ])
+    wid = started["work_id"]
+    approvals_path = ROOT / "out/operator-intelligence/approvals.ndjson"
+    proofs_path = ROOT / "out/operator-intelligence/proofs.ndjson"
+
+    allowed_actions = {
+        "apply-product-migration", "deploy-canary", "promote-public-stage",
+    }
+    check(opl.RELEASE_PROVIDER_ACTIONS == allowed_actions,
+          "provider-action contract exposes only the three fixed release actions")
+
+    digest = "a" * 64
+    valid_stdout = (
+        "PROVIDER_ACTION=deploy-canary\n"
+        "PROVIDER_ACTION_PROOF=PASS\n"
+        "PATHWAY_RESULT=PASS\n"
+        f"RELEASE_RECEIPT_SHA256={digest}\n"
+    )
+    check(opl.release_provider_action_verifier_binding(
+        valid_stdout, "deploy-canary", digest)["bound"] is True,
+        "provider-action verifier accepts the exact four-marker contract")
+    rejected_bindings = {
+        "wrong action": valid_stdout.replace("deploy-canary", "apply-product-migration"),
+        "unknown action": valid_stdout.replace("deploy-canary", "deploy-everything"),
+        "duplicate marker": valid_stdout + "PATHWAY_RESULT=PASS\n",
+        "extra marker": valid_stdout + "RELEASE_DECISION=RELEASE\n",
+        "digest mismatch": valid_stdout.replace(digest, "b" * 64),
+        "false deployed claim": valid_stdout + "PRODUCTION_STATUS=DEPLOYED\n",
+    }
+    for label, stdout in rejected_bindings.items():
+        check(not opl.release_provider_action_verifier_binding(
+            stdout, "deploy-canary", digest)["bound"],
+            f"provider-action verifier rejects {label}")
+
+    def authorization(name, action="deploy-canary"):
+        return write(f"out/operator-artifacts/{name}.json", json.dumps({
+            "version": 1,
+            "work_id": wid,
+            "project": proj.name,
+            "site": "https://example.test",
+            "action": action,
+            "fixture": name,
+        }, sort_keys=True))
+
+    def issue(receipt, reason):
+        result, _ = run("approval-issue", [
+            "--kind", "release-production-approval",
+            "--work-id", wid,
+            "--release-receipt", str(receipt),
+            "--reason", reason,
+        ])
+        return result
+
+    def verifier(name, stdout, exit_code=0, mutate_receipt=None):
+        mutation = (
+            "from pathlib import Path\n"
+            f"Path({str(mutate_receipt)!r}).write_text('tampered', encoding='utf-8')\n"
+            if mutate_receipt else ""
+        )
+        source = write(
+            f"out/test-verifiers/{name}.py",
+            "import sys\n" + mutation
+            + f"sys.stdout.write({stdout!r})\n"
+            + f"raise SystemExit({exit_code})\n",
+        )
+        return " ".join(shlex.quote(value) for value in (sys.executable, "-B", str(source)))
+
+    def log_action(receipt, recommendation, stdout, exit_code=0, mutate_receipt=None):
+        result, _ = run("work-log", [
+            "--work-id", wid,
+            "--pathway", "release",
+            "--kind", "release-provider-action",
+            "--gate", f"release-{recommendation}",
+            "--evidence", str(receipt),
+            "--result", "pass",
+            "--proof-type", "executed",
+            "--project", str(proj),
+            "--recommendation-id", recommendation,
+            "--verify-cmd", verifier(
+                recommendation, stdout, exit_code, mutate_receipt=mutate_receipt),
+        ])
+        return next(record for record in result.get("records", [])
+                    if record.get("source") == "operating-layer proof registry")
+
+    def action_stdout(action, receipt, *, extra=""):
+        return (
+            f"PROVIDER_ACTION={action}\n"
+            "PROVIDER_ACTION_PROOF=PASS\n"
+            "PATHWAY_RESULT=PASS\n"
+            f"RELEASE_RECEIPT_SHA256={opl.sha256_file(receipt)}\n"
+            f"{extra}"
+        )
+
+    # A failed verifier cannot burn the matching ticket.
+    failed_receipt = authorization("failed-action")
+    failed_issue = issue(failed_receipt, "approve failed action fixture")
+    failed_proof = log_action(
+        failed_receipt, "REC-provider-failed",
+        action_stdout("deploy-canary", failed_receipt), exit_code=7,
+    )
+    events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    check(failed_proof.get("release_approval_verified") is False
+          and not any(event.get("event") == "consumed"
+                      and event.get("subject_digest") == failed_issue.get("subject_digest")
+                      for event in events),
+          "failed provider verifier leaves its ticket unused")
+
+    # A verifier that changes the authorization cannot burn its matching ticket.
+    mutated_receipt = authorization("mutated-action")
+    mutated_issue = issue(mutated_receipt, "approve snapshot mutation fixture")
+    mutated_proof = log_action(
+        mutated_receipt, "REC-provider-mutated",
+        action_stdout("deploy-canary", mutated_receipt),
+        mutate_receipt=mutated_receipt,
+    )
+    events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    check(mutated_proof.get("release_snapshot_stable") is False
+          and mutated_proof.get("release_approval_verified") is False
+          and not any(event.get("event") == "consumed"
+                      and event.get("subject_digest") == mutated_issue.get("subject_digest")
+                      for event in events),
+          "provider-action authorization mutation leaves its ticket unused")
+
+    # A ticket for different bytes cannot authorize this evidence.
+    mismatch_receipt = authorization("ticket-mismatch")
+    other_receipt = authorization("ticket-mismatch-other", "promote-public-stage")
+    mismatch_issue = issue(other_receipt, "approve other authorization bytes")
+    mismatch_proof = log_action(
+        mismatch_receipt, "REC-provider-ticket-mismatch",
+        action_stdout("deploy-canary", mismatch_receipt),
+    )
+    events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    check(mismatch_proof.get("release_approval_verified") is False
+          and not any(event.get("event") == "consumed"
+                      and event.get("subject_digest") == mismatch_issue.get("subject_digest")
+                      for event in events),
+          "provider action refuses a ticket bound to different authorization bytes")
+
+    # Extra final-release claims fail closed and leave the exact ticket live.
+    extra_receipt = authorization("extra-marker")
+    extra_issue = issue(extra_receipt, "approve extra marker fixture")
+    extra_proof = log_action(
+        extra_receipt, "REC-provider-extra-marker",
+        action_stdout("deploy-canary", extra_receipt, extra="RELEASE_DECISION=RELEASE\n"),
+    )
+    events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    check(extra_proof.get("release_approval_verified") is False
+          and not any(event.get("event") == "consumed"
+                      and event.get("subject_digest") == extra_issue.get("subject_digest")
+                      for event in events),
+          "extra final-release marker cannot consume a provider-action ticket")
+
+    # The exact executed action consumes once and records the join fields.
+    approved_receipt = authorization("approved-action")
+    approved_issue = issue(approved_receipt, "approve exact canary deploy action")
+    approved_proof = log_action(
+        approved_receipt, "REC-provider-approved",
+        action_stdout("deploy-canary", approved_receipt),
+    )
+    check(approved_proof.get("release_provider_action_verified") is True
+          and approved_proof.get("release_provider_action") == "deploy-canary"
+          and approved_proof.get("release_receipt_sha256") == opl.sha256_file(approved_receipt)
+          and approved_proof.get("release_approval_verified") is True
+          and approved_proof.get("release_approval_digest") == approved_issue.get("subject_digest")
+          and bool(approved_proof.get("release_approval_consumed_id")),
+          "approved provider action records the exact digest and approval consumption join")
+    check(approved_proof.get("release_credit_scope") == ""
+          and approved_proof.get("release_verifier_markers") == {}
+          and approved_proof.get("release_verifier_bound") is False
+          and not opl.proof_is_verified(approved_proof),
+          "provider-action proof cannot impersonate or credit a final release")
+
+    status, _ = run("work-status", ["--work-id", wid])
+    check({entry["pathway"]: entry["status"]
+           for entry in status["summary"]["itinerary"]}["release"] == "required",
+          "approved provider action leaves final release coverage open")
+
+    # Reusing the consumed ticket under another proof id fails, with no second consumption.
+    replay_proof = log_action(
+        approved_receipt, "REC-provider-replay",
+        action_stdout("deploy-canary", approved_receipt),
+    )
+    events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    consumptions = [
+        event for event in events
+        if event.get("event") == "consumed"
+        and event.get("subject_digest") == approved_issue.get("subject_digest")
+    ]
+    check(replay_proof.get("release_approval_verified") is False
+          and replay_proof.get("release_approval_error") == "approval_consumed"
+          and len(consumptions) == 1,
+          "provider-action ticket replay cannot authorize a second proof")
+    persisted = [json.loads(line) for line in proofs_path.read_text(encoding="utf-8").splitlines()
+                 if line.strip()]
+    check(any(proof.get("proof_id") == approved_proof.get("proof_id") for proof in persisted),
+          "approved provider-action proof persists for the downstream release join")
+
+
 def test_approval_authority_survives_review_findings():
     """Regressions for the 2026-08-16 adversarial review. Each check fails on the pre-fix code:
     a long project slug redacted the ledger join key, a spent ticket locked the subject out
@@ -6408,6 +6623,7 @@ def main():
         test_approval_issue_guard_installer_uses_one_canonical_source,
         test_approval_issue_guard_repeatable_verifier,
         test_approval_authority_single_use_waiver_and_release_credit,
+        test_release_provider_action_consumes_approval_without_release_credit,
         test_approval_authority_survives_review_findings,
         test_proof_add_flips_itinerary_coverage,
         test_proof_add_resolves_bare_project_name_and_flags_invalid_cwd,
