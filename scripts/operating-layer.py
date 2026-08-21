@@ -1256,6 +1256,16 @@ def release_provider_action_from_evidence(evidence_path):
     action = authorization.get("action") if isinstance(authorization, dict) else None
     if action not in RELEASE_PROVIDER_ACTIONS:
         errors.append("release provider action authorization has an unknown action")
+    authorized_verifier_sha256 = (
+        authorization.get("verifier_source_sha256")
+        if isinstance(authorization, dict) else None
+    )
+    if (not isinstance(authorized_verifier_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", authorized_verifier_sha256)):
+        errors.append(
+            "release provider action authorization requires one lowercase SHA-256 "
+            "verifier_source_sha256"
+        )
     receipt_path = ""
     receipt_sha256 = ""
     if candidate.is_file() and not candidate.is_symlink():
@@ -3556,6 +3566,126 @@ namespace = {
 source = sys.stdin.buffer.read()
 exec(compile(source, filename, "exec"), namespace, namespace)
 """
+_PROVIDER_ACTION_VERIFIER_SNAPSHOT_LOADER = """\
+import sys
+
+filename = sys.argv[1]
+sys.argv = [filename, *sys.argv[2:]]
+namespace = {
+    "__name__": "__main__",
+    "__file__": filename,
+    "__cached__": None,
+    "__loader__": None,
+    "__package__": None,
+    "__spec__": None,
+}
+source = sys.stdin.buffer.read()
+exec(compile(source, filename, "exec"), namespace, namespace)
+"""
+
+
+def release_provider_action_local_import_errors(source_bytes, source_path):
+    """Reject imports that can execute unapproved Python beside a provider-action verifier.
+
+    The approved source may use the standard library or installed packages. A module or package
+    available through the verifier's own directory is mutable second-source code, so the closed
+    release-provider-action contract refuses it before executing the verifier snapshot.
+    """
+    try:
+        tree = ast.parse(source_bytes, filename=str(source_path))
+        source_dir = Path(source_path).resolve(strict=True).parent
+    except (OSError, SyntaxError, TypeError, ValueError, UnicodeDecodeError):
+        return ["release provider action verifier source could not be parsed safely"]
+
+    def resolves_beside_source(module_name):
+        module_name = str(module_name or "").lstrip(".")
+        parts = module_name.split(".") if module_name else []
+        if not parts or not all(part.isidentifier() for part in parts):
+            return False
+        module_path = source_dir.joinpath(*parts)
+        candidates = (
+            module_path.with_suffix(".py"),
+            module_path / "__init__.py",
+            module_path,
+        )
+        for candidate in candidates:
+            try:
+                if candidate.is_symlink() or candidate.is_file() or candidate.is_dir():
+                    return True
+            except OSError:
+                return True
+        return False
+
+    errors = []
+    importlib_aliases = {"importlib"}
+    import_module_aliases = set()
+    builtins_aliases = {"builtins"}
+    dunder_import_aliases = {"__import__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "importlib":
+                    importlib_aliases.add(alias.asname or alias.name)
+                if alias.name == "builtins":
+                    builtins_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module == "importlib":
+                import_module_aliases.update(
+                    alias.asname or alias.name
+                    for alias in node.names if alias.name == "import_module"
+                )
+            if node.level == 0 and node.module == "builtins":
+                dunder_import_aliases.update(
+                    alias.asname or alias.name
+                    for alias in node.names if alias.name == "__import__"
+                )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if resolves_beside_source(alias.name):
+                    errors.append(
+                        f"release provider action verifier imports local Python module "
+                        f"{alias.name}"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                errors.append(
+                    "release provider action verifier uses a relative Python import"
+                )
+            elif resolves_beside_source(node.module):
+                errors.append(
+                    f"release provider action verifier imports local Python module "
+                    f"{node.module}"
+                )
+        elif isinstance(node, ast.Call):
+            dynamic_import = False
+            if isinstance(node.func, ast.Name):
+                dynamic_import = node.func.id in (
+                    import_module_aliases | dunder_import_aliases
+                )
+            elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                dynamic_import = (
+                    (node.func.attr == "import_module"
+                     and node.func.value.id in importlib_aliases)
+                    or (node.func.attr == "__import__"
+                        and node.func.value.id in builtins_aliases)
+                )
+            if dynamic_import:
+                target = node.args[0].value if (
+                    node.args and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                ) else None
+                if target is None:
+                    errors.append(
+                        "release provider action verifier has an unresolved dynamic import"
+                    )
+                elif target.startswith(".") or resolves_beside_source(target):
+                    errors.append(
+                        f"release provider action verifier dynamically imports local Python "
+                        f"module {target}"
+                    )
+    return sorted(set(errors))
 
 
 def parse_generic_verifier_command(command, cwd):
@@ -3569,7 +3699,10 @@ def parse_generic_verifier_command(command, cwd):
         "interpreter_sha256": "",
         "path": "",
         "resolved_path": "",
+        "extra_python_sources": [],
+        "local_python_import_errors": [],
         "source_bytes": b"",
+        "isolated_argv": [],
         "source_sha256": command_sha256,
         "command_sha256": command_sha256,
         "error": "generic_verifier_command_unsupported",
@@ -3612,10 +3745,30 @@ def parse_generic_verifier_command(command, cwd):
     # Keep the lexical file location. Resolving it would erase a later symlink replacement and
     # make the read-time freshness check follow the attacker's target instead of failing closed.
     source = Path(os.path.abspath(source))
+    extra_python_sources = []
+    for raw_arg in tokens[index + 1:]:
+        candidate_values = [raw_arg]
+        if "=" in raw_arg:
+            candidate_values.append(raw_arg.split("=", 1)[1])
+        for candidate_raw in candidate_values:
+            if not candidate_raw:
+                continue
+            candidate = Path(candidate_raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(cwd) / candidate
+            try:
+                resolved_candidate = candidate.resolve(strict=True)
+            except (OSError, ValueError):
+                continue
+            if (resolved_candidate.is_file()
+                    and (candidate.suffix.lower() == ".py"
+                         or resolved_candidate.suffix.lower() == ".py")):
+                extra_python_sources.append(str(resolved_candidate))
     binding.update({
         "interpreter_path": str(trusted_interpreter),
         "interpreter_sha256": sha256_file(trusted_interpreter),
         "path": str(source),
+        "extra_python_sources": sorted(set(extra_python_sources)),
         "source_sha256": "",
         "error": "",
     })
@@ -3641,25 +3794,37 @@ def parse_generic_verifier_command(command, cwd):
                 binding["error"] = "verifier_source_unreadable"
             else:
                 binding["source_bytes"] = source_bytes
+                binding["local_python_import_errors"] = (
+                    release_provider_action_local_import_errors(
+                        source_bytes, resolved_source
+                    )
+                )
                 binding["argv"] = [
                     str(trusted_interpreter), "-I", "-B", "-S", "-c",
                     _GENERIC_VERIFIER_SNAPSHOT_LOADER, str(resolved_source),
+                    *tokens[index + 1:],
+                ]
+                binding["isolated_argv"] = [
+                    str(trusted_interpreter), "-I", "-B", "-S", "-c",
+                    _PROVIDER_ACTION_VERIFIER_SNAPSHOT_LOADER, str(resolved_source),
                     *tokens[index + 1:],
                 ]
                 binding["source_sha256"] = hashlib.sha256(source_bytes).hexdigest()
     return binding
 
 
-def run_generic_verifier_snapshot(binding, cwd, timeout=120):
+def run_generic_verifier_snapshot(binding, cwd, timeout=120, isolate_source_dir=False):
     """Execute the exact verifier bytes captured by ``parse_generic_verifier_command``.
 
-    The trusted interpreter receives the immutable source snapshot on stdin. The loader restores
-    direct-script ``__file__``, ``sys.argv``, script-directory imports, and the requested cwd.
+    The trusted interpreter receives the immutable source snapshot on stdin. Both loaders restore
+    direct-script ``__file__``, ``sys.argv``, and the requested cwd. Provider actions use the
+    isolated loader, which leaves the verifier directory off ``sys.path``.
     """
     source = binding.get("source_bytes") if isinstance(binding, dict) else None
+    argv_key = "isolated_argv" if isolate_source_dir else "argv"
     if (not isinstance(source, bytes)
             or hashlib.sha256(source).hexdigest() != binding.get("source_sha256")
-            or binding.get("error") or not binding.get("argv")):
+            or binding.get("error") or not binding.get(argv_key)):
         return 1, "", 0, ""
     try:
         clean_env = {
@@ -3670,7 +3835,7 @@ def run_generic_verifier_snapshot(binding, cwd, timeout=120):
             )
         }
         proc = subprocess.run(
-            binding["argv"], cwd=cwd or None, input=source,
+            binding[argv_key], cwd=cwd or None, input=source,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, shell=False,
             env=clean_env,
         )
@@ -4203,6 +4368,65 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             verifier_source_error = generic_binding["error"]
             verifier_interpreter_path = generic_binding["interpreter_path"]
             verifier_interpreter_sha256 = generic_binding["interpreter_sha256"]
+            if release_provider_action_contract:
+                authorized_source_sha256 = release_receipt["receipt"].get(
+                    "verifier_source_sha256"
+                )
+                source_binding_error = ""
+                if release_receipt["errors"]:
+                    source_binding_error = (
+                        "release_provider_action_authorization_invalid"
+                    )
+                elif generic_binding.get("extra_python_sources"):
+                    source_binding_error = (
+                        "release_provider_action_extra_verifier_source"
+                    )
+                    release_receipt = {
+                        **release_receipt,
+                        "errors": list(release_receipt["errors"]) + [
+                            "release provider action command includes an extra existing "
+                            "Python source"
+                        ],
+                    }
+                    template_check = {
+                        "valid": False,
+                        "template_id": "release-provider-action-v1",
+                        "missing": list(release_receipt["errors"]),
+                    }
+                elif generic_binding.get("local_python_import_errors"):
+                    source_binding_error = (
+                        "release_provider_action_local_verifier_import"
+                    )
+                    release_receipt = {
+                        **release_receipt,
+                        "errors": list(release_receipt["errors"]) + list(
+                            generic_binding["local_python_import_errors"]
+                        ),
+                    }
+                    template_check = {
+                        "valid": False,
+                        "template_id": "release-provider-action-v1",
+                        "missing": list(release_receipt["errors"]),
+                    }
+                elif (not verifier_source_error
+                      and verifier_source_sha256 != authorized_source_sha256):
+                    source_binding_error = (
+                        "release_provider_action_verifier_source_not_authorized"
+                    )
+                    release_receipt = {
+                        **release_receipt,
+                        "errors": list(release_receipt["errors"]) + [
+                            "release provider action verifier_source_sha256 does not match "
+                            "the captured verifier source"
+                        ],
+                    }
+                    template_check = {
+                        "valid": False,
+                        "template_id": "release-provider-action-v1",
+                        "missing": list(release_receipt["errors"]),
+                    }
+                if source_binding_error and not verifier_source_error:
+                    verifier_source_error = source_binding_error
         if project_context_mismatch:
             verify_error = "project_context_mismatch"
             canary_target_reason = "project_context_mismatch"
@@ -4225,7 +4449,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             else:
                 _t0 = time.monotonic()
                 exit_code, verify_stdout_sha256, verify_stdout_bytes, verify_stdout = (
-                    run_generic_verifier_snapshot(generic_binding, verify_cwd)
+                    run_generic_verifier_snapshot(
+                        generic_binding, verify_cwd, isolate_source_dir=True
+                    )
                 )
                 first_run_secs = time.monotonic() - _t0
                 trivial_verifier = verify_stdout_bytes < STDOUT_BYTE_FLOOR

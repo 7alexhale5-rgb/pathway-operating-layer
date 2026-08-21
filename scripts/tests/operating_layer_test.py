@@ -6315,15 +6315,50 @@ def test_release_provider_action_consumes_approval_without_release_credit():
             stdout, "deploy-canary", digest)["bound"],
             f"provider-action verifier rejects {label}")
 
-    def authorization(name, action="deploy-canary"):
-        return write(f"out/operator-artifacts/{name}.json", json.dumps({
+    verifier_body = (
+        "import hashlib\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "action, receipt_raw, exit_raw, mutate_receipt, mutate_source, extra, sentinel = sys.argv[1:8]\n"
+        "receipt = Path(receipt_raw)\n"
+        "receipt_digest = hashlib.sha256(receipt.read_bytes()).hexdigest()\n"
+        "if sentinel:\n"
+        "    Path(sentinel).write_text('executed', encoding='utf-8')\n"
+        "if mutate_receipt == '1':\n"
+        "    receipt.write_text('tampered', encoding='utf-8')\n"
+        "if mutate_source == '1':\n"
+        "    Path(__file__).write_text('tampered', encoding='utf-8')\n"
+        "sys.stdout.write(\n"
+        "    f'PROVIDER_ACTION={action}\\n'\n"
+        "    'PROVIDER_ACTION_PROOF=PASS\\n'\n"
+        "    'PATHWAY_RESULT=PASS\\n'\n"
+        "    f'RELEASE_RECEIPT_SHA256={receipt_digest}\\n'\n"
+        "    f'{extra}'\n"
+        ")\n"
+        "raise SystemExit(int(exit_raw))\n"
+    )
+
+    def verifier_source(name, prefix=""):
+        return write(f"out/test-verifiers/{name}.py", prefix + verifier_body)
+
+    def authorization(name, source, action="deploy-canary", *, verifier_field=None,
+                      omit_verifier_field=False):
+        document = {
             "version": 1,
             "work_id": wid,
             "project": proj.name,
             "site": "https://example.test",
             "action": action,
             "fixture": name,
-        }, sort_keys=True))
+        }
+        if not omit_verifier_field:
+            document["verifier_source_sha256"] = (
+                opl.sha256_file(source) if verifier_field is None else verifier_field
+            )
+        return write(
+            f"out/operator-artifacts/{name}.json",
+            json.dumps(document, sort_keys=True),
+        )
 
     def issue(receipt, reason):
         result, _ = run("approval-issue", [
@@ -6334,21 +6369,18 @@ def test_release_provider_action_consumes_approval_without_release_credit():
         ])
         return result
 
-    def verifier(name, stdout, exit_code=0, mutate_receipt=None):
-        mutation = (
-            "from pathlib import Path\n"
-            f"Path({str(mutate_receipt)!r}).write_text('tampered', encoding='utf-8')\n"
-            if mutate_receipt else ""
-        )
-        source = write(
-            f"out/test-verifiers/{name}.py",
-            "import sys\n" + mutation
-            + f"sys.stdout.write({stdout!r})\n"
-            + f"raise SystemExit({exit_code})\n",
-        )
-        return " ".join(shlex.quote(value) for value in (sys.executable, "-B", str(source)))
+    def verifier(source, receipt, action="deploy-canary", exit_code=0, *,
+                 mutate_receipt=False, mutate_source=False, extra="", sentinel=None,
+                 extra_args=()):
+        return " ".join(shlex.quote(str(value)) for value in (
+            sys.executable, "-B", source, action, receipt, exit_code,
+            int(mutate_receipt), int(mutate_source), extra, sentinel or "",
+            *extra_args,
+        ))
 
-    def log_action(receipt, recommendation, stdout, exit_code=0, mutate_receipt=None):
+    def log_action(receipt, recommendation, source, action="deploy-canary", exit_code=0, *,
+                   mutate_receipt=False, mutate_source=False, extra="", sentinel=None,
+                   extra_args=()):
         result, _ = run("work-log", [
             "--work-id", wid,
             "--pathway", "release",
@@ -6360,26 +6392,19 @@ def test_release_provider_action_consumes_approval_without_release_credit():
             "--project", str(proj),
             "--recommendation-id", recommendation,
             "--verify-cmd", verifier(
-                recommendation, stdout, exit_code, mutate_receipt=mutate_receipt),
+                source, receipt, action, exit_code,
+                mutate_receipt=mutate_receipt, mutate_source=mutate_source,
+                extra=extra, sentinel=sentinel, extra_args=extra_args),
         ])
         return next(record for record in result.get("records", [])
                     if record.get("source") == "operating-layer proof registry")
 
-    def action_stdout(action, receipt, *, extra=""):
-        return (
-            f"PROVIDER_ACTION={action}\n"
-            "PROVIDER_ACTION_PROOF=PASS\n"
-            "PATHWAY_RESULT=PASS\n"
-            f"RELEASE_RECEIPT_SHA256={opl.sha256_file(receipt)}\n"
-            f"{extra}"
-        )
-
     # A failed verifier cannot burn the matching ticket.
-    failed_receipt = authorization("failed-action")
+    failed_source = verifier_source("failed-action")
+    failed_receipt = authorization("failed-action", failed_source)
     failed_issue = issue(failed_receipt, "approve failed action fixture")
     failed_proof = log_action(
-        failed_receipt, "REC-provider-failed",
-        action_stdout("deploy-canary", failed_receipt), exit_code=7,
+        failed_receipt, "REC-provider-failed", failed_source, exit_code=7,
     )
     events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
               if line.strip()]
@@ -6390,12 +6415,12 @@ def test_release_provider_action_consumes_approval_without_release_credit():
           "failed provider verifier leaves its ticket unused")
 
     # A verifier that changes the authorization cannot burn its matching ticket.
-    mutated_receipt = authorization("mutated-action")
+    mutated_source = verifier_source("mutated-action")
+    mutated_receipt = authorization("mutated-action", mutated_source)
     mutated_issue = issue(mutated_receipt, "approve snapshot mutation fixture")
     mutated_proof = log_action(
-        mutated_receipt, "REC-provider-mutated",
-        action_stdout("deploy-canary", mutated_receipt),
-        mutate_receipt=mutated_receipt,
+        mutated_receipt, "REC-provider-mutated", mutated_source,
+        mutate_receipt=True,
     )
     events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
               if line.strip()]
@@ -6407,12 +6432,14 @@ def test_release_provider_action_consumes_approval_without_release_credit():
           "provider-action authorization mutation leaves its ticket unused")
 
     # A ticket for different bytes cannot authorize this evidence.
-    mismatch_receipt = authorization("ticket-mismatch")
-    other_receipt = authorization("ticket-mismatch-other", "promote-public-stage")
+    mismatch_source = verifier_source("ticket-mismatch")
+    other_source = verifier_source("ticket-mismatch-other")
+    mismatch_receipt = authorization("ticket-mismatch", mismatch_source)
+    other_receipt = authorization(
+        "ticket-mismatch-other", other_source, "promote-public-stage")
     mismatch_issue = issue(other_receipt, "approve other authorization bytes")
     mismatch_proof = log_action(
-        mismatch_receipt, "REC-provider-ticket-mismatch",
-        action_stdout("deploy-canary", mismatch_receipt),
+        mismatch_receipt, "REC-provider-ticket-mismatch", mismatch_source,
     )
     events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
               if line.strip()]
@@ -6423,11 +6450,12 @@ def test_release_provider_action_consumes_approval_without_release_credit():
           "provider action refuses a ticket bound to different authorization bytes")
 
     # Extra final-release claims fail closed and leave the exact ticket live.
-    extra_receipt = authorization("extra-marker")
+    extra_source = verifier_source("extra-marker")
+    extra_receipt = authorization("extra-marker", extra_source)
     extra_issue = issue(extra_receipt, "approve extra marker fixture")
     extra_proof = log_action(
-        extra_receipt, "REC-provider-extra-marker",
-        action_stdout("deploy-canary", extra_receipt, extra="RELEASE_DECISION=RELEASE\n"),
+        extra_receipt, "REC-provider-extra-marker", extra_source,
+        extra="RELEASE_DECISION=RELEASE\n",
     )
     events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
               if line.strip()]
@@ -6437,15 +6465,290 @@ def test_release_provider_action_consumes_approval_without_release_credit():
                       for event in events),
           "extra final-release marker cannot consume a provider-action ticket")
 
+    def ticket_unused(issue_result):
+        events = [
+            json.loads(line)
+            for line in approvals_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return not any(
+            event.get("event") == "consumed"
+            and event.get("subject_digest") == issue_result.get("subject_digest")
+            for event in events
+        )
+
+    # The reviewed authorization must name one canonical source digest. Missing, malformed,
+    # or multi-source values fail before any operator-controlled verifier code runs.
+    malformed_cases = [
+        ("missing-source-binding", True, None),
+        ("short-source-binding", False, "abc123"),
+        ("uppercase-source-binding", False, "A" * 64),
+        ("multiple-source-bindings", False, ["a" * 64, "b" * 64]),
+    ]
+    for name, omit_field, field_value in malformed_cases:
+        malformed_source = verifier_source(name)
+        malformed_receipt = authorization(
+            name,
+            malformed_source,
+            verifier_field=field_value,
+            omit_verifier_field=omit_field,
+        )
+        malformed_issue = issue(malformed_receipt, f"approve {name} fixture")
+        sentinel = ROOT / "out" / f"{name}-executed"
+        malformed_proof = log_action(
+            malformed_receipt,
+            f"REC-provider-{name}",
+            malformed_source,
+            sentinel=sentinel,
+        )
+        check(
+            malformed_proof.get("release_approval_verified") is False
+            and malformed_proof.get("exit_code") is None
+            and not sentinel.exists()
+            and ticket_unused(malformed_issue),
+            f"provider action rejects {name} before verifier execution",
+        )
+
+    # A generated wrapper cannot ride a ticket that approved another verifier, even when it
+    # emits the exact four markers. The unapproved source must not execute at all.
+    reviewed_source = verifier_source("reviewed-source")
+    generated_source = verifier_source("generated-wrapper", "# generated wrapper\n")
+    generated_receipt = authorization("generated-wrapper", reviewed_source)
+    generated_issue = issue(generated_receipt, "approve only the reviewed verifier source")
+    generated_sentinel = ROOT / "out" / "generated-wrapper-executed"
+    generated_proof = log_action(
+        generated_receipt,
+        "REC-provider-generated-wrapper",
+        generated_source,
+        sentinel=generated_sentinel,
+    )
+    check(
+        generated_proof.get("release_approval_verified") is False
+        and generated_proof.get("exit_code") is None
+        and not generated_sentinel.exists()
+        and ticket_unused(generated_issue),
+        "provider action rejects an arbitrary generated verifier before execution",
+    )
+
+    # A second existing Python source cannot ride as a command argument. Non-Python data paths
+    # remain valid, but executable Python source is a closed one-file contract.
+    one_source = verifier_source("one-authorized-source")
+    extra_python_source = verifier_source("unapproved-extra-source")
+    extra_source_receipt = authorization("extra-python-source", one_source)
+    extra_source_issue = issue(
+        extra_source_receipt, "approve one verifier source only")
+    extra_source_sentinel = ROOT / "out" / "extra-source-command-executed"
+    extra_source_proof = log_action(
+        extra_source_receipt,
+        "REC-provider-extra-python-source",
+        one_source,
+        sentinel=extra_source_sentinel,
+        extra_args=(extra_python_source,),
+    )
+    check(
+        extra_source_proof.get("release_approval_verified") is False
+        and extra_source_proof.get("exit_code") is None
+        and not extra_source_sentinel.exists()
+        and ticket_unused(extra_source_issue),
+        "provider action rejects an extra existing Python source before execution",
+    )
+
+    # An existing positional path may itself contain '='. Checking only the text after '=' lets
+    # that second source hide from an option-value-only scan.
+    equals_python_source = verifier_source("positional-extra=source")
+    equals_source_receipt = authorization("equals-python-source", one_source)
+    equals_source_issue = issue(
+        equals_source_receipt, "approve no positional Python source")
+    equals_source_sentinel = ROOT / "out" / "equals-source-command-executed"
+    equals_source_proof = log_action(
+        equals_source_receipt,
+        "REC-provider-equals-python-source",
+        one_source,
+        sentinel=equals_source_sentinel,
+        extra_args=(equals_python_source,),
+    )
+    check(
+        equals_source_proof.get("release_approval_verified") is False
+        and equals_source_proof.get("exit_code") is None
+        and not equals_source_sentinel.exists()
+        and ticket_unused(equals_source_issue),
+        "provider action rejects a positional Python source whose path contains equals",
+    )
+
+    # The approved source cannot import unapproved Python beside itself. Cover direct modules,
+    # local packages, from-imports, and both common dynamic import forms.
+    local_import_cases = [
+        (
+            "direct-local-import",
+            "import direct_local_helper\n",
+            [("direct_local_helper.py", "VALUE = 1\n")],
+        ),
+        (
+            "local-package-import",
+            "import local_package.submodule\n",
+            [
+                ("local_package/__init__.py", "VALUE = 1\n"),
+                ("local_package/submodule.py", "VALUE = 2\n"),
+            ],
+        ),
+        (
+            "local-from-import",
+            "from local_from_helper import VALUE\n",
+            [("local_from_helper.py", "VALUE = 1\n")],
+        ),
+        (
+            "local-importlib-import",
+            "import importlib\nimportlib.import_module('local_dynamic_helper')\n",
+            [("local_dynamic_helper.py", "VALUE = 1\n")],
+        ),
+        (
+            "local-dunder-import",
+            "__import__('local_dunder_helper')\n",
+            [("local_dunder_helper.py", "VALUE = 1\n")],
+        ),
+    ]
+    for name, prefix, local_files in local_import_cases:
+        for relative_path, content in local_files:
+            write(f"out/test-verifiers/{relative_path}", content)
+        importing_source = verifier_source(name, prefix)
+        importing_receipt = authorization(name, importing_source)
+        importing_issue = issue(importing_receipt, f"approve one source for {name}")
+        importing_sentinel = ROOT / "out" / f"{name}-executed"
+        importing_proof = log_action(
+            importing_receipt,
+            f"REC-provider-{name}",
+            importing_source,
+            sentinel=importing_sentinel,
+        )
+        check(
+            importing_proof.get("release_approval_verified") is False
+            and importing_proof.get("exit_code") is None
+            and not importing_sentinel.exists()
+            and ticket_unused(importing_issue),
+            f"provider action rejects {name} before verifier execution",
+        )
+
+    # Defense in depth: even if a caller bypassed the provider-action AST decision, the isolated
+    # snapshot loader itself does not make the verifier directory importable.
+    write("out/test-verifiers/isolation_helper.py", "VALUE = 1\n")
+    isolation_source = verifier_source(
+        "isolated-loader", "import isolation_helper\n")
+    isolation_receipt = authorization("isolated-loader", isolation_source)
+    isolation_sentinel = ROOT / "out" / "isolated-loader-executed"
+    isolation_binding = opl.parse_generic_verifier_command(
+        verifier(
+            isolation_source,
+            isolation_receipt,
+            sentinel=isolation_sentinel,
+        ),
+        str(proj),
+    )
+    isolation_exit, _, _, _ = opl.run_generic_verifier_snapshot(
+        isolation_binding, str(proj), isolate_source_dir=True)
+    check(
+        isolation_exit != 0 and not isolation_sentinel.exists(),
+        "provider-action isolated loader leaves the verifier directory off sys.path",
+    )
+
+    # `-I` still imports global or virtual-environment site startup files. Provider actions need
+    # `-S` too, so a writable `.pth` file cannot run before the approved source snapshot.
+    startup_source = verifier_source("site-startup-guard")
+    startup_receipt = authorization("site-startup-guard", startup_source)
+    startup_binding = opl.parse_generic_verifier_command(
+        verifier(startup_source, startup_receipt), str(proj))
+    check(
+        startup_binding.get("isolated_argv", [])[1:4] == ["-I", "-B", "-S"],
+        "provider-action isolated argv disables Python site startup",
+    )
+    fake_venv = ROOT / "out" / "writable-site-python"
+    (fake_venv / "bin").mkdir(parents=True)
+    fake_python = fake_venv / "bin" / "python"
+    os.symlink(sys.executable, fake_python)
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    (fake_venv / "pyvenv.cfg").write_text(
+        f"home = {Path(sys.executable).parent}\n"
+        "include-system-site-packages = false\n"
+        f"version = {sys.version_info.major}.{sys.version_info.minor}."
+        f"{sys.version_info.micro}\n",
+        encoding="utf-8",
+    )
+    writable_site = fake_venv / "lib" / f"python{python_version}" / "site-packages"
+    writable_site.mkdir(parents=True)
+    startup_marker = fake_venv / "site-startup-ran"
+    (writable_site / "unapproved-startup.pth").write_text(
+        f"import pathlib; pathlib.Path({str(startup_marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    startup_argv = list(startup_binding["isolated_argv"])
+    startup_argv[0] = str(fake_python)
+    startup_proc = subprocess.run(
+        startup_argv,
+        cwd=str(proj),
+        input=startup_binding["source_bytes"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        env={
+            key: value for key, value in os.environ.items()
+            if not key.upper().startswith("PYTHON") and key != "__PYVENV_LAUNCHER__"
+        },
+    )
+    check(
+        startup_proc.returncode == 0 and not startup_marker.exists(),
+        "provider-action interpreter cannot run writable site startup code",
+    )
+
+    # Changing the reviewed source after ticket issue changes the captured digest. It must fail
+    # before the changed source can run.
+    changed_source = verifier_source("changed-after-approval")
+    changed_receipt = authorization("changed-after-approval", changed_source)
+    changed_issue = issue(changed_receipt, "approve original verifier source bytes")
+    changed_source.write_text("# changed after approval\n" + verifier_body, encoding="utf-8")
+    changed_sentinel = ROOT / "out" / "changed-source-executed"
+    changed_proof = log_action(
+        changed_receipt,
+        "REC-provider-changed-source",
+        changed_source,
+        sentinel=changed_sentinel,
+    )
+    check(
+        changed_proof.get("release_approval_verified") is False
+        and changed_proof.get("exit_code") is None
+        and not changed_sentinel.exists()
+        and ticket_unused(changed_issue),
+        "provider action rejects verifier source changed after approval",
+    )
+
+    # A source that changes its own on-disk bytes during snapshot execution still cannot consume
+    # the ticket, even though the captured bytes matched at process start.
+    self_mutating_source = verifier_source("self-mutating-source")
+    self_mutating_receipt = authorization("self-mutating-source", self_mutating_source)
+    self_mutating_issue = issue(
+        self_mutating_receipt, "approve stable verifier source snapshot")
+    self_mutating_proof = log_action(
+        self_mutating_receipt,
+        "REC-provider-self-mutating-source",
+        self_mutating_source,
+        mutate_source=True,
+    )
+    check(
+        self_mutating_proof.get("release_approval_verified") is False
+        and self_mutating_proof.get("verifier_snapshot_stable") is False
+        and ticket_unused(self_mutating_issue),
+        "provider action rejects verifier source changed during execution",
+    )
+
     # The exact executed action consumes once and records the join fields.
-    approved_receipt = authorization("approved-action")
+    approved_source = verifier_source("approved-action")
+    approved_receipt = authorization("approved-action", approved_source)
     approved_issue = issue(approved_receipt, "approve exact canary deploy action")
     approved_proof = log_action(
-        approved_receipt, "REC-provider-approved",
-        action_stdout("deploy-canary", approved_receipt),
+        approved_receipt, "REC-provider-approved", approved_source,
     )
     check(approved_proof.get("release_provider_action_verified") is True
           and approved_proof.get("release_provider_action") == "deploy-canary"
+          and approved_proof.get("verifier_source_sha256")
+          == approved_proof.get("release_receipt", {}).get("verifier_source_sha256")
           and approved_proof.get("release_receipt_sha256") == opl.sha256_file(approved_receipt)
           and approved_proof.get("release_approval_verified") is True
           and approved_proof.get("release_approval_digest") == approved_issue.get("subject_digest")
@@ -6464,8 +6767,7 @@ def test_release_provider_action_consumes_approval_without_release_credit():
 
     # Reusing the consumed ticket under another proof id fails, with no second consumption.
     replay_proof = log_action(
-        approved_receipt, "REC-provider-replay",
-        action_stdout("deploy-canary", approved_receipt),
+        approved_receipt, "REC-provider-replay", approved_source,
     )
     events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
               if line.strip()]
