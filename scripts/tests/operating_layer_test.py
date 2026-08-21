@@ -1913,6 +1913,100 @@ def test_pathway_metric():
     check(pathway in m1["metric"]["by_pathway"], "pathway-metric breaks the rate down by pathway")
 
 
+def test_pathway_metric_reuses_generic_verifier_binding():
+    """A metric pass parses each shared verifier command once, not once per proof scan."""
+    reset()
+    opl = load_cli("pathway_metric_verifier_cache")
+    project = ROOT / "projects" / "metric-verifier-cache"
+    project.mkdir(parents=True)
+    verifier = write(
+        "out/test-verifiers/metric-cache.py",
+        "print('GENERIC_TEST_VERIFIER=PASS')\n",
+    )
+    command = f"{sys.executable} -B {verifier}"
+    binding = opl.parse_generic_verifier_command(command, project)
+    command_digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+    proof_timestamp = "2026-08-21T12:01:00+00:00"
+    recommendation_timestamp = "2026-08-21T12:00:00+00:00"
+    proofs = []
+    recommendations = []
+    for index in range(12):
+        recommendation_id = f"REC-cache-{index}"
+        recommendations.append({
+            "recommendation_id": recommendation_id,
+            "timestamp": recommendation_timestamp,
+            "work_id": "W-cache",
+            "project": project.name,
+            "pathway": "quality",
+        })
+        proofs.append({
+            "proof_id": f"P-cache-{index}",
+            "recommendation_id": recommendation_id,
+            "timestamp": proof_timestamp,
+            "work_id": "W-cache",
+            "project": project.name,
+            "project_path": str(project),
+            "pathway": "quality",
+            "result": "pass",
+            "verifier_strength": "executed",
+            "exit_code": 0,
+            "trivial_verifier": False,
+            "canary_mutant_failed": None,
+            "verify_command": command,
+            "verify_command_sha256": command_digest,
+            "verify_error": "",
+            "verifier_source_kind": "python_file",
+            "verifier_source_error": "",
+            "verifier_source_path": binding["path"],
+            "verifier_source_target_path": binding["resolved_path"],
+            "verifier_source_sha256": binding["source_sha256"],
+            "verifier_interpreter_path": binding["interpreter_path"],
+            "verifier_interpreter_sha256": binding["interpreter_sha256"],
+            "verifier_post_source_sha256": binding["source_sha256"],
+            "verifier_post_interpreter_sha256": binding["interpreter_sha256"],
+            "verifier_snapshot_stable": True,
+        })
+
+    args = type("Args", (), {
+        "claude_home": str(ROOT / "claude"),
+        "codex_home": str(ROOT / "codex"),
+        "projects_root": str(ROOT / "projects"),
+        "output_root": str(ROOT / "out"),
+    })()
+    paths = opl.Paths(args)
+    paths.operator_intel.mkdir(parents=True, exist_ok=True)
+    opl.write_ndjson(paths.recommendations_path, recommendations)
+    opl.write_ndjson(paths.proofs_path, proofs)
+    opl.write_ndjson(paths.work_items_path, [{
+        "work_id": "W-cache", "project_name": project.name,
+    }])
+
+    parse_calls = 0
+    original_parse = opl.parse_generic_verifier_command
+
+    def counting_parse(*call_args, **call_kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parse(*call_args, **call_kwargs)
+
+    opl.parse_generic_verifier_command = counting_parse
+    metric = opl.compute_pathway_metric(paths)
+    check(metric["proved"] == len(recommendations),
+          "the verifier-binding cache preserves the proved recommendation count")
+    check(parse_calls == 1,
+          "pathway-metric parses one shared generic verifier binding once per computation")
+
+    parse_calls = 0
+    freshness_cache = {}
+    check(opl.generic_verifier_source_is_current(proofs[0], freshness_cache),
+          "a cached verifier binding accepts unchanged live source")
+    verifier.write_bytes(verifier.read_bytes() + b"# drift\n")
+    check(not opl.generic_verifier_source_is_current(proofs[0], freshness_cache),
+          "a cached verifier binding still rejects live source drift")
+    check(parse_calls == 1,
+          "live source drift is caught without reparsing the shared verifier binding")
+
+
 def test_pathway_audit_is_read_only_explainable_and_below_target_is_not_an_error():
     reset()
     write("projects/consult-ops/README.md", "# ConsultOps\n")
@@ -7021,6 +7115,7 @@ def main():
         test_ingest_review_malformed_and_empty,
         test_stale_review_gate,
         test_pathway_metric,
+        test_pathway_metric_reuses_generic_verifier_binding,
         test_pathway_audit_is_read_only_explainable_and_below_target_is_not_an_error,
         test_proof_registry_and_proved_metric,
         test_project_scoping_no_substring_bleed,

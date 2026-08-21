@@ -3123,14 +3123,14 @@ def waiver_corroborated(entry, work_id, project, events):
     )
 
 
-def proof_credits_pathway(proof, approval_events=None):
+def proof_credits_pathway(proof, approval_events=None, verifier_binding_cache=None):
     """The single crediting predicate every consumer must use.
 
     `proof_is_verified` answers "did a verifier really pass"; this adds the trust-root join a
     proof row cannot vouch for on its own. Release credit requires ledger corroboration, so a
     forged row carrying approval fields cannot raise the proof rate, ride a carry-forward baton,
     or inflate audit metrics (adversarial review finding, 2026-08-16)."""
-    if not proof_is_verified(proof):
+    if not proof_is_verified(proof, verifier_binding_cache):
         return False
     if (proof or {}).get("pathway") != "release":
         return True
@@ -3154,7 +3154,7 @@ def proof_result_is_passing(result):
     return bool(re.match(r"^(?:pass|passed)(?:[\s:_-].*)$", normalized))
 
 
-def proof_is_verified(proof):
+def proof_is_verified(proof, verifier_binding_cache=None):
     """Keystone: a proof counts as REAL verification ONLY when a re-executed verifier exited 0
     on an explicitly passing result. Free-text attestation (a --verified-by string) and bare human
     attestation (a --reviewer name) are claims, not verifications — a name is not a verifiable
@@ -3180,7 +3180,7 @@ def proof_is_verified(proof):
     if not base_verified:
         return False
     if (proof.get("pathway") not in {"release", "observability"}
-            and not generic_verifier_source_is_current(proof)):
+            and not generic_verifier_source_is_current(proof, verifier_binding_cache)):
         return False
     if proof.get("pathway") == "release":
         if proof.get("release_provider_action_contract") is True:
@@ -3577,7 +3577,8 @@ def pathways_referenced_by_text(text):
     return sorted(found, key=pathway_sort_key)
 
 
-def proved_pathways_from_proofs(work_id, proofs, approval_events=None):
+def proved_pathways_from_proofs(
+        work_id, proofs, approval_events=None, verifier_binding_cache=None):
     """Evidence side of the itinerary join: every pathway carrying at least one genuinely-verified
     proof (`proof_is_verified` — a re-executed verifier that exited 0) for this work item, mapped
     to the run_id (or proof_id) that earned it. A verified proof proves its pathway no matter which
@@ -3588,11 +3589,15 @@ def proved_pathways_from_proofs(work_id, proofs, approval_events=None):
     Release proofs additionally require ledger corroboration of their approval claim against
     `approval_events`; a caller that cannot supply the approvals ledger cannot credit release."""
     proved = {}
+    verifier_binding_cache = (
+        verifier_binding_cache if verifier_binding_cache is not None else {}
+    )
     for proof in proofs or []:
         if not isinstance(proof, dict) or proof.get("work_id") != work_id:
             continue
         pathway = proof.get("pathway")
-        if (pathway and pathway not in proved and proof_is_verified(proof)
+        if (pathway and pathway not in proved
+                and proof_is_verified(proof, verifier_binding_cache)
                 and not proof_is_stale(proof)):
             if (pathway == "release"
                     and not release_approval_corroborated(proof, approval_events or [])):
@@ -3928,7 +3933,7 @@ def run_generic_verifier_snapshot(binding, cwd, timeout=120, isolate_source_dir=
         return 1, "", 0, ""
 
 
-def generic_verifier_source_is_current(proof):
+def generic_verifier_source_is_current(proof, binding_cache=None):
     """Revalidate a generic verifier receipt against current command and source bytes.
 
     Proof rows created before source binding have no ``verifier_source_kind`` and remain readable.
@@ -3951,12 +3956,21 @@ def generic_verifier_source_is_current(proof):
         return False
     if (proof or {}).get("verifier_snapshot_stable") is not True:
         return False
-    current_binding = parse_generic_verifier_command(
+    verify_cwd = str((proof or {}).get("project_path") or Path(
+        str((proof or {}).get("evidence_path") or ".")
+    ).parent)
+    cache_key = (
         command,
-        str((proof or {}).get("project_path") or Path(
-            str((proof or {}).get("evidence_path") or ".")
-        ).parent),
+        verify_cwd,
+        str((proof or {}).get("verifier_source_path") or ""),
+        str((proof or {}).get("verifier_source_target_path") or ""),
+        str((proof or {}).get("verifier_interpreter_path") or ""),
     )
+    # Parsing a large Python verifier dominates metric scans. Reuse only its matched binding;
+    # the path, target, interpreter, and source hashes below are still checked for every proof.
+    current_binding = binding_cache.get(cache_key) if binding_cache is not None else None
+    if current_binding is None:
+        current_binding = parse_generic_verifier_command(command, verify_cwd)
     if (current_binding.get("error")
             or current_binding.get("path") != (proof or {}).get("verifier_source_path")
             or current_binding.get("resolved_path")
@@ -3964,6 +3978,8 @@ def generic_verifier_source_is_current(proof):
             or current_binding.get("interpreter_path")
             != (proof or {}).get("verifier_interpreter_path")):
         return False
+    if binding_cache is not None:
+        binding_cache[cache_key] = current_binding
     interpreter_raw = str((proof or {}).get("verifier_interpreter_path") or "")
     interpreter_digest = str((proof or {}).get("verifier_interpreter_sha256") or "")
     if not interpreter_raw or not re.fullmatch(r"[0-9a-f]{64}", interpreter_digest):
@@ -9556,6 +9572,7 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
     proofs = read_ndjson(paths.proofs_path)
     items = read_ndjson(paths.work_items_path)
     project_of = {w.get("work_id"): w.get("project_name") for w in items if w.get("work_id")}
+    verifier_binding_cache = {}
 
     def acted_on(rec):
         rec_ts = parse_ts(rec.get("timestamp"))
@@ -9576,7 +9593,8 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
     def proved(rec):
         rec_ts = parse_ts(rec.get("timestamp"))
         for proof in proofs:
-            if not proof_credits_pathway(proof, approval_events):
+            if not proof_credits_pathway(
+                    proof, approval_events, verifier_binding_cache):
                 continue  # keystone: attested (free-text) proofs never raise the autonomy proof rate
             proof_rec = proof.get("recommendation_id")
             if proof_rec:
