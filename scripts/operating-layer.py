@@ -978,12 +978,15 @@ RELEASE_RECEIPT_STATES = {
     "canary_status": {"not-run", "ready", "active", "passed", "failed"},
     "production_status": {"not-deployed", "deployed", "failed"},
     "rollback_status": {"not-needed", "ready", "rehearsed", "executed", "failed"},
-    "external_send_state": {"not-sent", "send-ready", "sent", "blocked"},
+    "external_send_state": {
+        "not-sent", "send-ready", "sent", "blocked", "user-triggered-auth-only",
+    },
     "feature_flag_state": {"not-used", "disabled", "enabled"},
 }
 RELEASE_RECEIPT_ARTIFACT_FIELDS = (
     "deploy_artifact", "verification_artifact", "canary_artifact", "rollback_artifact",
 )
+RELEASE_AUTH_SEND_ARTIFACT_FIELD = "external_send_artifact"
 RELEASE_CONTEXT_FIELDS = ("work_id", "recommendation_id", "target_project")
 RELEASE_MAX_EVIDENCE_AGE_SECONDS = 86_400
 RELEASE_MAX_FUTURE_SKEW_SECONDS = 300
@@ -997,6 +1000,17 @@ RELEASE_PROVIDER_ACTIONS = {
 # authority shipped. proof_is_verified still consults it, so it remains the release-credit kill
 # switch; per-proof crediting additionally requires a consumed, ledger-corroborated ticket.
 RELEASE_PRODUCTION_APPROVAL_STATE = "CONFIGURED_AND_VERIFIED"
+
+
+def release_receipt_artifact_fields(receipt):
+    """Return the closed artifact set required by one typed release receipt."""
+    fields = list(RELEASE_RECEIPT_ARTIFACT_FIELDS)
+    if (
+        isinstance(receipt, dict)
+        and receipt.get("external_send_state") == "user-triggered-auth-only"
+    ):
+        fields.append(RELEASE_AUTH_SEND_ARTIFACT_FIELD)
+    return tuple(fields)
 
 
 def validate_release_receipt(receipt, artifact_base=None, production_approval=False):
@@ -1031,16 +1045,18 @@ def validate_release_receipt(receipt, artifact_base=None, production_approval=Fa
                 "receipt; have Alex issue one with `approval-issue --kind "
                 "release-production-approval` bound to this exact receipt"
             )
-        if rollback not in {"rehearsed", "executed"}:
-            errors.append("production deployment requires rehearsed or executed rollback_status")
+        if rollback not in {"ready", "rehearsed", "executed"}:
+            errors.append(
+                "production deployment requires ready, rehearsed, or executed rollback_status"
+            )
         if receipt.get("canary_status") not in {"active", "passed"}:
             errors.append("production deployment requires an active or passed canary_status")
-        for field in RELEASE_RECEIPT_ARTIFACT_FIELDS:
+        for field in release_receipt_artifact_fields(receipt):
             if not str(receipt.get(field) or "").strip():
                 errors.append(f"production deployment requires {field}")
     if artifact_base:
         base = Path(artifact_base).resolve()
-        for field in RELEASE_RECEIPT_ARTIFACT_FIELDS:
+        for field in release_receipt_artifact_fields(receipt):
             raw = str(receipt.get(field) or "").strip()
             if not raw:
                 continue
@@ -1068,6 +1084,17 @@ def validate_release_receipt(receipt, artifact_base=None, production_approval=Fa
         )
         if not approval:
             errors.append("external send requires human_approval attestation")
+    if external == "user-triggered-auth-only":
+        # This state records a completed user-triggered transactional auth message. It grants
+        # no send authority. The release verifier must bind its separate approval/evidence file.
+        if receipt.get("external_send_count") != 1:
+            errors.append("user-triggered auth state requires exactly one external send")
+        if receipt.get("external_send_action") != "request-one-supabase-magic-link":
+            errors.append("user-triggered auth state requires the exact auth action")
+        if not str(receipt.get(RELEASE_AUTH_SEND_ARTIFACT_FIELD) or "").strip():
+            errors.append("user-triggered auth state requires external_send_artifact")
+        if not approval:
+            errors.append("user-triggered auth state requires human_approval attestation")
     if external == "send-ready" and receipt.get("claimed_external_send") is True:
         errors.append("send-ready cannot be claimed as sent")
     return errors
@@ -1191,7 +1218,7 @@ def release_receipt_from_evidence(evidence_path, expected=None, now=None, produc
             errors = ["release receipt records a hold, not preview or production readiness"]
         artifact_sha256 = {}
         if not errors and scope == "production":
-            for field in RELEASE_RECEIPT_ARTIFACT_FIELDS:
+            for field in release_receipt_artifact_fields(receipt):
                 artifact = candidate.parent / str(receipt[field])
                 artifact_sha256[field] = sha256_file(artifact)
         return {
@@ -1212,11 +1239,12 @@ def release_receipt_from_evidence(evidence_path, expected=None, now=None, produc
     }
 
 
-def release_verifier_binding(stdout, receipt_sha256):
+def release_verifier_binding(stdout, receipt_sha256, typed_receipt):
     """Bind a production release verifier's explicit outcome to the typed receipt digest."""
     allowed_markers = {
         "RELEASE_DECISION", "RELEASE_GATE", "PATHWAY_RESULT", "PRODUCTION_STATUS",
-        "CANARY_STATUS", "ROLLBACK_STATUS", "RELEASE_RECEIPT_SHA256",
+        "CANARY_STATUS", "ROLLBACK_STATUS", "EXTERNAL_SEND_STATUS",
+        "EXTERNAL_SEND_COUNT", "RELEASE_RECEIPT_SHA256",
     }
     markers, duplicate_keys = _strict_verifier_markers(stdout, allowed_markers)
     required = {
@@ -1225,7 +1253,6 @@ def release_verifier_binding(stdout, receipt_sha256):
         "PATHWAY_RESULT": {"PASS", "PASSED"},
         "PRODUCTION_STATUS": {"DEPLOYED"},
         "CANARY_STATUS": {"ACTIVE", "PASSED"},
-        "ROLLBACK_STATUS": {"REHEARSED", "EXECUTED"},
     }
     errors = [
         f"release verifier must emit {key}={('|'.join(sorted(values)))}"
@@ -1233,6 +1260,54 @@ def release_verifier_binding(stdout, receipt_sha256):
         if markers.get(key, "").upper() not in values
     ]
     errors.extend(f"release verifier emitted duplicate marker {key}" for key in sorted(duplicate_keys))
+    rollback_status = (
+        str(typed_receipt.get("rollback_status") or "").strip().lower()
+        if isinstance(typed_receipt, dict)
+        else ""
+    )
+    expected_rollback_marker = {
+        "ready": "TARGET_READY",
+        "rehearsed": "REHEARSED",
+        "executed": "EXECUTED",
+    }.get(rollback_status)
+    if not expected_rollback_marker:
+        errors.append(
+            "release verifier requires a typed ready, rehearsed, or executed rollback receipt"
+        )
+    elif markers.get("ROLLBACK_STATUS", "").upper() != expected_rollback_marker:
+        errors.append(
+            "release verifier ROLLBACK_STATUS must match the typed rollback receipt"
+        )
+    external_send_state = (
+        str(typed_receipt.get("external_send_state") or "").strip().lower()
+        if isinstance(typed_receipt, dict)
+        else ""
+    )
+    expected_external_marker = {
+        "not-sent": ("NOT_SENT", "0"),
+        "user-triggered-auth-only": ("USER_TRIGGERED_AUTH_ONLY", "1"),
+    }.get(external_send_state)
+    if not expected_external_marker:
+        errors.append(
+            "release verifier requires a typed no-send or user-triggered auth-only receipt"
+        )
+    else:
+        expected_status, expected_count = expected_external_marker
+        if markers.get("EXTERNAL_SEND_STATUS", "").upper() != expected_status:
+            errors.append(
+                "release verifier EXTERNAL_SEND_STATUS must match the typed receipt"
+            )
+        if markers.get("EXTERNAL_SEND_COUNT", "") != expected_count:
+            errors.append(
+                "release verifier EXTERNAL_SEND_COUNT must match the typed receipt"
+            )
+        if (
+            external_send_state == "user-triggered-auth-only"
+            and typed_receipt.get("external_send_count") != 1
+        ):
+            errors.append(
+                "release verifier auth-only receipt must record exactly one external send"
+            )
     if not receipt_sha256 or markers.get("RELEASE_RECEIPT_SHA256", "").lower() != receipt_sha256.lower():
         errors.append("release verifier must emit the exact RELEASE_RECEIPT_SHA256")
     return {"markers": markers, "errors": errors, "bound": not errors}
@@ -2559,8 +2634,14 @@ def _is_receipt_artifact_digest_map(key, value):
     entropy-shaped secret past redaction.
     """
     allowed_fields = {
-        "release_artifact_sha256": RELEASE_RECEIPT_ARTIFACT_FIELDS,
-        "release_post_release_artifact_sha256": RELEASE_RECEIPT_ARTIFACT_FIELDS,
+        "release_artifact_sha256": (
+            *RELEASE_RECEIPT_ARTIFACT_FIELDS,
+            RELEASE_AUTH_SEND_ARTIFACT_FIELD,
+        ),
+        "release_post_release_artifact_sha256": (
+            *RELEASE_RECEIPT_ARTIFACT_FIELDS,
+            RELEASE_AUTH_SEND_ARTIFACT_FIELD,
+        ),
         "artifact_sha256": OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS,
         "observability_artifact_sha256": OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS,
         "observability_post_observability_artifact_sha256": OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS,
@@ -3112,7 +3193,8 @@ def proof_is_verified(proof):
             and not proof.get("release_snapshot_errors")
             and proof.get("release_credit_scope") == "production"
             and not proof.get("release_receipt_errors")
-            and set((proof.get("release_artifact_sha256") or {})) == set(RELEASE_RECEIPT_ARTIFACT_FIELDS)
+            and set((proof.get("release_artifact_sha256") or {}))
+            == set(release_receipt_artifact_fields(proof.get("release_receipt")))
             and all(
                 re.fullmatch(r"[0-9a-f]{64}", str(value or ""))
                 for value in (proof.get("release_artifact_sha256") or {}).values()
@@ -4319,6 +4401,20 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "template_id": "release-provider-action-v1",
             "missing": list(release_receipt["errors"]),
         }
+    elif (
+        (args.pathway or "") == "release"
+        and Path(evidence_path).suffix.lower() == ".json"
+        and release_receipt["credit_scope"] == "production"
+        and not release_receipt["errors"]
+    ):
+        # A fully valid typed production receipt is the closed release template. This keeps the
+        # final proof bound to the exact JSON bytes Alex approved instead of requiring unrelated
+        # Markdown headings beside the receipt.
+        template_check = {
+            "valid": True,
+            "template_id": "release-production-receipt-v1",
+            "missing": [],
+        }
     observability_receipt = (
         observability_receipt_from_evidence(evidence_path, proof_context, now=utc_now())
         if (args.pathway or "") == "observability"
@@ -4663,7 +4759,11 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 "errors": list(release_receipt["errors"]) + release_snapshot_errors,
             }
     release_binding = (
-        release_verifier_binding(verify_stdout, release_receipt["receipt_sha256"])
+        release_verifier_binding(
+            verify_stdout,
+            release_receipt["receipt_sha256"],
+            release_receipt.get("receipt"),
+        )
         if (args.pathway or "") == "release" and not release_provider_action_contract
         else {"markers": {}, "errors": [], "bound": False}
     )
@@ -4772,6 +4872,7 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         elif not release_provider_action_contract and not (
             exit_code == 0
             and canary_mutant_failed is True
+            and template_check.get("valid") is True
             and release_receipt["credit_scope"] == "production"
             and not release_receipt["errors"]
             and release_snapshot_stable

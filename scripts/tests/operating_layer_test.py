@@ -1257,6 +1257,7 @@ Release preflight is complete and rollback is verified; implementation is the ne
         "grep PRODUCTION_RELEASE_READY release-guard.txt && "
         "printf 'RELEASE_DECISION=RELEASE\\nRELEASE_GATE=PASS\\nPATHWAY_RESULT=PASS\\nPRODUCTION_STATUS=DEPLOYED\\n"
         "CANARY_STATUS=PASSED\\nROLLBACK_STATUS=REHEARSED\\n"
+        "EXTERNAL_SEND_STATUS=NOT_SENT\\nEXTERNAL_SEND_COUNT=0\\n"
         f"RELEASE_RECEIPT_SHA256={receipt_sha}\\n'"
     )
     logged_release, _ = run("work-log", ["--work-id", wid, "--pathway", "release", "--kind", "verify",
@@ -3532,13 +3533,39 @@ def test_release_receipt_distinguishes_preview_production_rollback_and_send():
     check(not opl.validate_release_receipt(preview), "preview-ready receipt passes without production mutation")
     check(opl.release_receipt_credit_scope(preview) == "",
           "preview readiness does not credit the production release pathway")
-    missing_rollback = {**preview, "production_status": "deployed", "rollback_status": "ready", "human_approval": "Alex approved"}
-    check(any("rollback" in error for error in opl.validate_release_receipt(missing_rollback)),
-          "production receipt without rollback rehearsal is rejected")
+    target_ready = {
+        **preview,
+        "canary_status": "passed",
+        "production_status": "deployed",
+        "rollback_status": "ready",
+        "human_approval": "Alex approved",
+        "canary_artifact": "canary.json",
+    }
+    check(not any("rollback_status" in error for error in opl.validate_release_receipt(
+        target_ready, production_approval=True
+    )), "production receipt accepts a provider-backed ready rollback target")
     send_ready = {**preview, "external_send_state": "send-ready", "claimed_external_send": True}
     check(any("send-ready" in error for error in opl.validate_release_receipt(send_ready))
           and not opl.release_receipt_supports_send(send_ready),
           "send-ready cannot be claimed as sent")
+    auth_only_send = {
+        **target_ready,
+        "external_send_state": "user-triggered-auth-only",
+        "external_send_count": 1,
+        "external_send_action": "request-one-supabase-magic-link",
+        "external_send_artifact": "auth-send.json",
+        "human_approval": "Alex approved the exact one auth message",
+    }
+    check(not opl.validate_release_receipt(
+        auth_only_send, production_approval=True
+    ), "one separately approved user-triggered auth message is representable")
+    check(any("exactly one" in error for error in opl.validate_release_receipt(
+        {**auth_only_send, "external_send_count": 2}, production_approval=True
+    )), "user-triggered auth state rejects more than one message")
+    check(any("exact auth action" in error for error in opl.validate_release_receipt(
+        {**auth_only_send, "external_send_action": "send-campaign"},
+        production_approval=True,
+    )), "user-triggered auth state cannot authorize another send kind")
     unattested_send = {
         **preview,
         "external_send_state": "sent",
@@ -3594,13 +3621,61 @@ def test_release_receipt_distinguishes_preview_production_rollback_and_send():
     marker_text = (
         "RELEASE_DECISION=RELEASE\nRELEASE_GATE=PASS\nPATHWAY_RESULT=PASS\n"
         "PRODUCTION_STATUS=DEPLOYED\nCANARY_STATUS=PASSED\nROLLBACK_STATUS=REHEARSED\n"
+        "EXTERNAL_SEND_STATUS=NOT_SENT\nEXTERNAL_SEND_COUNT=0\n"
         f"RELEASE_RECEIPT_SHA256={'b' * 64}\n"
     )
-    check(opl.release_verifier_binding(marker_text, "b" * 64)["bound"] is True,
+    check(opl.release_verifier_binding(
+        marker_text,
+        "b" * 64,
+        {"rollback_status": "rehearsed", "external_send_state": "not-sent"},
+    )["bound"] is True,
           "release verifier markers bind the production outcome to the receipt digest")
     duplicate = "RELEASE_DECISION=NO_RELEASE\n" + marker_text
-    check(opl.release_verifier_binding(duplicate, "b" * 64)["bound"] is False,
+    check(opl.release_verifier_binding(
+        duplicate,
+        "b" * 64,
+        {"rollback_status": "rehearsed", "external_send_state": "not-sent"},
+    )["bound"] is False,
           "duplicate release markers fail closed instead of using the last value")
+    target_ready_marker_text = marker_text.replace(
+        "ROLLBACK_STATUS=REHEARSED", "ROLLBACK_STATUS=TARGET_READY"
+    )
+    check(opl.release_verifier_binding(
+        target_ready_marker_text,
+        "b" * 64,
+        {"rollback_status": "ready", "external_send_state": "not-sent"},
+    )["bound"] is True,
+          "target-ready output binds only to a typed ready rollback receipt")
+    check(opl.release_verifier_binding(
+        target_ready_marker_text, "b" * 64, None
+    )["bound"] is False,
+          "target-ready output cannot earn release credit without a typed receipt")
+    check(opl.release_verifier_binding(
+        marker_text,
+        "b" * 64,
+        {"rollback_status": "ready", "external_send_state": "not-sent"},
+    )["bound"] is False,
+          "a ready rollback receipt rejects a false rehearsed output marker")
+    auth_marker_text = target_ready_marker_text.replace(
+        "EXTERNAL_SEND_STATUS=NOT_SENT\nEXTERNAL_SEND_COUNT=0",
+        "EXTERNAL_SEND_STATUS=USER_TRIGGERED_AUTH_ONLY\nEXTERNAL_SEND_COUNT=1",
+    )
+    check(opl.release_verifier_binding(
+        auth_marker_text,
+        "b" * 64,
+        {
+            "rollback_status": "ready",
+            "external_send_state": "user-triggered-auth-only",
+            "external_send_count": 1,
+        },
+    )["bound"] is True,
+          "one auth-only send marker binds to the exact typed receipt")
+    check(opl.release_verifier_binding(
+        auth_marker_text,
+        "b" * 64,
+        {"rollback_status": "ready", "external_send_state": "not-sent"},
+    )["bound"] is False,
+          "auth-only stdout cannot bind a receipt that claims no send")
 
     reset()
     missing_artifact_md = write("out/operator-artifacts/missing-release.md", "release verification rollback\n")
@@ -3629,6 +3704,26 @@ def test_release_receipt_distinguishes_preview_production_rollback_and_send():
         },
         "release_receipt": production,
     }
+    write("out/operator-artifacts/auth-send.json", json.dumps({
+        "action": "request-one-supabase-magic-link",
+        "message_count": 1,
+        "approval_reference": "Alex approved the exact one auth message",
+    }))
+    auth_bound_receipt = {**auth_only_send, "external_send_artifact": "auth-send.json"}
+    auth_bound_json = write(
+        "out/operator-artifacts/release-auth-bound.json",
+        json.dumps({**bound_envelope, "release_receipt": auth_bound_receipt}),
+    )
+    auth_loaded = opl.release_receipt_from_evidence(
+        auth_bound_json,
+        release_context,
+        now=now,
+        production_approval=True,
+    )
+    check(not auth_loaded["errors"]
+          and set(auth_loaded["artifact_sha256"])
+          == set(opl.RELEASE_RECEIPT_ARTIFACT_FIELDS) | {"external_send_artifact"},
+          "auth-only release proof snapshots its separate send artifact")
     bound_md = write("out/operator-artifacts/release-bound.md", "release verification rollback\n")
     write("out/operator-artifacts/release-bound.json", json.dumps(bound_envelope))
     loaded = opl.release_receipt_from_evidence(bound_md, release_context, now=now)
@@ -3944,6 +4039,8 @@ print("PATHWAY_RESULT=PASS")
 print("PRODUCTION_STATUS=DEPLOYED")
 print("CANARY_STATUS=PASSED")
 print("ROLLBACK_STATUS=REHEARSED")
+print("EXTERNAL_SEND_STATUS=NOT_SENT")
+print("EXTERNAL_SEND_COUNT=0")
 print("RELEASE_RECEIPT_SHA256={pre_receipt_sha}")
 """)
     logged, _ = run("work-log", [
@@ -6157,32 +6254,10 @@ def test_approval_authority_single_use_waiver_and_release_credit():
     release_guard.write_text("PRODUCTION_RELEASE_READY\n", encoding="utf-8")
     recommendation_id = "REC-approval-authority"
     release_now = opl.utc_now()
-    release_evidence = write("out/operator-artifacts/approval-release.md", """# Release Verification
-
-## Summary
-Release preflight is complete and rollback is verified.
-
-## What Changed
-- Pinned the rollback sequence.
-
-## More Relevant
-- Production approval authority regression.
-
-## Less Relevant
-- Preview-only planning.
-
-## Next Pathway Must Use
-- Docs must record the approval trail.
-
-## Do Not Do Yet
-- Do not send externally.
-
-## Open Decisions
-- None.
-
-## Active Risk Overlays
-- rollback
-""")
+    release_evidence = write(
+        "out/operator-artifacts/approval-release.md",
+        "This intentionally lacks the release carry-forward headings.\n",
+    )
     receipt_path = write("out/operator-artifacts/approval-release.json", json.dumps({
         "work_id": wid,
         "recommendation_id": recommendation_id,
@@ -6209,10 +6284,11 @@ Release preflight is complete and rollback is verified.
         "grep PRODUCTION_RELEASE_READY release-guard.txt && "
         "printf 'RELEASE_DECISION=RELEASE\\nRELEASE_GATE=PASS\\nPATHWAY_RESULT=PASS\\n"
         "PRODUCTION_STATUS=DEPLOYED\\nCANARY_STATUS=PASSED\\nROLLBACK_STATUS=REHEARSED\\n"
+        "EXTERNAL_SEND_STATUS=NOT_SENT\\nEXTERNAL_SEND_COUNT=0\\n"
         f"RELEASE_RECEIPT_SHA256={receipt_sha}\\n'"
     )
     release_log_args = ["--work-id", wid, "--pathway", "release", "--kind", "verify",
-                        "--evidence", str(release_evidence), "--result", "pass",
+                        "--evidence", str(receipt_path), "--result", "pass",
                         "--proof-type", "artifact", "--project", str(proj),
                         "--verify-cmd", release_verify,
                         "--canary-target", str(release_guard),
@@ -6220,12 +6296,15 @@ Release preflight is complete and rollback is verified.
     proofs_path = ROOT / "out/operator-intelligence/proofs.ndjson"
 
     def persisted_release_proof():
+        rows = [
+            json.loads(line)
+            for line in proofs_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
         return next(
-            row for row in (
-                json.loads(line)
-                for line in proofs_path.read_text(encoding="utf-8").splitlines() if line.strip()
-            )
-            if row.get("pathway") == "release" and row.get("work_id") == wid
+            row for row in reversed(rows)
+            if row.get("pathway") == "release"
+            and row.get("work_id") == wid
+            and row.get("evidence_path") == str(receipt_path)
         )
 
     run("work-log", release_log_args)
@@ -6243,13 +6322,40 @@ Release preflight is complete and rollback is verified.
         "--release-receipt", str(receipt_path), "--reason", "fixture production approval"])
     check(bool(approved_issue.get("subject_digest")),
           "approval-issue binds a release ticket to the exact receipt digest")
+
+    invalid_template_args = list(release_log_args)
+    invalid_template_args[invalid_template_args.index(str(receipt_path))] = str(release_evidence)
+    run("work-log", invalid_template_args)
+    invalid_template_proof = next(
+        row for row in (
+            json.loads(line)
+            for line in proofs_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+        if row.get("pathway") == "release"
+        and row.get("work_id") == wid
+        and row.get("evidence_path") == str(release_evidence)
+    )
+    check(invalid_template_proof.get("template_check", {}).get("valid") is False
+          and invalid_template_proof.get("release_approval_verified") is False
+          and invalid_template_proof.get("release_approval_error")
+          == "release_evidence_not_creditable",
+          "an invalid template cannot consume the exact production ticket")
+
     run("work-log", release_log_args)
     approved_proof = persisted_release_proof()
-    check(approved_proof.get("release_approval_verified") is True
-          and bool(approved_proof.get("release_approval_consumed_id"))
-          and approved_proof.get("release_approval_digest") == approved_issue.get("subject_digest")
-          and opl.proof_is_verified(approved_proof),
-          "the same evidence credits once a single-use approval ticket is consumed")
+    check(approved_proof.get("release_approval_verified") is True,
+          "typed JSON receipt consumes its exact production ticket")
+    check(bool(approved_proof.get("release_approval_consumed_id"))
+          and approved_proof.get("release_approval_digest") == approved_issue.get("subject_digest"),
+          "typed JSON receipt records the exact production ticket consumption")
+    check(approved_proof.get("template_check") == {
+              "valid": True,
+              "template_id": "release-production-receipt-v1",
+              "missing": [],
+          },
+          "typed JSON receipt is its own closed production template")
+    check(opl.proof_is_verified(approved_proof),
+          "the exact typed JSON receipt credits once its single-use ticket is consumed")
     approved_status, _ = run("work-status", ["--work-id", wid])
     check({e["pathway"]: e["status"]
            for e in approved_status["summary"]["itinerary"]}["release"] == "proved",
