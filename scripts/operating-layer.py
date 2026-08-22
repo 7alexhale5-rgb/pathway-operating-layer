@@ -3657,7 +3657,9 @@ _PROVIDER_ACTION_VERIFIER_SNAPSHOT_LOADER = """\
 import sys
 
 filename = sys.argv[1]
-sys.argv = [filename, *sys.argv[2:]]
+reported_executable = sys.argv[2]
+sys.argv = [filename, *sys.argv[3:]]
+sys.executable = reported_executable
 namespace = {
     "__name__": "__main__",
     "__file__": filename,
@@ -3894,6 +3896,7 @@ def parse_generic_verifier_command(command, cwd):
                 binding["isolated_argv"] = [
                     str(trusted_interpreter), "-I", "-B", "-S", "-c",
                     _PROVIDER_ACTION_VERIFIER_SNAPSHOT_LOADER, str(resolved_source),
+                    str(supplied_interpreter),
                     *tokens[index + 1:],
                 ]
                 binding["source_sha256"] = hashlib.sha256(source_bytes).hexdigest()

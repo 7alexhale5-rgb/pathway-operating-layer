@@ -6898,6 +6898,28 @@ def test_release_provider_action_consumes_approval_without_release_credit():
         "provider-action interpreter cannot run writable site startup code",
     )
 
+    # Execute the resolved trusted interpreter, but preserve the spelling that the approved
+    # command supplied. A verifier may bind historical commands built from ``sys.executable``;
+    # resolving a Homebrew symlink inside the isolated child must not change that command.
+    lexical_python = ROOT / "out" / "lexical-python"
+    os.symlink(sys.executable, lexical_python)
+    lexical_source = write(
+        "out/test-verifiers/lexical-interpreter.py",
+        "import sys\nsys.stdout.write(sys.executable + '\\n')\n",
+    )
+    lexical_binding = opl.parse_generic_verifier_command(
+        f"{shlex.quote(str(lexical_python))} {shlex.quote(str(lexical_source))}",
+        str(proj),
+    )
+    lexical_exit, _, _, lexical_stdout = opl.run_generic_verifier_snapshot(
+        lexical_binding, str(proj), isolate_source_dir=True)
+    check(
+        lexical_exit == 0
+        and lexical_stdout.strip() == str(lexical_python)
+        and lexical_binding["isolated_argv"][0] == str(Path(sys.executable).resolve()),
+        "provider-action snapshot preserves the trusted lexical interpreter spelling",
+    )
+
     # Changing the reviewed source after ticket issue changes the captured digest. It must fail
     # before the changed source can run.
     changed_source = verifier_source("changed-after-approval")
