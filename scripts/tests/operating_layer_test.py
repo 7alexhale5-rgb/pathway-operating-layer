@@ -10,6 +10,7 @@ import atexit
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -7100,8 +7101,96 @@ def test_approval_authority_survives_review_findings():
           "an uncorroborated release proof stays out of the proved map")
 
 
+def test_design_findings_route_to_design_pathway():
+    """design-guard ids must reach the design pathway, not quality/implementation.
+
+    Before the "ds-" prefix existed, pathway_for_finding fell through to keyword
+    matching and mis-filed four of nine: "regression" and "coverage" hit quality
+    first, so a missing visual-regression suite was filed as a testing problem.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("opl_design_routing", str(CLI))
+    ol = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ol)
+
+    check(ol.GUARD_PREFIX_PATHWAY.get("ds-") == "design",
+          "GUARD_PREFIX_PATHWAY maps the ds- prefix to design")
+    for fid in ("ds-raw-values", "ds-primitive-misuse", "ds-no-tokens",
+                "ds-dtcg-nonconformant", "ds-no-a11y", "ds-no-stories",
+                "ds-no-visual-regression", "ds-low-story-coverage",
+                "ds-no-api-stability"):
+        got = ol.pathway_for_finding({"id": fid, "message": fid.replace("-", " ")})
+        check(got == "design", f"{fid} routes to design (got {got})")
+
+
+def test_design_gate_is_derived_from_repo_not_goal_wording():
+    """A repo either renders an interface or it does not.
+
+    Design used to enter an itinerary only when the goal sentence happened to say
+    "ui"/"screen"/"page", so a live Next.js app whose goal read "ship the affiliate
+    portal" closed having never passed a design gate.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("opl_design_gate", str(CLI))
+    ol = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ol)
+
+    ui_repo = ROOT / "ui-repo" / "app"
+    ui_repo.mkdir(parents=True)
+    (ui_repo / "page.tsx").write_text("export default function P(){return null}\n")
+
+    api_repo = ROOT / "api-repo" / "src"
+    api_repo.mkdir(parents=True)
+    (api_repo / "main.py").write_text("print('no interface here')\n")
+
+    # Harvested third-party code is somebody else's interface, not ours to gate.
+    vendored = ROOT / "api-repo" / "templates" / "someone-elses-app"
+    vendored.mkdir(parents=True)
+    (vendored / "page.tsx").write_text("export default function P(){return null}\n")
+
+    check(ol.repo_has_ui(str(ROOT / "ui-repo")) is True,
+          "repo_has_ui detects a repo containing .tsx components")
+    check(ol.repo_has_ui(str(ROOT / "api-repo")) is False,
+          "repo_has_ui ignores .tsx living under templates/ (harvested third-party)")
+    check(ol.repo_has_ui("") is False, "repo_has_ui is False for an empty path")
+    check(ol.repo_has_ui(str(ROOT / "does-not-exist")) is False,
+          "repo_has_ui is False for a missing directory")
+
+    # The goal sentence deliberately avoids every design keyword.
+    goal = "ship the affiliate portal"
+    check(not re.search(ol.PATHWAY_KEYWORD_GATES["design"], goal),
+          "the test goal genuinely misses the design keyword gate")
+
+    contract = ol.outcome_contract(goal=goal, project_path=str(ROOT / "ui-repo"),
+                                   project_name="ui-repo")
+    itinerary = ol.compute_itinerary(contract["tier"], goal,
+                                     contract["outcome_profile"],
+                                     contract["risk_overlays"])
+    names = [e["pathway"] if isinstance(e, dict) else e for e in itinerary]
+    check("design" in names,
+          f"a UI repo gets design in its itinerary without design wording (got {names})")
+
+    api_contract = ol.outcome_contract(goal=goal, project_path=str(ROOT / "api-repo"),
+                                       project_name="api-repo")
+    api_names = [e["pathway"] if isinstance(e, dict) else e
+                 for e in ol.compute_itinerary(api_contract["tier"], goal,
+                                               api_contract["outcome_profile"],
+                                               api_contract["risk_overlays"])]
+    check("design" not in api_names,
+          f"a non-UI repo is not burdened with a design gate (got {api_names})")
+
+    # The profile dicts are module-level constants shared across every call.
+    for profile in ol.OUTCOME_PROFILES:
+        check("design" not in profile.get("required_pathways", []) or
+              profile["id"] != "customer-field-review",
+              "outcome_contract did not mutate the shared OUTCOME_PROFILES constant")
+
+
+
 def main():
     tests = [
+        test_design_findings_route_to_design_pathway,
+        test_design_gate_is_derived_from_repo_not_goal_wording,
         test_resolve_project_dir_nesting_and_unverified_proof_loudness,
         test_source_integrity_no_duplicate_module_level_names,
         test_test_runner_integrity_detects_unregistered_tests,

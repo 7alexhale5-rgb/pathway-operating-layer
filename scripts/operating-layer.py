@@ -508,9 +508,75 @@ def detect_risk_overlays(goal="", project_name="", scoped_findings=None, carry_f
     return overlays
 
 
+
+# Design used to enter an itinerary only when the GOAL SENTENCE happened to say
+# "ui"/"screen"/"page" (PATHWAY_KEYWORD_GATES). Measured 2026-08-28: 58 of 321 work
+# items (18%) ever carried design, and affiliate-desk -- a live Next.js app -- was
+# closure-eligible having never passed a design gate. evansville-tonight got one only
+# because a human added it by hand mid-run, reason "revealed during execution".
+#
+# A repo either renders an interface or it does not. That is a property of the code,
+# not of how the goal was phrased, so it is read from the code.
+UI_FILE_GLOBS = ("*.tsx", "*.jsx", "*.vue", "*.svelte")
+UI_CONFIG_NAMES = (
+    "tailwind.config.js", "tailwind.config.ts", "tailwind.config.mjs",
+    "tailwind.config.cjs", "postcss.config.js", "postcss.config.mjs",
+)
+_UI_REPO_CACHE = {}
+
+
+def repo_has_ui(project_path):
+    """True when the repo renders an interface.
+
+    Deliberately cheap and bounded: a depth-limited scan for component files or a
+    CSS-framework config. A false positive costs one `work-cover ... na`; a false
+    negative is how a client site ships ungated, so this leans towards detecting.
+    """
+    if not project_path:
+        return False
+    root = Path(project_path)
+    if not root.is_dir():
+        return False
+    key = str(root.resolve())
+    if key in _UI_REPO_CACHE:
+        return _UI_REPO_CACHE[key]
+
+    found = False
+    for name in UI_CONFIG_NAMES:
+        if (root / name).exists() or (root / "web" / name).exists():
+            found = True
+            break
+    if not found:
+        # `templates` and `_vendored` hold harvested third-party code. Somebody
+        # else's React app in our warehouse is not our interface to gate.
+        skip = {
+            "node_modules", ".git", ".next", "dist", "build", ".venv", "__pycache__",
+            "templates", "_vendored", "vendor", "third_party", ".worktrees",
+        }
+        for depth_root, dirnames, filenames in os.walk(root):
+            rel = Path(depth_root).relative_to(root)
+            if len(rel.parts) > 3:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d not in skip and not d.endswith("-wt")]
+            if any(fn.endswith((".tsx", ".jsx", ".vue", ".svelte")) for fn in filenames):
+                found = True
+                break
+    _UI_REPO_CACHE[key] = found
+    return found
+
+
 def outcome_contract(goal="", project_path="", project_name="", scoped_findings=None, carry_forward=None, explicit_tier=None):
     project_label = project_name or (Path(project_path).name if project_path else "")
     profile = classify_outcome_profile(goal, project_label, scoped_findings, carry_forward)
+    # Copy before touching: profiles come from the module-level OUTCOME_PROFILES list
+    # and mutating one would leak into every later call in the process.
+    if repo_has_ui(project_path):
+        profile = dict(profile)
+        required = list(profile.get("required_pathways", []) or [])
+        if "design" not in required:
+            required.append("design")
+            profile["required_pathways"] = required
     overlays = detect_risk_overlays(goal, project_label, scoped_findings, carry_forward, profile)
     tier = (explicit_tier or profile.get("default_tier") or DEFAULT_ITINERARY_TIER).lower()
     if tier not in PATHWAY_TIERS:
@@ -873,6 +939,7 @@ FINDING_PATHWAY_KEYWORDS = [
 
 # Guard-script finding-id prefixes -> pathway (deterministic; review-stack guards).
 GUARD_PREFIX_PATHWAY = {
+    "ds-": "design",
     "sec-": "security",
     "mig-": "data",
     "gov-": "govern",
