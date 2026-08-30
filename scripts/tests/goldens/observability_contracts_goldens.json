@@ -1,0 +1,16 @@
+{
+ "missing_artifact": [
+  "metric_artifact must be an existing file in the companion directory",
+  "observability artifact_sha256 map does not match current artifact bytes"
+ ],
+ "valid": [],
+ "wrong_event_artifact": [
+  "log_artifact must contain correlated structured log records"
+ ],
+ "wrong_metric_set_artifact": [
+  "metric_artifact must contain one typed sample for every canonical metric"
+ ],
+ "wrong_metric_set_receipt": [
+  "runtime observability requires the exact canonical metric_names"
+ ]
+}
