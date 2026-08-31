@@ -20,10 +20,12 @@ import re
 import secrets
 import shutil
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,6 +54,12 @@ def _default_output_root():
 
 DEFAULT_OUTPUT_ROOT = _default_output_root()
 RENDERER = DEFAULT_CLAUDE_HOME / "scripts" / "operator-md-to-html.py"
+APPROVAL_AUTHORITY_PATH = Path(
+    "/Library/Application Support/Pathway/approval-authority.ndjson"
+    if sys.platform == "darwin"
+    else "/var/lib/pathway/approval-authority.ndjson"
+)
+APPROVAL_HELPER_PATH = Path("/usr/local/libexec/pathway-approval")
 
 PRUNE_DIRS = {
     ".git",
@@ -2898,6 +2906,128 @@ def _is_receipt_artifact_digest_map(key, value):
     )
 
 
+def _authority_text_safe(value):
+    if not isinstance(value, str):
+        return False
+    unsafe_bidi = {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"}
+    return not any(
+        unicodedata.category(character).startswith("C")
+        or unicodedata.category(character) in {"Zl", "Zp"}
+        or unicodedata.bidirectional(character) in unsafe_bidi
+        for character in value
+    )
+
+
+def _authority_json_strings_safe(value):
+    if isinstance(value, dict):
+        return all(
+            _authority_text_safe(key) and _authority_json_strings_safe(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return all(_authority_json_strings_safe(item) for item in value)
+    return not isinstance(value, str) or _authority_text_safe(value)
+
+
+def _is_safe_authority_command(value):
+    """Recognize only the two exact helper commands emitted after approval validation.
+
+    The generic string redactor correctly treats an embedded 64-hex receipt digest as secret-like.
+    Redacting that digest makes the reviewed root command unusable, so this narrow parser repeats
+    the closed subject/consumer checks before allowing the generated command through unchanged.
+    """
+    prefix = (
+        "/usr/bin/sudo -k; /usr/bin/sudo -- "
+        "/usr/local/libexec/pathway-approval "
+    )
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 16_384:
+        return False
+    if not value.startswith(prefix) or not _authority_text_safe(value):
+        return False
+    try:
+        argv = shlex.split(value[len(prefix):])
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    action = argv[0]
+    if action == "invalidate":
+        if len(argv) != 5 or argv[1] != "--ticket-id" or argv[3] != "--reason":
+            return False
+        return bool(
+            APPROVAL_TICKET_ID_RE.fullmatch(argv[2])
+            and argv[4]
+            and redact(argv[4]) == argv[4]
+        )
+    if action != "issue" or len(argv) != 7:
+        return False
+    if argv[1] != "--subject-json" or argv[3] != "--reason" or argv[5] != "--consumer":
+        return False
+    duplicate_keys = []
+
+    def unique_subject_object(pairs):
+        parsed = {}
+        for key, item in pairs:
+            if key in parsed:
+                duplicate_keys.append(key)
+            else:
+                parsed[key] = item
+        return parsed
+
+    def reject_subject_constant(value):
+        raise ValueError(f"non-finite JSON constant {value}")
+
+    try:
+        subject = json.loads(
+            argv[2],
+            object_pairs_hook=unique_subject_object,
+            parse_constant=reject_subject_constant,
+        )
+    except (TypeError, ValueError):
+        return False
+    if duplicate_keys:
+        return False
+    canonical_subject = json.dumps(subject, sort_keys=True, separators=(",", ":"))
+    if argv[2] != canonical_subject:
+        return False
+    reason, consumer = argv[4], argv[6]
+    if (not isinstance(subject, dict) or not reason or redact(reason) != reason
+            or not _authority_text_safe(reason) or not _authority_text_safe(consumer)
+            or not _authority_json_strings_safe(subject)):
+        return False
+    if subject.get("kind") == APPROVAL_KIND_WAIVER:
+        return bool(
+            set(subject) == {
+                "kind", "schema_version", "work_id", "project", "pathway", "reason",
+                "work_context_sha256",
+            }
+            and type(subject.get("schema_version")) is int
+            and subject.get("schema_version") == WAIVER_SUBJECT_SCHEMA_VERSION
+            and subject.get("work_id")
+            and subject.get("project")
+            and subject.get("pathway") in PATHWAY_CANON_ORDER
+            and subject.get("reason") == reason
+            and _is_sha256_digest(subject.get("work_context_sha256"))
+            and consumer
+            == f"work-cover:{subject.get('work_id')}:{subject.get('pathway')}"
+            and redact(subject.get("work_id")) == subject.get("work_id")
+            and redact(subject.get("project")) == subject.get("project")
+        )
+    if subject.get("kind") == APPROVAL_KIND_RELEASE:
+        return bool(
+            set(subject)
+            == {"kind", "work_id", "project", "stage", "release_receipt_sha256"}
+            and subject.get("work_id")
+            and subject.get("project")
+            and subject.get("stage") == "production"
+            and _is_sha256_digest(subject.get("release_receipt_sha256"))
+            and re.fullmatch(r"P-[0-9a-f]{12}", consumer or "")
+            and redact(subject.get("work_id")) == subject.get("work_id")
+            and redact(subject.get("project")) == subject.get("project")
+        )
+    return False
+
+
 def redact_obj(value):
     if isinstance(value, dict):
         generated_id_keys = {
@@ -2919,6 +3049,7 @@ def redact_obj(value):
         # key fails the key check and gets scrubbed by the 64-char entropy pattern.
         return {
             k: (v if (k in generated_id_keys or _is_digest_field(k, v)
+                      or (k == "authority_command" and _is_safe_authority_command(v))
                       or _is_receipt_artifact_digest_map(k, v))
                 else redact_obj(v))
             for k, v in value.items()
@@ -3027,6 +3158,7 @@ class Paths:
         self.codex_home = Path(args.codex_home).expanduser()
         self.projects_root = Path(args.projects_root).expanduser()
         self.output_root = Path(args.output_root).expanduser()
+        self.output_root_input = self.output_root.absolute()
         self.operator_intel = self.output_root / "operator-intelligence"
         self.operator_artifacts = self.output_root / "operator-artifacts"
         self.agent_cards = self.operator_intel / "agent-capability-cards"
@@ -3046,6 +3178,9 @@ class Paths:
         self.pathway_trust_path = self.operator_intel / "pathway-trust.json"
         self.proofs_path = self.operator_intel / "proofs.ndjson"
         self.approvals_path = self.operator_intel / "approvals.ndjson"
+        # Fixed OS-owned trust root. It is deliberately not configurable through args or env;
+        # a user-writable alternate would restore the same-agent authority bypass.
+        self.approval_authority_path = APPROVAL_AUTHORITY_PATH
         self.carry_forward_path = self.operator_intel / "pathway-carry-forward.ndjson"
         self.pathway_run_plans_path = self.operator_intel / "pathway-run-plans.ndjson"
         self.pathway_decisions_path = self.operator_intel / "pathway-decisions.ndjson"
@@ -3152,7 +3287,181 @@ def upsert_proof(paths, proof):
 APPROVAL_TTL_SECONDS = 900
 APPROVAL_KIND_RELEASE = "release-production-approval"
 APPROVAL_KIND_WAIVER = "production-secure-waiver"
+APPROVAL_MUTATION_SUBCOMMANDS = frozenset({"approval-issue", "approval-invalidate"})
 APPROVAL_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+APPROVAL_TICKET_ID_RE = re.compile(r"^AT-[0-9a-f]{12}$")
+APPROVAL_CONSUMPTION_ID_RE = re.compile(r"^AC-[0-9a-f]{12}$")
+APPROVAL_INVALIDATION_ID_RE = re.compile(r"^AI-[0-9a-f]{12}$")
+
+
+class ApprovalEvents(list):
+    """Strict approval-ledger view.
+
+    Approval records are authority input, so a partial parse is never useful.  The ordinary
+    NDJSON reader intentionally tolerates damaged advisory rows; this reader carries an explicit
+    validity bit so every approval consumer can fail closed on one malformed, reordered, or
+    truncated event.
+    """
+
+    def __init__(self, records=(), *, valid=True, error=""):
+        super().__init__(records)
+        self.valid = bool(valid)
+        self.error = str(error or "")
+
+
+def _invalid_approval_events(error):
+    return ApprovalEvents(valid=False, error=error)
+
+
+def approval_events_valid(events):
+    return isinstance(events, ApprovalEvents) and events.valid
+
+
+def _approval_event_shape_valid(event):
+    if not isinstance(event, dict):
+        return False
+    event_kind = event.get("event")
+    required = {
+        "issued": {
+            "event", "kind", "subject_digest", "ticket_id", "subject", "issued_at",
+            "expires_at", "reason", "work_id", "issued_by",
+        },
+        "consumed": {
+            "event", "kind", "subject_digest", "ticket_id", "at", "work_id", "pathway",
+            "consumed_by", "consumption_id",
+        },
+        "invalidated": {
+            "event", "kind", "subject_digest", "ticket_id", "at", "work_id", "reason",
+            "invalidated_by", "invalidation_id",
+        },
+    }
+    if event_kind not in required or set(event) != required[event_kind]:
+        return False
+    if event.get("kind") not in {APPROVAL_KIND_RELEASE, APPROVAL_KIND_WAIVER}:
+        return False
+    if not APPROVAL_DIGEST_RE.fullmatch(str(event.get("subject_digest") or "")):
+        return False
+    if not APPROVAL_TICKET_ID_RE.fullmatch(str(event.get("ticket_id") or "")):
+        return False
+    if not isinstance(event.get("work_id"), str) or not event.get("work_id"):
+        return False
+    if event_kind == "issued":
+        subject = event.get("subject")
+        issued_at = parse_ts(str(event.get("issued_at") or ""))
+        expires_at = parse_ts(str(event.get("expires_at") or ""))
+        return bool(
+            isinstance(subject, dict)
+            and subject.get("kind") == event.get("kind")
+            and subject.get("work_id") == event.get("work_id")
+            and approval_subject_digest(subject) == event.get("subject_digest")
+            and issued_at is not None
+            and expires_at is not None
+            and expires_at > issued_at
+            and (expires_at - issued_at).total_seconds() <= APPROVAL_TTL_SECONDS
+            and isinstance(event.get("reason"), str)
+            and event.get("reason")
+            and isinstance(event.get("issued_by"), str)
+            and event.get("issued_by")
+        )
+    if event_kind == "consumed":
+        return bool(
+            parse_ts(str(event.get("at") or "")) is not None
+            and isinstance(event.get("pathway"), str)
+            and isinstance(event.get("consumed_by"), str)
+            and event.get("consumed_by")
+            and APPROVAL_CONSUMPTION_ID_RE.fullmatch(
+                str(event.get("consumption_id") or "")
+            )
+        )
+    return bool(
+        parse_ts(str(event.get("at") or "")) is not None
+        and isinstance(event.get("reason"), str)
+        and event.get("reason")
+        and isinstance(event.get("invalidated_by"), str)
+        and event.get("invalidated_by")
+        and APPROVAL_INVALIDATION_ID_RE.fullmatch(str(event.get("invalidation_id") or ""))
+    )
+
+
+def _strict_approval_events(path):
+    """Read one authority ledger completely or return an invalid empty view."""
+    ledger = Path(path)
+    if not ledger.exists():
+        return ApprovalEvents()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(ledger, flags)
+    except OSError as exc:
+        return _invalid_approval_events(f"open:{exc.__class__.__name__}")
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return _invalid_approval_events("not-regular")
+        if metadata.st_size > NDJSON_READ_MAX_BYTES:
+            return _invalid_approval_events("over-read-cap")
+        chunks = []
+        remaining = metadata.st_size + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1_048_576, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        return _invalid_approval_events(f"read:{exc.__class__.__name__}")
+    finally:
+        os.close(descriptor)
+    if len(raw) != metadata.st_size:
+        return _invalid_approval_events("short-read")
+    if raw and not raw.endswith(b"\n"):
+        return _invalid_approval_events("truncated-tail")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return _invalid_approval_events("invalid-utf8")
+
+    records = []
+    issued_by_ticket = {}
+    consumed_tickets = set()
+    invalidated_tickets = set()
+    consumption_ids = set()
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            return _invalid_approval_events(f"blank-line:{line_number}")
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            return _invalid_approval_events(f"malformed-json:{line_number}")
+        if not _approval_event_shape_valid(event):
+            return _invalid_approval_events(f"invalid-event:{line_number}")
+        ticket_id = event["ticket_id"]
+        event_kind = event["event"]
+        if event_kind == "issued":
+            if ticket_id in issued_by_ticket:
+                return _invalid_approval_events(f"duplicate-ticket:{line_number}")
+            issued_by_ticket[ticket_id] = event
+        else:
+            issued = issued_by_ticket.get(ticket_id)
+            if not issued:
+                return _invalid_approval_events(f"event-before-issue:{line_number}")
+            if any(
+                event.get(field) != issued.get(field)
+                for field in ("kind", "subject_digest", "work_id")
+            ):
+                return _invalid_approval_events(f"ticket-binding-mismatch:{line_number}")
+            if event_kind == "consumed":
+                consumption_id = event["consumption_id"]
+                if ticket_id in consumed_tickets or consumption_id in consumption_ids:
+                    return _invalid_approval_events(f"duplicate-consumption:{line_number}")
+                consumed_tickets.add(ticket_id)
+                consumption_ids.add(consumption_id)
+            elif ticket_id in invalidated_tickets:
+                return _invalid_approval_events(f"duplicate-invalidation:{line_number}")
+            else:
+                invalidated_tickets.add(ticket_id)
+        records.append(event)
+    return ApprovalEvents(records)
 
 
 def approval_subject_digest(subject):
@@ -3162,17 +3471,131 @@ def approval_subject_digest(subject):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _ephemeral_approval_store(paths):
+    """Whether this is an isolated canonical-suite store with no symlink escape.
+
+    The lexical output root matters. A same-user replacement of the live output directory with a
+    symlink into a test-shaped path must never make the default CLI unprotected.
+    """
+    try:
+        lexical_root = Path(
+            getattr(paths, "output_root_input", Path(paths.approvals_path).parents[1])
+        ).absolute()
+        test_parent = Path("/private/tmp").absolute()
+        relative = lexical_root.relative_to(test_parent)
+        if (
+            len(relative.parts) != 2
+            or not relative.parts[0].startswith("operating-layer-test-")
+            or relative.parts[1] != "out"
+        ):
+            return False
+        if lexical_root.resolve(strict=True) != lexical_root:
+            return False
+        suite_root = test_parent / relative.parts[0]
+        metadata = suite_root.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            return False
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            return False
+        expected = lexical_root / "operator-intelligence" / "approvals.ndjson"
+        actual = Path(paths.approvals_path).absolute()
+        if actual != expected or actual.resolve(strict=False) != actual:
+            return False
+        cursor = suite_root
+        for part in ("out", "operator-intelligence"):
+            cursor = cursor / part
+            if cursor.exists() and cursor.is_symlink():
+                return False
+        return True
+    except (AttributeError, IndexError, OSError, RuntimeError, ValueError):
+        return False
+
+
+def approval_store_is_protected(paths):
+    return not _ephemeral_approval_store(paths)
+
+
+def _authority_path_is_os_owned(path):
+    """Require an unbroken root-owned, non-writable chain for the live trust root."""
+    authority = Path(path)
+    expected = APPROVAL_AUTHORITY_PATH
+    if authority != expected or not authority.is_absolute():
+        return False
+    components = [authority]
+    cursor = authority.parent
+    stop = Path("/Library") if sys.platform == "darwin" else Path("/var/lib")
+    while True:
+        components.append(cursor)
+        if cursor == stop:
+            break
+        if cursor == cursor.parent:
+            return False
+        cursor = cursor.parent
+    try:
+        for component in components:
+            metadata = component.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
+                return False
+            if stat.S_IMODE(metadata.st_mode) & 0o022:
+                return False
+        return stat.S_ISREG(authority.lstat().st_mode)
+    except OSError:
+        return False
+
+
 def approval_events_for(paths):
-    return read_ndjson(paths.approvals_path)
+    """Return the effective authority view, never a partial or user-forged one.
+
+    Isolated canonical-suite stores remain self-contained.  Every real store requires the fixed,
+    OS-owned authority ledger for issued and invalidated events; the user ledger contributes only
+    structurally valid consumptions that bind an exact OS-authorized ticket.
+    """
+    if not approval_store_is_protected(paths):
+        return _strict_approval_events(paths.approvals_path)
+    authority_path = Path(
+        getattr(paths, "approval_authority_path", APPROVAL_AUTHORITY_PATH)
+    )
+    if not authority_path.exists():
+        return _invalid_approval_events("authority-ledger-missing")
+    if not _authority_path_is_os_owned(authority_path):
+        return _invalid_approval_events("authority-ledger-permissions")
+    authority_events = _strict_approval_events(authority_path)
+    if not approval_events_valid(authority_events):
+        return _invalid_approval_events(f"authority-{authority_events.error}")
+    return authority_events
 
 
 def latest_approval_event(events, digest, event_kind):
+    if not approval_events_valid(events):
+        return None
     match = None
     for event in events or []:
         if (isinstance(event, dict) and event.get("event") == event_kind
                 and event.get("subject_digest") == digest):
             match = event
     return match
+
+
+def approval_event_for_ticket(events, ticket_id, event_kind, consumption_id=""):
+    """Return the latest exact-ticket event, optionally bound to one consumption id."""
+    if not approval_events_valid(events):
+        return None
+    match = None
+    for event in events or []:
+        if (not isinstance(event, dict) or event.get("event") != event_kind
+                or event.get("ticket_id") != ticket_id):
+            continue
+        if consumption_id and event.get("consumption_id") != consumption_id:
+            continue
+        match = event
+    return match
+
+
+def approval_ticket_invalidated(events, ticket_id):
+    """An append-only invalidation permanently revokes exactly one issued ticket."""
+    if not approval_events_valid(events):
+        return True
+    return approval_event_for_ticket(events, ticket_id, "invalidated") is not None
 
 
 @contextlib.contextmanager
@@ -3191,14 +3614,16 @@ def _approvals_write_lock(paths):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def _approvals_ledger_over_cap(paths):
-    """A ledger past the NDJSON read cap would be read truncated; rewriting from that read would
-    permanently destroy the newest events (the consumptions). Refuse to write instead."""
-    try:
-        size = Path(paths.approvals_path).stat().st_size
-    except OSError:
-        return False
-    return size > NDJSON_READ_MAX_BYTES
+def _approval_records_size(records):
+    return sum(
+        len(json.dumps(redact_obj(record), sort_keys=True).encode("utf-8")) + 1
+        for record in records
+    )
+
+
+def _approval_write_fits(records):
+    """Refuse the write that would cross the read cap, not merely the write after it."""
+    return _approval_records_size(records) <= NDJSON_READ_MAX_BYTES
 
 
 def find_active_approval(events, digest, now=None):
@@ -3209,11 +3634,17 @@ def find_active_approval(events, digest, now=None):
     issued event's ticket_id blocks it. A fresh issued event appended after a consumption is a
     new, consumable ticket for the same subject — otherwise one spent ticket would lock a
     legitimate re-approval out forever (adversarial review finding, 2026-08-16)."""
+    if not approval_events_valid(events):
+        return None, "ledger_invalid"
     now = now or utc_now()
     issued = latest_approval_event(events, digest, "issued")
     if issued is None:
         return None, "no_ticket"
     ticket_id = issued.get("ticket_id", "")
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return None, "invalid_ticket_id"
+    if approval_ticket_invalidated(events, ticket_id):
+        return None, "invalidated"
     for event in events or []:
         if (isinstance(event, dict) and event.get("event") == "consumed"
                 and event.get("subject_digest") == digest
@@ -3233,6 +3664,46 @@ def find_active_approval(events, digest, now=None):
     return issued, ""
 
 
+def prebound_approval_for_consumer(events, digest, consumed_by, now=None):
+    """Return a root-preconsumed approval only while its first attachment is timely.
+
+    The OS helper binds and consumes at issue time, before the agent can attach the ticket to a
+    waiver row or release proof. That pre-consumption must not make the 15-minute review window
+    infinite. Status-time corroboration deliberately uses the timeless receipt-specific helpers
+    instead, so already persisted historical proof does not expire retroactively.
+    """
+    if not approval_events_valid(events):
+        return None, "ledger_invalid"
+    issued = latest_approval_event(events, digest, "issued")
+    if issued is None:
+        return None, "no_ticket"
+    ticket_id = issued.get("ticket_id", "")
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return None, "invalid_ticket_id"
+    if approval_ticket_invalidated(events, ticket_id):
+        return None, "invalidated"
+    subject = issued.get("subject")
+    if not isinstance(subject, dict) or approval_subject_digest(subject) != digest:
+        return None, "subject_mismatch"
+    issued_at = parse_ts(str(issued.get("issued_at") or ""))
+    expires_at = parse_ts(str(issued.get("expires_at") or ""))
+    if issued_at is None or expires_at is None or expires_at <= issued_at:
+        return None, "invalid_window"
+    if (expires_at - issued_at).total_seconds() > APPROVAL_TTL_SECONDS:
+        return None, "invalid_window"
+    current = now or utc_now()
+    if current < issued_at:
+        return None, "not_yet_valid"
+    if current > expires_at:
+        return None, "expired"
+    prior = approval_event_for_ticket(events, ticket_id, "consumed")
+    if prior is None:
+        return None, "consumption_not_human_bound"
+    if prior.get("consumed_by") != consumed_by:
+        return None, "consumed"
+    return prior, ""
+
+
 def consume_approval(paths, subject, consumed_by, now=None):
     """Single-use consumption bound to one consumer, under the ledger write lock.
 
@@ -3243,14 +3714,22 @@ def consume_approval(paths, subject, consumed_by, now=None):
     digest = approval_subject_digest(subject)
     with _approvals_write_lock(paths):
         events = approval_events_for(paths)
-        prior = latest_approval_event(events, digest, "consumed")
+        if not approval_events_valid(events):
+            return None, "ledger_invalid"
+        if approval_store_is_protected(paths):
+            return prebound_approval_for_consumer(
+                events, digest, consumed_by, now=now
+            )
+        issued = latest_approval_event(events, digest, "issued")
+        ticket_id = issued.get("ticket_id", "") if isinstance(issued, dict) else ""
+        if ticket_id and approval_ticket_invalidated(events, ticket_id):
+            return None, "invalidated"
+        prior = approval_event_for_ticket(events, ticket_id, "consumed")
         if prior is not None and prior.get("consumed_by") == consumed_by:
             return prior, ""
         issued, refusal = find_active_approval(events, digest, now=now)
         if issued is None:
             return None, refusal
-        if _approvals_ledger_over_cap(paths):
-            return None, "ledger_over_read_cap"
         record = {
             "event": "consumed",
             "kind": issued.get("kind"),
@@ -3260,12 +3739,15 @@ def consume_approval(paths, subject, consumed_by, now=None):
             "work_id": subject.get("work_id", ""),
             "pathway": subject.get("pathway", ""),
             "consumed_by": consumed_by,
-            "consumption_id": f"AC-{sha_text(digest + '|' + str(consumed_by), 12)}",
+            "consumption_id": f"AC-{sha_text(ticket_id + '|' + digest + '|' + str(consumed_by), 12)}",
         }
+        records_to_write = [*events, record]
+        if not _approval_write_fits(records_to_write):
+            return None, "ledger_over_read_cap"
         # append_records rewrites the whole file atomically, so a true append must carry every
         # existing event forward. The ledger stays append-only at the semantic level: events are
         # never edited or removed, only added.
-        write_ndjson(paths.approvals_path, events + [record])
+        write_ndjson(paths.approvals_path, records_to_write)
         return record, ""
 
 
@@ -3283,6 +3765,11 @@ def _approval_issuer_identity():
         return "unknown"
 
 
+def _approval_helper_command(action, arguments):
+    argv = ["/usr/bin/sudo", "--", str(APPROVAL_HELPER_PATH), action, *map(str, arguments)]
+    return "/usr/bin/sudo -k; " + shlex.join(argv)
+
+
 def release_approval_subject(work_id, project, release_receipt_sha256):
     return {
         "kind": APPROVAL_KIND_RELEASE,
@@ -3293,13 +3780,65 @@ def release_approval_subject(work_id, project, release_receipt_sha256):
     }
 
 
-def waiver_subject(work_id, project, pathway, reason):
+WAIVER_SUBJECT_SCHEMA_VERSION = 2
+
+
+def work_context_sha256(item, pathway):
+    """Bind a waiver to the immutable meaning of one current work obligation.
+
+    Status and proof fields are intentionally excluded because consuming the waiver changes them.
+    Identity-shaping fields and the itinerary pathway set are included, so editing the goal,
+    project, tier, profile, overlays, or obligation set orphans the human-reviewed waiver.
+    """
+    if not isinstance(item, dict) or pathway not in PATHWAY_CANON_ORDER:
+        return ""
+    raw_project = str(item.get("project") or "")
+    try:
+        resolved_project = str(Path(raw_project).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    itinerary = item.get("itinerary")
+    if not isinstance(itinerary, list):
+        return ""
+    itinerary_pathways = sorted({
+        entry.get("pathway")
+        for entry in itinerary
+        if isinstance(entry, dict) and entry.get("pathway") in PATHWAY_CANON_ORDER
+    }, key=pathway_sort_key)
+    if pathway not in itinerary_pathways:
+        return ""
+    context = {
+        "schema_version": 1,
+        "work_id": str(item.get("work_id") or ""),
+        "project_name": str(item.get("project_name") or ""),
+        "project_path_input": raw_project,
+        "project_path_resolved": resolved_project,
+        "goal": item.get("goal"),
+        "tier": item.get("tier"),
+        "outcome_profile": item.get("outcome_profile"),
+        "risk_overlays": item.get("risk_overlays"),
+        "itinerary_pathways": itinerary_pathways,
+        "obligation": {"pathway": pathway},
+    }
+    try:
+        encoded = json.dumps(
+            context, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return ""
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def waiver_subject(work_id, project, pathway, reason, context_sha256):
     return {
         "kind": APPROVAL_KIND_WAIVER,
+        "schema_version": WAIVER_SUBJECT_SCHEMA_VERSION,
         "work_id": str(work_id or ""),
         "project": str(project or ""),
         "pathway": str(pathway or ""),
         "reason": str(reason or ""),
+        "work_context_sha256": str(context_sha256 or ""),
     }
 
 
@@ -3310,12 +3849,31 @@ def approval_claim_corroborated(digest, expected_subject, consumer, consumption_
     whose subject is exactly what the claim implies, a consumption by this exact consumer, and a
     matching consumption id) can never drift apart. Also re-checks the issued window against the
     authority's own TTL, so a hand-widened expiry in the ledger cannot be honored later."""
+    if not approval_events_valid(events):
+        return False
     digest = str(digest or "")
     if not APPROVAL_DIGEST_RE.fullmatch(digest):
         return False
-    issued = latest_approval_event(events, digest, "issued")
-    consumed = latest_approval_event(events, digest, "consumed")
-    if issued is None or consumed is None:
+    consumed = next(
+        (
+            event for event in reversed(events or [])
+            if isinstance(event, dict)
+            and event.get("event") == "consumed"
+            and event.get("subject_digest") == digest
+            and event.get("consumption_id") == consumption_id
+            and event.get("consumed_by") == consumer
+        ),
+        None,
+    )
+    if consumed is None:
+        return False
+    ticket_id = consumed.get("ticket_id", "")
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return False
+    issued = approval_event_for_ticket(events, ticket_id, "issued")
+    if issued is None or issued.get("subject_digest") != digest:
+        return False
+    if approval_ticket_invalidated(events, ticket_id):
         return False
     subject = issued.get("subject") if isinstance(issued.get("subject"), dict) else {}
     if subject != expected_subject or approval_subject_digest(subject) != digest:
@@ -3333,6 +3891,7 @@ def approval_claim_corroborated(digest, expected_subject, consumer, consumption_
     return (
         consumed.get("consumed_by") == consumer
         and consumed.get("consumption_id") == consumption_id
+        and consumed.get("subject_digest") == digest
     )
 
 
@@ -3351,16 +3910,24 @@ def release_approval_corroborated(proof, events):
     )
 
 
-def waiver_corroborated(entry, work_id, project, events):
+def waiver_corroborated(entry, item, events):
     """A production-secure N/A row survives status recomputation only when its waiver claim maps
     back to an issued subject for this exact work/project/pathway/reason and to that row's own
     work-cover consumption."""
     if not isinstance(entry, dict):
         return False
+    item = item if isinstance(item, dict) else {}
+    pathway = entry.get("pathway")
+    context_sha256 = work_context_sha256(item, pathway)
+    if not context_sha256:
+        return False
     return approval_claim_corroborated(
         entry.get("waiver_digest"),
-        waiver_subject(work_id, project, entry.get("pathway"), entry.get("reason")),
-        f"work-cover:{work_id}:{entry.get('pathway')}",
+        waiver_subject(
+            item.get("work_id"), item.get("project_name"), pathway,
+            entry.get("reason"), context_sha256,
+        ),
+        f"work-cover:{item.get('work_id')}:{pathway}",
         entry.get("waiver_consumed_id"),
         events,
     )
@@ -3766,7 +4333,60 @@ def latest_carry_forward_for_work(paths, work_id):
         return {}
     # NDJSON append order is the deterministic tie-breaker when multiple proofs land inside
     # the same timestamp second. The most recently written baton must win continuity.
-    return max(enumerate(records), key=lambda item: (item[1].get("created_at", ""), item[0]))[1]
+    latest = max(enumerate(records), key=lambda item: (item[1].get("created_at", ""), item[0]))[1]
+    release_batons = [
+        record for record in records
+        if record.get("pathway") == "release" and record.get("credits_pathway") is True
+    ]
+    if not release_batons:
+        return latest
+    proofs = read_ndjson(paths.proofs_path)
+    approval_events = approval_events_for(paths)
+    release_proof_ids = {
+        baton.get("proof_id") for baton in release_batons if baton.get("proof_id")
+    }
+    valid_release_proof = next(
+        (
+            proof for proof in reversed(proofs)
+            if proof.get("work_id") == work_id
+            and (
+                proof.get("pathway") == "release"
+                or proof.get("proof_id") in release_proof_ids
+            )
+            and release_approval_corroborated(proof, approval_events)
+        ),
+        None,
+    )
+    if valid_release_proof is not None:
+        return latest
+    latest_release = max(
+        enumerate(release_batons),
+        key=lambda item: (item[1].get("created_at", ""), item[0]),
+    )[1]
+    release_proof = next(
+        (
+            proof for proof in reversed(proofs)
+            if proof.get("proof_id") == latest_release.get("proof_id")
+        ),
+        None,
+    )
+    if release_proof is None:
+        return latest
+    corrected = dict(latest)
+    corrected.update({
+        "release_credit_current": False,
+        "release_pathway_outcome": "approval_invalidated",
+        "invalidated_release_proof_id": release_proof.get("proof_id", ""),
+        "summary": "The release approval no longer corroborates; release proof is open again.",
+        "what_changed": ["Current approval-ledger state invalidated the release credit."],
+        "next_pathway_must_use": ["Re-establish independent human approval before release credit."],
+        "do_not_do_yet": ["Do not treat the historical release carry-forward as proved."],
+        "source": "operating-layer invalidation-aware carry-forward view",
+    })
+    if latest.get("pathway") == "release":
+        corrected["credits_pathway"] = False
+        corrected["pathway_outcome"] = "approval_invalidated"
+    return corrected
 
 
 def carry_forward_effect(carry_forward, recommended_pathway):
@@ -4641,10 +5261,16 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 args.work_id or "", project_name, _peek_sha)
             _peek_digest = approval_subject_digest(release_approval_subject_value)
             _peek_events = approval_events_for(paths)
-            _active, _refusal = find_active_approval(_peek_events, _peek_digest)
-            _prior = latest_approval_event(_peek_events, _peek_digest, "consumed")
-            release_approval_available = _active is not None or (
-                _prior is not None and _prior.get("consumed_by") == proof_id)
+            if approval_store_is_protected(paths):
+                _prior, _refusal = prebound_approval_for_consumer(
+                    _peek_events, _peek_digest, proof_id
+                )
+                release_approval_available = _prior is not None
+            else:
+                _active, _refusal = find_active_approval(_peek_events, _peek_digest)
+                _prior = latest_approval_event(_peek_events, _peek_digest, "consumed")
+                release_approval_available = _active is not None or (
+                    _prior is not None and _prior.get("consumed_by") == proof_id)
     release_receipt = (
         release_provider_action_from_evidence(evidence_path)
         if release_provider_action_contract
@@ -6877,7 +7503,7 @@ def stale_measurements(measurements):
     return stale
 
 
-def work_status_summary(paths, work_id):
+def work_status_summary(paths, work_id, approval_events_override=None):
     records = load_work_records(paths)
     item = next((w for w in records["items"] if w.get("work_id") == work_id), None)
     runs = [r for r in records["runs"] if r.get("work_id") == work_id]
@@ -6888,7 +7514,11 @@ def work_status_summary(paths, work_id):
     stale = stale_measurements(measurements)
     pathways_seen = sorted(set(r.get("pathway") for r in runs if r.get("pathway")), key=pathway_sort_key)
     proof_records = read_ndjson(paths.proofs_path)
-    approval_events = approval_events_for(paths)
+    approval_events = (
+        approval_events_override
+        if approval_events_override is not None
+        else approval_events_for(paths)
+    )
     proved_pathway_map = proved_pathways_from_proofs(work_id, proof_records, approval_events)
     missing_core_pathways = [p for p in CORE_PATHWAYS if p not in pathways_seen]
     if item:
@@ -6926,8 +7556,7 @@ def work_status_summary(paths, work_id):
                 and pathway not in proved_pathway_map
                 and (production_secure or recorded_receipt)
             )
-            waived = waiver_corroborated(
-                entry, work_id, (item or {}).get("project_name", ""), approval_events)
+            waived = waiver_corroborated(entry, item, approval_events)
             if (production_secure and entry.get("status") == "na" and not waived) or unsupported_proved:
                 entry["status"] = "required"
                 entry["proved_by_run"] = ""
@@ -6969,6 +7598,166 @@ def work_status_summary(paths, work_id):
     }
 
 
+def current_work_item_view(paths, item, summary=None, approval_events=None):
+    """Project the effective status of a historically closed item without rewriting history.
+
+    Only a consumed ticket whose removal is the difference between ready and not-ready may reopen
+    a closed item as approval-invalidated.  An invalidated but unused ticket is audit history, not
+    causal work state.
+    """
+    if not isinstance(item, dict) or item.get("status", "active") != "closed":
+        return item, summary
+    work_id = item.get("work_id")
+    if not work_id:
+        return item, summary
+    events = approval_events if approval_events is not None else approval_events_for(paths)
+    if not approval_events_valid(events):
+        has_waiver_claim = any(
+            isinstance(entry, dict)
+            and bool(entry.get("waiver_digest") or entry.get("waiver_consumed_id"))
+            for entry in item.get("itinerary", [])
+        )
+        has_release_claim = any(
+            proof.get("work_id") == work_id
+            and proof.get("pathway") == "release"
+            and bool(
+                proof.get("release_approval_digest")
+                or proof.get("release_approval_consumed_id")
+            )
+            for proof in read_ndjson(paths.proofs_path)
+        )
+        current_summary = summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") == "ready":
+            return item, current_summary
+        if not (
+            has_waiver_claim
+            or has_release_claim
+            or production_secure_waiver_locked(item)
+        ):
+            return item, current_summary
+        current_view = dict(item)
+        current_view.update({
+            "persisted_status": "closed",
+            "status": "active",
+            "current_status": "active",
+            "current_status_reason": (
+                "approval_ledger_invalid"
+                if has_waiver_claim or has_release_claim
+                else "production_secure_not_ready"
+            ),
+        })
+        current_summary = dict(current_summary)
+        current_summary["work_item"] = current_view
+        return current_view, current_summary
+    consumed_tickets = {
+        event.get("ticket_id")
+        for event in events
+        if event.get("event") == "consumed" and event.get("work_id") == work_id
+    }
+    causal_ticket_ids = {
+        event.get("ticket_id")
+        for event in events
+        if event.get("event") == "invalidated"
+        and event.get("work_id") == work_id
+        and event.get("ticket_id") in consumed_tickets
+    }
+    current_summary = summary
+    if causal_ticket_ids:
+        current_summary = current_summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") != "ready":
+            without_invalidations = ApprovalEvents([
+                event for event in events
+                if not (
+                    event.get("event") == "invalidated"
+                    and event.get("ticket_id") in causal_ticket_ids
+                )
+            ])
+            counterfactual = work_status_summary(
+                paths, work_id, approval_events_override=without_invalidations
+            )
+            if counterfactual.get("closeout_readiness") == "ready":
+                current_view = dict(item)
+                current_view.update({
+                    "persisted_status": "closed",
+                    "status": "active",
+                    "current_status": "active",
+                    "current_status_reason": "approval_invalidated",
+                })
+                current_summary = dict(current_summary)
+                current_summary["work_item"] = current_view
+                return current_view, current_summary
+
+    def claim_was_explicitly_invalidated(digest, consumption_id):
+        consumed = next(
+            (
+                event for event in events
+                if event.get("event") == "consumed"
+                and event.get("subject_digest") == digest
+                and event.get("consumption_id") == consumption_id
+            ),
+            None,
+        )
+        return bool(
+            consumed
+            and approval_ticket_invalidated(events, consumed.get("ticket_id", ""))
+        )
+
+    project_name = item.get("project_name", "")
+    has_uncorroborated_claim = any(
+        isinstance(entry, dict)
+        and bool(entry.get("waiver_digest") or entry.get("waiver_consumed_id"))
+        and not waiver_corroborated(entry, item, events)
+        and not claim_was_explicitly_invalidated(
+            entry.get("waiver_digest"), entry.get("waiver_consumed_id")
+        )
+        for entry in item.get("itinerary", [])
+    )
+    if not has_uncorroborated_claim:
+        has_uncorroborated_claim = any(
+            proof.get("work_id") == work_id
+            and bool(
+                proof.get("release_approval_digest")
+                or proof.get("release_approval_consumed_id")
+            )
+            and not release_approval_corroborated(proof, events)
+            and not claim_was_explicitly_invalidated(
+                proof.get("release_approval_digest"),
+                proof.get("release_approval_consumed_id"),
+            )
+            for proof in read_ndjson(paths.proofs_path)
+        )
+    if not has_uncorroborated_claim:
+        if not production_secure_waiver_locked(item):
+            return item, current_summary
+        current_summary = current_summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") == "ready":
+            return item, current_summary
+        reason = "production_secure_not_ready"
+    else:
+        current_summary = current_summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") == "ready":
+            return item, current_summary
+        reason = "approval_uncorroborated"
+    current_view = dict(item)
+    current_view.update({
+        "persisted_status": "closed",
+        "status": "active",
+        "current_status": "active",
+        "current_status_reason": reason,
+    })
+    current_summary = dict(current_summary)
+    current_summary["work_item"] = current_view
+    return current_view, current_summary
+
+
 def work_warnings(item, runs, measurements, open_controls, stale, itinerary_open=None):
     warnings = []
     if not item:
@@ -6999,8 +7788,23 @@ def work_warnings(item, runs, measurements, open_controls, stale, itinerary_open
 def build_daily_dashboard(paths):
     records = load_work_records(paths)
     work_items = sorted(records["items"], key=lambda w: w.get("updated_at", ""), reverse=True)
-    active = [w for w in work_items if w.get("status", "active") != "closed"]
-    summaries = [work_status_summary(paths, w.get("work_id")) for w in active[:25]]
+    approval_events = approval_events_for(paths)
+    active = []
+    invalidation_summaries = {}
+    for item in work_items:
+        current_view, summary = current_work_item_view(
+            paths, item, approval_events=approval_events
+        )
+        if current_view.get("status", "active") == "closed":
+            continue
+        active.append(current_view)
+        if summary is not None:
+            invalidation_summaries[item.get("work_id")] = summary
+    summaries = [
+        invalidation_summaries.get(item.get("work_id"))
+        or work_status_summary(paths, item.get("work_id"))
+        for item in active[:25]
+    ]
     stuck = [
         s for s in summaries
         if s["open_controls"] or s["stale_measurements"] or any("No pathway runs" in w for w in s["warnings"])
@@ -7010,7 +7814,7 @@ def build_daily_dashboard(paths):
         "generated_at": iso_now(),
         "active_work_items": active,
         "active_count": len(active),
-        "closed_count": len([w for w in work_items if w.get("status") == "closed"]),
+        "closed_count": len(work_items) - len(active),
         "work_summaries": summaries,
         "stuck_work_items": [
             {
@@ -7502,7 +8306,9 @@ def run_work_cover(args, paths):
                 waiver_consumption, consume_refusal = consume_approval(
                     paths,
                     waiver_subject(
-                        args.work_id, item.get("project_name", ""), args.pathway, args.reason),
+                        args.work_id, item.get("project_name", ""), args.pathway, args.reason,
+                        work_context_sha256(item, args.pathway),
+                    ),
                     f"work-cover:{args.work_id}:{args.pathway}",
                 )
                 if waiver_consumption is None:
@@ -7650,13 +8456,13 @@ def run_approval_issue(args, paths):
     # The ledger is written through the redactor. A reason the redactor rewrites would be stored
     # as different bytes than the digest binds, and the ticket would be stillborn with a refusal
     # that reads like tampering. Refuse loudly at issue time instead.
-    if redact(reason) != reason:
+    if redact(reason) != reason or not _authority_text_safe(reason):
         return _refuse(
             "approval-issue-reason-not-storable",
-            "The reason contains secret-like text that the ledger redactor would rewrite, so the "
-            "ticket could never be consumed.",
-            "Reword the reason without credential-shaped text (no `token:`/`secret=`/`password:` "
-            "phrasing and no 64-character-plus runs), then re-issue.",
+            "The reason contains secret-like or visually unsafe control text, so the reviewed "
+            "authority command cannot preserve it safely.",
+            "Reword the reason without credential-shaped, control, bidi, or line-separator text, "
+            "then re-issue.",
         )
     item = next(
         (w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
@@ -7667,6 +8473,12 @@ def run_approval_issue(args, paths):
             "Check the work_id with work-status.",
         )
     project = item.get("project_name", "")
+    if not all(_authority_text_safe(value) for value in (str(args.work_id), str(project))):
+        return _refuse(
+            "approval-issue-unsafe-identity-text",
+            "The work ID or project name contains visually unsafe Unicode control text.",
+            "Repair the work item identity before requesting approval.",
+        )
     if kind == APPROVAL_KIND_WAIVER:
         if (args.pathway or "") not in PATHWAY_CANON_ORDER:
             return _refuse(
@@ -7674,7 +8486,18 @@ def run_approval_issue(args, paths):
                 "A production-secure waiver ticket requires --pathway (a canonical pathway name).",
                 f"Choose one of: {', '.join(PATHWAY_CANON_ORDER)}.",
             )
-        subject = waiver_subject(args.work_id, project, args.pathway, reason)
+        context_sha256 = work_context_sha256(item, args.pathway)
+        if not context_sha256:
+            return _refuse(
+                "approval-issue-invalid-work-context",
+                "The current work context cannot be bound to a waiver subject.",
+                "Repair the work item project, goal, tier, profile, overlays, and itinerary "
+                "before requesting a waiver.",
+            )
+        subject = waiver_subject(
+            args.work_id, project, args.pathway, reason, context_sha256
+        )
+        authority_consumer = f"work-cover:{args.work_id}:{args.pathway}"
     else:
         receipt_raw = (getattr(args, "release_receipt", None) or "").strip()
         if not receipt_raw:
@@ -7699,6 +8522,45 @@ def run_approval_issue(args, paths):
                 "Fix the file and re-run.",
             )
         subject = release_approval_subject(args.work_id, project, receipt_sha)
+        recommendation_id = (getattr(args, "recommendation_id", None) or "").strip()
+        if not recommendation_id:
+            try:
+                receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if isinstance(receipt_payload, dict):
+                    recommendation_id = str(receipt_payload.get("recommendation_id") or "")
+            except (OSError, TypeError, ValueError):
+                recommendation_id = ""
+        derived_consumer = proof_id_for(
+            str(receipt_path), args.work_id, "release", "artifact", recommendation_id
+        )
+        provided_consumer = (getattr(args, "consumer", None) or "").strip()
+        if provided_consumer and provided_consumer != derived_consumer:
+            return _refuse(
+                "approval-issue-consumer-mismatch",
+                "--consumer does not match the exact proof id derived from the reviewed receipt.",
+                f"Use --consumer {derived_consumer}, then log the same receipt with the same "
+                "work id, release pathway, artifact proof type, and recommendation id.",
+            )
+        authority_consumer = provided_consumer or derived_consumer
+    if approval_store_is_protected(paths):
+        command = _approval_helper_command(
+            "issue",
+            [
+                "--subject-json",
+                json.dumps(subject, sort_keys=True, separators=(",", ":")),
+                "--reason",
+                reason,
+                "--consumer",
+                authority_consumer,
+            ],
+        )
+        refusal = _refuse(
+            "approval-issue-human-helper-required",
+            "The user-writable operating-layer CLI cannot issue live approval authority.",
+            f"Review the exact subject, then run this in Alex's normal Terminal: {command}",
+        )
+        refusal["authority_command"] = command
+        return refusal
     digest = approval_subject_digest(subject)
     now = utc_now()
     issued_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -7720,14 +8582,20 @@ def run_approval_issue(args, paths):
         "issued_by": _approval_issuer_identity(),
     }
     with _approvals_write_lock(paths):
-        if _approvals_ledger_over_cap(paths):
+        events = approval_events_for(paths)
+        if not approval_events_valid(events):
+            return _refuse(
+                "approval-issue-ledger-invalid",
+                "The approvals ledger is malformed, truncated, symlinked, or over its read cap.",
+                "Repair or rotate the ledger before issuing another ticket.",
+            )
+        if not _approval_write_fits([*events, event]):
             return _refuse(
                 "approval-issue-ledger-over-cap",
-                "The approvals ledger is past the NDJSON read cap; writing now would destroy the "
-                "newest events.",
+                "This approval event would put the ledger past its exact read cap.",
                 "Rotate the approvals ledger before issuing another ticket.",
             )
-        write_ndjson(paths.approvals_path, approval_events_for(paths) + [event])
+        write_ndjson(paths.approvals_path, [*events, event])
     next_step = (
         f"work-cover --work-id {args.work_id} --pathway {args.pathway} --na --reason "
         "\"<the exact same reason>\""
@@ -7742,6 +8610,112 @@ def run_approval_issue(args, paths):
         "expires_in_seconds": APPROVAL_TTL_SECONDS,
         "single_use": True,
         "next_step": next_step,
+    }
+
+
+def run_approval_invalidate(args, paths):
+    """Append an exact-ticket invalidation (Alex's deliberate corrective act).
+
+    Invalidation never rewrites issuance or consumption history. Status-time corroboration
+    consults this event, so an invalidated ticket cannot credit a waiver or release proof even
+    when its consumption predates the correction.
+    """
+    def _refuse(fid, message, remediation):
+        return {
+            "findings": [finding(
+                fid, "approval-authority", "error", message,
+                [line_evidence(paths.approvals_path, source=args.ticket_id or "")],
+                remediation, "static", "high",
+            )],
+            "records": [],
+        }
+
+    ticket_id = (args.ticket_id or "").strip()
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return _refuse(
+            "approval-invalidate-invalid-ticket-id",
+            "approval-invalidate requires one exact ticket id in the AT-<12 lowercase hex> form.",
+            "Copy the ticket_id from the approvals ledger and re-run the reviewed command.",
+        )
+    reason = (args.reason or "").strip()
+    if not reason:
+        return _refuse(
+            "approval-invalidate-missing-reason",
+            "approval-invalidate requires --reason so the correction is auditable.",
+            "State the bounded correction reason and re-run the reviewed command.",
+        )
+    if redact(reason) != reason or not _authority_text_safe(reason):
+        return _refuse(
+            "approval-invalidate-reason-not-storable",
+            "The invalidation reason contains secret-like or visually unsafe control text.",
+            "Reword the reason without credential-shaped, control, bidi, or line-separator text, "
+            "then re-run.",
+        )
+    if approval_store_is_protected(paths):
+        command = _approval_helper_command(
+            "invalidate", ["--ticket-id", ticket_id, "--reason", reason]
+        )
+        refusal = _refuse(
+            "approval-invalidate-human-helper-required",
+            "The user-writable operating-layer CLI cannot invalidate live approval authority.",
+            f"Review the exact ticket and reason, then run this in Alex's normal Terminal: {command}",
+        )
+        refusal["authority_command"] = command
+        return refusal
+
+    with _approvals_write_lock(paths):
+        events = approval_events_for(paths)
+        if not approval_events_valid(events):
+            return _refuse(
+                "approval-invalidate-ledger-invalid",
+                "The approvals ledger is malformed, truncated, symlinked, or over its read cap.",
+                "Repair or rotate the ledger before invalidating a ticket.",
+            )
+        if not _approval_write_fits(events):
+            return _refuse(
+                "approval-invalidate-ledger-over-cap",
+                "The approvals ledger is at or past its exact read cap.",
+                "Rotate the approvals ledger before invalidating a ticket.",
+            )
+        issued = approval_event_for_ticket(events, ticket_id, "issued")
+        if issued is None:
+            return _refuse(
+                "approval-invalidate-ticket-not-found",
+                f"No issued approval ticket exists with id {ticket_id}.",
+                "Check the exact ticket_id in the approvals ledger.",
+            )
+        prior = approval_event_for_ticket(events, ticket_id, "invalidated")
+        if prior is not None:
+            return {
+                "findings": [],
+                "records": [prior],
+                "ticket_id": ticket_id,
+                "status": "already_invalidated",
+            }
+        at = iso_now()
+        event = {
+            "event": "invalidated",
+            "kind": issued.get("kind", ""),
+            "subject_digest": issued.get("subject_digest", ""),
+            "ticket_id": ticket_id,
+            "at": at,
+            "work_id": issued.get("work_id", ""),
+            "reason": reason,
+            "invalidated_by": _approval_issuer_identity(),
+            "invalidation_id": f"AI-{sha_text(ticket_id + '|' + at + '|' + reason, 12)}",
+        }
+        if not _approval_write_fits([*events, event]):
+            return _refuse(
+                "approval-invalidate-ledger-over-cap",
+                "This invalidation event would put the ledger past its exact read cap.",
+                "Rotate the approvals ledger before invalidating a ticket.",
+            )
+        write_ndjson(paths.approvals_path, [*events, event])
+    return {
+        "findings": [],
+        "records": [event],
+        "ticket_id": ticket_id,
+        "status": "invalidated",
     }
 
 
@@ -7761,6 +8735,11 @@ def run_work_status(args, paths):
             "records": [],
         }
     summary = work_status_summary(paths, args.work_id)
+    current_item, current_summary = current_work_item_view(
+        paths, summary.get("work_item"), summary=summary
+    )
+    if current_item is not None and current_summary is not None:
+        summary = current_summary
     return {"records": [summary], "findings": [], "summary": summary}
 
 
@@ -8322,8 +9301,13 @@ def project_local_findings(project_path, max_files=40, max_records=200):
 
 def active_work_for_project(paths, project_path, project_name):
     items = read_ndjson(paths.work_items_path)
+    approval_events = approval_events_for(paths)
+    effective_items = [
+        current_work_item_view(paths, item, approval_events=approval_events)[0]
+        for item in items
+    ]
     matches = [
-        w for w in items
+        w for w in effective_items
         if w.get("status", "active") != "closed"
         and (w.get("project") == project_path or w.get("project_name") == project_name)
     ]
@@ -9055,11 +10039,12 @@ def compute_pathway_next(args, paths):
              if item.get("work_id") == requested_work_id),
             None,
         )
+        effective_known_item = current_work_item_view(paths, known_item)[0] if known_item else None
         selected_item = (
-            known_item
-            if known_item
-            and known_item.get("status", "active") != "closed"
-            and work_item_is_within_project(known_item, project_path, project_name)
+            effective_known_item
+            if effective_known_item
+            and effective_known_item.get("status", "active") != "closed"
+            and work_item_is_within_project(effective_known_item, project_path, project_name)
             else None
         )
         if not selected_item:
@@ -10293,10 +11278,15 @@ def portfolio_next_items(paths):
     proofs = read_ndjson(paths.proofs_path)
     recs = read_ndjson(paths.recommendations_path)
     out = []
+    approval_events = approval_events_for(paths)
+    effective_work_items = [
+        current_work_item_view(paths, item, approval_events=approval_events)[0]
+        for item in work_records["items"]
+    ]
     for project in projects:
         name = project.get("name", "")
         work_items = [
-            w for w in work_records["items"]
+            w for w in effective_work_items
             if w.get("status", "active") != "closed"
             and (w.get("project") == project.get("path") or w.get("project_name") == name)
         ]
@@ -11250,7 +12240,28 @@ def compute_tier_calibration(paths, min_outcomes=MIN_TIER_CALIBRATION_OUTCOMES,
     confirmed changes by ADR. Tier definitions are global, so it aggregates closed outcomes across
     ALL projects. A tier with fewer than `min_outcomes` closes makes no calibration claim."""
     items = read_ndjson(paths.work_items_path)
-    closed = [w for w in items if w.get("status") in ("closed", "done") and w.get("tier") in PATHWAY_TIERS]
+    approval_events = approval_events_for(paths)
+    closed = []
+    for item in items:
+        if item.get("status") not in ("closed", "done") or item.get("tier") not in PATHWAY_TIERS:
+            continue
+        work_id = item.get("work_id")
+        summary = (
+            work_status_summary(paths, work_id, approval_events_override=approval_events)
+            if work_id else None
+        )
+        current_item, current_summary = current_work_item_view(
+            paths, item, summary=summary, approval_events=approval_events
+        )
+        if current_item.get("status") not in ("closed", "done"):
+            continue
+        # Calibration learns from the same current, corroborated itinerary that status and
+        # routing expose. Persisted labels are history, not authority after an approval or proof
+        # loses corroboration.
+        projected = dict(current_item)
+        if current_summary is not None:
+            projected["itinerary"] = current_summary.get("itinerary", [])
+        closed.append(projected)
 
     def canon_key(pathway):
         return (pathway_sort_key(pathway), pathway)  # name tiebreak keeps off-canon pathways deterministically ordered
@@ -11622,7 +12633,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Operating layer workflow CLI")
     parser.add_argument("subcommand", choices=[
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
-        "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily", "approval-issue",
+        "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily", "approval-issue", "approval-invalidate",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
         "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate", "all"
     ])
@@ -11672,6 +12683,8 @@ def build_parser():
     parser.add_argument("--na", action="store_true", help="work-cover: mark the pathway not-applicable (requires --reason).")
     parser.add_argument("--add", action="store_true", help="work-cover: append the pathway to the itinerary as newly required.")
     parser.add_argument("--release-receipt", help="approval-issue: exact release receipt JSON the single-use production approval binds to.")
+    parser.add_argument("--ticket-id", help="approval-invalidate: exact AT- ticket to revoke append-only.")
+    parser.add_argument("--consumer", help="approval-issue: exact root-bound consumer for a live release ticket.")
     return parser
 
 
@@ -11721,6 +12734,8 @@ def main(argv=None):
         result = run_work_cover(args, paths)
     elif args.subcommand == "approval-issue":
         result = run_approval_issue(args, paths)
+    elif args.subcommand == "approval-invalidate":
+        result = run_approval_invalidate(args, paths)
     elif args.subcommand == "work-daily":
         result = run_work_daily(args, paths)
     elif args.subcommand == "proof-add":
@@ -11750,6 +12765,10 @@ def main(argv=None):
     else:
         result = run_all(args, paths)
     print_result(result, args.json)
+    if args.subcommand in APPROVAL_MUTATION_SUBCOMMANDS:
+        records = result.get("records") if isinstance(result, dict) else None
+        if result.get("findings") or not isinstance(records, list) or not records:
+            return 2
     return 0
 
 

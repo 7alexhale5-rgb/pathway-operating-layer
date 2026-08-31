@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Block direct agent Bash calls to the approval-issue CLI command.
+"""Defense-in-depth warning for direct agent approval mutation commands.
 
-This is a PreToolUse forcing function, not a human identity boundary. Alex can
-still run the reviewed command in a normal Terminal outside an agent session.
+The OS-owned helper and authority ledger are the identity boundary. This hook
+reduces accidental attempts on shells that actually invoke it.
 """
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ from pathlib import Path
 
 
 DENIAL = (
-    "DENIED: approval-issue is reserved for Alex. "
-    "Review the exact command, then run it in a normal Terminal.\n"
+    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
+    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
 )
+
+RESTRICTED_SUBCOMMANDS = frozenset({"approval-issue", "approval-invalidate"})
 
 BASH_TOOL_NAMES = frozenset(
     {
@@ -82,6 +84,8 @@ VALUE_OPTIONS = frozenset(
         "--gate-target",
         "--tier",
         "--release-receipt",
+        "--ticket-id",
+        "--consumer",
     }
 )
 
@@ -93,7 +97,7 @@ SUSPICIOUS_FALLBACK_RE = re.compile(
     r"(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?"
     r"(?:command\s+)?"
     r"(?:(?:\S*/)?python(?:\d+(?:\.\d+)*)?(?:\s+-\S+)*\s+)?"
-    r"(?:\S*/)?operating-layer\.py\s+[^;\n]*\bapproval-issue\b",
+    r"(?:\S*/)?operating-layer\.py\s+[^;\n]*\bapproval-(?:issue|invalidate)\b",
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -108,10 +112,10 @@ def _normalize_quote_prefixes(command: str) -> str:
     return re.sub(r"\$(?=['\"])", "", continued)
 
 
-def _could_contain_issuance(command: str) -> bool:
+def _could_contain_restricted_subcommand(command: str) -> bool:
     """Cheap prefilter which cannot reject a literal shell-joined subcommand."""
     dequoted = command.casefold().translate(str.maketrans("", "", "'\"\\"))
-    return "approval-issue" in dequoted
+    return any(subcommand in dequoted for subcommand in RESTRICTED_SUBCOMMANDS)
 
 
 def _shell_tokens(command: str) -> list[str]:
@@ -406,7 +410,7 @@ def _segment_issues(tokens: list[str], depth: int) -> bool:
             ):
                 if depth >= MAX_NESTED_COMMANDS:
                     return True
-                return command_issues_approval(tokens[option_index + 1], depth + 1)
+                return command_changes_approval_authority(tokens[option_index + 1], depth + 1)
             if option == "--" or not option.startswith(("-", "+")):
                 return False
             option_index += 1
@@ -420,15 +424,15 @@ def _segment_issues(tokens: list[str], depth: int) -> bool:
 
     if _basename(tokens[script_index]) != "operating-layer.py":
         return False
-    return _operating_subcommand(tokens[script_index + 1 :]) == "approval-issue"
+    return _operating_subcommand(tokens[script_index + 1 :]) in RESTRICTED_SUBCOMMANDS
 
 
-def command_issues_approval(command: str, depth: int = 0) -> bool:
+def command_changes_approval_authority(command: str, depth: int = 0) -> bool:
     normalized = _normalize_quote_prefixes(command)
-    if not _could_contain_issuance(normalized):
+    if not _could_contain_restricted_subcommand(normalized):
         return False
     normalized = _strip_heredoc_bodies(normalized)
-    if not _could_contain_issuance(normalized):
+    if not _could_contain_restricted_subcommand(normalized):
         return False
     try:
         tokens = _shell_tokens(normalized)
@@ -450,7 +454,7 @@ def main() -> int:
             for key in ("command", "cmd")
             if isinstance(tool_input.get(key), str)
         ]
-        if not any(command_issues_approval(command) for command in commands):
+        if not any(command_changes_approval_authority(command) for command in commands):
             return 0
     except Exception:
         return 0

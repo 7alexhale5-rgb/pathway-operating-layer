@@ -25,10 +25,11 @@ CLI = (HERE / ".." / "operating-layer.py").resolve()
 REPO = HERE.parent.parent
 APPROVAL_GUARD = REPO / "hooks" / "approval-issue-guard.py"
 APPROVAL_GUARD_VERIFIER = REPO / "scripts" / "verify-approval-issue-guard.py"
+APPROVAL_HELPER_SOURCE = REPO / "security" / "pathway-approval"
 INSTALLER = REPO / "install.sh"
 APPROVAL_GUARD_DENIAL = (
-    "DENIED: approval-issue is reserved for Alex. "
-    "Review the exact command, then run it in a normal Terminal.\n"
+    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
+    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
 )
 _TEST_ROOT_PARENT = Path("/private/tmp").resolve()
 ROOT = _TEST_ROOT_PARENT / f"operating-layer-test-{uuid.uuid4().hex}"
@@ -61,6 +62,7 @@ def reset():
     if ROOT.exists():
         shutil.rmtree(ROOT)
     (ROOT / "claude").mkdir(parents=True)
+    ROOT.chmod(0o700)
     (ROOT / "codex").mkdir(parents=True)
     (ROOT / "projects").mkdir(parents=True)
     (ROOT / "out").mkdir(parents=True)
@@ -5941,9 +5943,10 @@ def test_artifact_filename_dates_use_local_day_not_utc():
 
 
 def test_approval_issue_guard_blocks_agent_shell_issuance():
-    """The PreToolUse guard blocks only executable approval issuance commands."""
+    """The PreToolUse guard blocks executable approval authority mutations."""
     waiver = "--kind production-secure-waiver --work-id W-test --pathway release"
     release = "--kind release-production-approval --work-id W-test --release-receipt r.json"
+    invalidation = "--ticket-id AT-000000000000 --reason compromised-ticket"
     deeply_nested = f"operating-layer.py approval-issue {waiver}"
     for _ in range(5):
         deeply_nested = f"bash -c {shlex.quote(deeply_nested)}"
@@ -6013,6 +6016,13 @@ def test_approval_issue_guard_blocks_agent_shell_issuance():
         ("locale quoted subcommand", f"operating-layer.py $\"approval-issue\" {waiver}"),
         ("approval issue help", "operating-layer.py approval-issue --help"),
         ("release ticket", f"operating-layer.py approval-issue {release}"),
+        ("approval invalidation", f"operating-layer.py approval-invalidate {invalidation}"),
+        ("legacy inline override", "APPROVAL_ISSUE_CHAT_OVERRIDE=1 "
+         f"operating-layer.py approval-issue {waiver}"),
+        ("legacy inline invalidation override", "APPROVAL_ISSUE_CHAT_OVERRIDE=1 "
+         f"operating-layer.py approval-invalidate {invalidation}"),
+        ("nested legacy override", "bash -c 'APPROVAL_ISSUE_CHAT_OVERRIDE=1 "
+         f"operating-layer.py approval-invalidate {invalidation}'"),
     ]
     for label, command in blocked:
         proc = run_approval_guard({"tool_name": "Bash", "tool_input": {"command": command}})
@@ -6053,7 +6063,9 @@ def test_approval_issue_guard_blocks_agent_shell_issuance():
     check(malformed.stderr == APPROVAL_GUARD_DENIAL,
           "approval guard malformed fallback gives the exact denial")
 
-    for variable in ("CLAUDE_HOOK_FORCE", "EXTERNAL_SEND_APPROVED"):
+    for variable in (
+        "APPROVAL_ISSUE_CHAT_OVERRIDE", "CLAUDE_HOOK_FORCE", "EXTERNAL_SEND_APPROVED",
+    ):
         proc = run_approval_guard(
             {"tool_name": "Bash", "tool_input": {"command": blocked[0][1]}},
             env={variable: "1"},
@@ -6248,7 +6260,7 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier reports all three settings files")
     check(summary.get("symlinks_checked") == 2,
           "approval guard verifier reports both installed links")
-    check(summary.get("blocked_fixtures") == 15 and summary.get("allowed_fixtures") == 12,
+    check(summary.get("blocked_fixtures") == 21 and summary.get("allowed_fixtures") == 12,
           "approval guard verifier runs fixtures through source and both installed links")
     check(isinstance(summary.get("p95_ms"), (int, float)) and summary.get("p95_ms") < 50,
           "approval guard verifier reports p95 below 50ms")
@@ -6326,6 +6338,244 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier failure paths leave fake ledger bytes unchanged")
 
 
+def test_approval_ledger_strict_reader_and_authority_refusal_exit_codes():
+    """Authority input is all-or-nothing and repo CLI mutation refusals fail at the shell."""
+    opl = load_cli("approval_strict_ledger")
+    reset()
+    proj = ROOT / "projects" / "strict-approval-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "strict approval ledger fixture",
+        "--tier", "production-secure",
+    ])
+    wid = started["work_id"]
+    reason = "strict authority fixture"
+    issued, issued_proc = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "observability", "--reason", reason,
+    ])
+    check(issued_proc.returncode == 0 and bool(issued.get("records")),
+          "an isolated valid approval issue exits zero")
+    covered, _ = run("work-cover", [
+        "--work-id", wid, "--pathway", "observability", "--na", "--reason", reason,
+    ])
+    waiver_entry = next(
+        entry for entry in covered["records"][0]["itinerary"]
+        if entry.get("pathway") == "observability"
+    )
+    ledger = ROOT / "out/operator-intelligence/approvals.ndjson"
+    valid_bytes = ledger.read_bytes()
+    valid_events = opl._strict_approval_events(ledger)
+    check(opl.approval_events_valid(valid_events),
+          "the strict reader accepts a complete ordered approval ledger")
+
+    # Root authority pre-consumes at issue time. The first engine attachment must still occur
+    # inside the exact 15-minute review window for both waiver and release consumers.
+    waiver_digest = issued["records"][0]["subject_digest"]
+    waiver_issue_event = next(
+        event for event in valid_events
+        if event.get("event") == "issued" and event.get("subject_digest") == waiver_digest
+    )
+    waiver_expiry = opl.parse_ts(waiver_issue_event["expires_at"])
+    waiver_consumer = f"work-cover:{wid}:observability"
+    timely_waiver, timely_refusal = opl.prebound_approval_for_consumer(
+        valid_events, waiver_digest, waiver_consumer,
+        now=waiver_expiry - opl.timedelta(seconds=1),
+    )
+    stale_waiver, stale_refusal = opl.prebound_approval_for_consumer(
+        valid_events, waiver_digest, waiver_consumer,
+        now=waiver_expiry + opl.timedelta(seconds=1),
+    )
+    check(timely_waiver is not None and not timely_refusal,
+          "a root-preconsumed waiver is attachable inside its review window")
+    check(stale_waiver is None and stale_refusal == "expired",
+          "a root-preconsumed waiver cannot be attached after its review window")
+
+    release_receipt = write(
+        "out/operator-artifacts/strict-root-preconsumed-release.json",
+        json.dumps({"strict_fixture": True}) + "\n",
+    )
+    release_issue, _ = run("approval-issue", [
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(release_receipt),
+        "--reason", "strict preconsumed release fixture",
+    ])
+    release_subject = opl.release_approval_subject(
+        wid, proj.name, opl.sha256_file(release_receipt)
+    )
+    release_consumer = "P-strict-root-preconsumed-release"
+    release_consumption, release_refusal = opl.consume_approval(
+        type("Paths", (), {"approvals_path": ledger})(),
+        release_subject,
+        release_consumer,
+    )
+    check(release_consumption is not None and not release_refusal,
+          "the isolated fixture creates an exact preconsumed release binding")
+    valid_bytes = ledger.read_bytes()
+    valid_events = opl._strict_approval_events(ledger)
+    release_digest = release_issue["records"][0]["subject_digest"]
+    release_issue_event = next(
+        event for event in valid_events
+        if event.get("event") == "issued" and event.get("subject_digest") == release_digest
+    )
+    release_expiry = opl.parse_ts(release_issue_event["expires_at"])
+    stale_release, stale_release_refusal = opl.prebound_approval_for_consumer(
+        valid_events, release_digest, release_consumer,
+        now=release_expiry + opl.timedelta(seconds=1),
+    )
+    check(stale_release is None and stale_release_refusal == "expired",
+          "a root-preconsumed release cannot be attached after its review window")
+
+    original_store_classifier = opl.approval_store_is_protected
+    original_event_loader = opl.approval_events_for
+    try:
+        opl.approval_store_is_protected = lambda _paths: True
+        opl.approval_events_for = lambda _paths: valid_events
+        protected_stale_waiver, protected_waiver_refusal = opl.consume_approval(
+            type("Paths", (), {"approvals_path": ledger})(),
+            waiver_issue_event["subject"],
+            waiver_consumer,
+            now=waiver_expiry + opl.timedelta(seconds=1),
+        )
+        protected_stale_release, protected_release_refusal = opl.consume_approval(
+            type("Paths", (), {"approvals_path": ledger})(),
+            release_subject,
+            release_consumer,
+            now=release_expiry + opl.timedelta(seconds=1),
+        )
+    finally:
+        opl.approval_store_is_protected = original_store_classifier
+        opl.approval_events_for = original_event_loader
+    check(protected_stale_waiver is None and protected_waiver_refusal == "expired",
+          "protected consume rejects a stale root-preconsumed waiver")
+    check(protected_stale_release is None and protected_release_refusal == "expired",
+          "protected consume rejects a stale root-preconsumed release")
+
+    lines = valid_bytes.splitlines(keepends=True)
+    malformed_cases = {
+        "malformed middle": lines[0] + b"{not-json}\n" + b"".join(lines[1:]),
+        "truncated tail": valid_bytes[:-1],
+        "reordered consumption": b"".join([lines[1], lines[0], *lines[2:]]),
+        "unknown event": valid_bytes.replace(b'"event": "consumed"', b'"event": "forged"', 1),
+    }
+    for label, payload in malformed_cases.items():
+        ledger.write_bytes(payload)
+        events = opl._strict_approval_events(ledger)
+        check(not opl.approval_events_valid(events) and len(events) == 0,
+              f"the strict reader rejects the whole ledger for {label}")
+        check(not opl.waiver_corroborated(waiver_entry, covered["records"][0], events),
+              f"{label} cannot retain waiver credit")
+
+    ledger.write_bytes(valid_bytes)
+    symlink = ROOT / "out/operator-intelligence/symlinked-approvals.ndjson"
+    symlink.symlink_to(ledger)
+    check(not opl.approval_events_valid(opl._strict_approval_events(symlink)),
+          "a symlinked approval ledger is rejected")
+    original_cap = opl.NDJSON_READ_MAX_BYTES
+    try:
+        opl.NDJSON_READ_MAX_BYTES = len(valid_bytes) - 1
+        check(not opl.approval_events_valid(opl._strict_approval_events(ledger)),
+              "an over-cap approval ledger is rejected instead of truncated")
+        check(not opl._approval_write_fits(valid_events),
+              "the projected-size guard refuses the write that would cross the read cap")
+    finally:
+        opl.NDJSON_READ_MAX_BYTES = original_cap
+
+    bad_ticket, bad_ticket_proc = run("approval-invalidate", [
+        "--ticket-id", "not-a-ticket", "--reason", "invalid id fixture",
+    ])
+    check(bad_ticket_proc.returncode == 2
+          and "approval-invalidate-invalid-ticket-id" in ids(bad_ticket),
+          "an invalidation validation refusal exits nonzero")
+    missing_reason, missing_reason_proc = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "docs",
+    ])
+    check(missing_reason_proc.returncode == 2
+          and "approval-issue-missing-reason" in ids(missing_reason),
+          "an issue validation refusal exits nonzero")
+
+    # A live-shaped lexical output path remains protected even when it symlinks to the suite's
+    # valid user ledger. The repo CLI renders the sudo helper command and changes no bytes.
+    live_link = ROOT / "live-output-link"
+    live_link.symlink_to(ROOT / "out", target_is_directory=True)
+    before = ledger.read_bytes()
+    protected, protected_proc = run("approval-invalidate", [
+        "--output-root", str(live_link),
+        "--ticket-id", issued["records"][0]["ticket_id"],
+        "--reason", "protected path fixture",
+    ])
+    check(protected_proc.returncode == 2
+          and "approval-invalidate-human-helper-required" in ids(protected)
+          and str(protected.get("authority_command", "")).startswith(
+              "/usr/bin/sudo -k; /usr/bin/sudo -- "
+          ),
+          "a symlinked live-shaped store still requires the root-owned helper")
+    check(ledger.read_bytes() == before,
+          "a protected helper-required refusal leaves the user ledger byte-identical")
+
+    protected_release, protected_release_proc = run("approval-issue", [
+        "--output-root", str(live_link),
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(release_receipt),
+        "--reason", "reviewed strict root command fixture",
+    ])
+    authority_command = str(protected_release.get("authority_command", ""))
+    authority_prefix = (
+        "/usr/bin/sudo -k; /usr/bin/sudo -- "
+        "/usr/local/libexec/pathway-approval "
+    )
+    helper_argv = shlex.split(authority_command[len(authority_prefix):])
+    subject_json = helper_argv[helper_argv.index("--subject-json") + 1]
+    rendered_subject = json.loads(subject_json)
+    import importlib.machinery
+    import importlib.util
+    helper_loader = importlib.machinery.SourceFileLoader(
+        "pathway_approval_command_parser", str(APPROVAL_HELPER_SOURCE)
+    )
+    helper_spec = importlib.util.spec_from_loader(helper_loader.name, helper_loader)
+    helper_module = importlib.util.module_from_spec(helper_spec)
+    helper_loader.exec_module(helper_module)
+    parsed_helper_args = helper_module._build_parser().parse_args(helper_argv)
+    check(protected_release_proc.returncode == 2
+          and authority_command.startswith(authority_prefix)
+          and rendered_subject.get("release_receipt_sha256")
+          == opl.sha256_file(release_receipt)
+          and "[REDACTED]" not in authority_command,
+          "the protected release command preserves the exact reviewed receipt digest")
+    check(parsed_helper_args.command == "issue"
+          and parsed_helper_args.subject_json == subject_json,
+          "the installed helper parser accepts the emitted shlex argument vector")
+
+    project_fragment = '"project":' + json.dumps(rendered_subject["project"])
+    duplicate_subject_json = subject_json.replace(
+        project_fragment,
+        '"project":"sk-proj-' + ("A" * 32) + '",' + project_fragment,
+        1,
+    )
+    check(duplicate_subject_json != subject_json,
+          "duplicate authority subject regression plants the adversarial key")
+    duplicate_argv = list(helper_argv)
+    duplicate_argv[duplicate_argv.index("--subject-json") + 1] = duplicate_subject_json
+    duplicate_command = authority_prefix + shlex.join(duplicate_argv)
+    duplicate_redacted = opl.redact_obj({"authority_command": duplicate_command})
+    check(not opl._is_safe_authority_command(duplicate_command)
+          and duplicate_redacted.get("authority_command") != duplicate_command
+          and "[REDACTED]" in duplicate_redacted.get("authority_command", ""),
+          "duplicate authority subject keys cannot bypass command redaction")
+
+    spoofed_reason, spoofed_reason_proc = run("approval-issue", [
+        "--output-root", str(live_link),
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(release_receipt),
+        "--reason", "reviewed \u202e visually reversed",
+    ])
+    check(spoofed_reason_proc.returncode == 2
+          and "approval-issue-reason-not-storable" in ids(spoofed_reason)
+          and not spoofed_reason.get("authority_command"),
+          "Unicode bidi controls are refused before an authority command is displayed")
+
+
 def test_approval_authority_single_use_waiver_and_release_credit():
     """The verifiable single-use waiver/approval authority (SPEC 2026-08-16): content-bound
     tickets, 15-minute expiry, single-use durable consumption, fail-closed refusals, and
@@ -6397,6 +6647,38 @@ def test_approval_authority_single_use_waiver_and_release_credit():
     check(len(consumed_events) == 1
           and consumed_events[0].get("consumed_by") == f"work-cover:{wid}:observability",
           "consumption appends one durable ledger event bound to the consuming work-cover")
+
+    context_events = opl.approval_events_for(
+        type("Paths", (), {"approvals_path": approvals_path})()
+    )
+    covered_item = covered["records"][0]
+    context_digest = opl.work_context_sha256(covered_item, "observability")
+    check(issued_event["subject"].get("schema_version") == 2
+          and issued_event["subject"].get("work_context_sha256") == context_digest
+          and opl.waiver_corroborated(obs_entry, covered_item, context_events),
+          "a waiver v2 subject binds the unchanged work context and survives its status update")
+    context_mutations = []
+    for label, field, value in (
+        ("work id", "work_id", "W-mutated-context"),
+        ("project name", "project_name", "mutated-project"),
+        ("resolved project path", "project", str(proj / "mutated-target")),
+        ("goal", "goal", "mutated production goal"),
+        ("tier", "tier", "live"),
+        ("outcome profile", "outcome_profile", {"id": "mutated-profile"}),
+        ("risk overlays", "risk_overlays", [{"id": "mutated-risk"}]),
+    ):
+        mutated_item = json.loads(json.dumps(covered_item))
+        mutated_item[field] = value
+        context_mutations.append((label, mutated_item))
+    obligation_mutation = json.loads(json.dumps(covered_item))
+    obligation_mutation["itinerary"] = [
+        entry for entry in obligation_mutation["itinerary"]
+        if entry.get("pathway") != "observability"
+    ]
+    context_mutations.append(("obligation identity", obligation_mutation))
+    for label, mutated_item in context_mutations:
+        check(not opl.waiver_corroborated(obs_entry, mutated_item, context_events),
+              f"mutating the waiver-bound {label} invalidates corroboration")
 
     # Criterion 5: the consumed ticket cannot be spent by any other consumer.
     class _ApprovalPaths:
@@ -6576,6 +6858,131 @@ def test_approval_authority_single_use_waiver_and_release_credit():
            for e in approved_status["summary"]["itinerary"]}["release"] == "proved",
           "release flips to proved through the approved, corroborated proof")
 
+    # Close the remaining fixture pathways with exact waiver tickets so the item is genuinely
+    # ready and closed before its release approval is invalidated. This exercises current views,
+    # not a hand-edited status label.
+    for pathway in approved_status["summary"]["itinerary_coverage"]["open"]:
+        if pathway == "release":
+            continue
+        reason = f"{pathway} is not applicable in the release invalidation fixture"
+        run("approval-issue", [
+            "--kind", "production-secure-waiver", "--work-id", wid,
+            "--pathway", pathway, "--reason", reason,
+        ])
+        run("work-cover", [
+            "--work-id", wid, "--pathway", pathway, "--na", "--reason", reason,
+        ])
+    closed, _ = run("work-close", ["--work-id", wid])
+    check(closed.get("closed") is True,
+          "the fully corroborated fixture closes before its release ticket is invalidated")
+
+    carry_forward_path = ROOT / "out/operator-intelligence/pathway-carry-forward.ndjson"
+    raw_carry_forwards = [
+        json.loads(line)
+        for line in carry_forward_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    historical_release = next(
+        row for row in reversed(raw_carry_forwards)
+        if row.get("work_id") == wid and row.get("pathway") == "release"
+    )
+    check(historical_release.get("credits_pathway") is True
+          and historical_release.get("pathway_outcome") == "proved",
+          "the historical release carry-forward records the originally credited decision")
+
+    release_ticket = approved_issue["records"][0]["ticket_id"]
+    invalidated, _ = run("approval-invalidate", [
+        "--ticket-id", release_ticket,
+        "--reason", "release approval was issued through an agent bypass",
+    ])
+    check(invalidated.get("status") == "invalidated",
+          "the exact consumed release ticket accepts an append-only invalidation")
+    reopened_status, _ = run("work-status", ["--work-id", wid])
+    reopened_states = {
+        entry["pathway"]: entry["status"]
+        for entry in reopened_status["summary"]["itinerary"]
+    }
+    check(reopened_states["release"] == "required"
+          and reopened_status["summary"]["closeout_readiness"] == "not_ready",
+          "status-time corroboration reopens release after exact-ticket invalidation")
+    persisted_closed = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted_closed.get("status") == "closed",
+          "the raw work ledger preserves the historical close event")
+    daily, _ = run("work-daily")
+    dashboard = read_json(daily["dashboard"])
+    current_item = next(
+        item for item in dashboard.get("active_work_items", [])
+        if item.get("work_id") == wid
+    )
+    check(current_item.get("persisted_status") == "closed"
+          and current_item.get("current_status_reason") == "approval_invalidated",
+          "the dashboard projects invalidated closed work back into the active current view")
+    view_paths = type("Paths", (), {
+        "approvals_path": approvals_path,
+        "proofs_path": proofs_path,
+        "carry_forward_path": carry_forward_path,
+    })()
+    corrected_carry = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(corrected_carry.get("credits_pathway") is False
+          and corrected_carry.get("pathway_outcome") == "approval_invalidated",
+          "the latest carry-forward view removes invalidated release credit")
+    later_docs = {
+        **historical_release,
+        "carry_forward_id": "CF-later-docs-after-release",
+        "pathway": "docs",
+        "proof_id": "P-later-docs",
+        "summary": "Documentation followed the historical release proof.",
+        "created_at": "2099-01-01T00:00:00Z",
+    }
+    raw_carry_forwards.append(later_docs)
+    carry_forward_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in raw_carry_forwards),
+        encoding="utf-8",
+    )
+    corrected_later_baton = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(corrected_later_baton.get("pathway") == "docs"
+          and corrected_later_baton.get("credits_pathway") is True
+          and corrected_later_baton.get("release_credit_current") is False
+          and corrected_later_baton.get("release_pathway_outcome")
+          == "approval_invalidated",
+          "a later non-release baton still carries the current release invalidation overlay")
+    raw_after_invalidation = next(
+        row for row in reversed([
+            json.loads(line)
+            for line in carry_forward_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ])
+        if row.get("work_id") == wid and row.get("pathway") == "release"
+    )
+    check(raw_after_invalidation.get("credits_pathway") is True
+          and raw_after_invalidation.get("pathway_outcome") == "proved",
+          "the raw carry-forward ledger preserves the historical proved record")
+
+    clean_issue, _ = run("approval-issue", [
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(receipt_path),
+        "--reason", "independent fixture reapproval",
+    ])
+    run("work-log", release_log_args)
+    restored_status, _ = run("work-status", ["--work-id", wid])
+    check(clean_issue["records"][0]["ticket_id"] != release_ticket
+          and restored_status["summary"]["closeout_readiness"] == "ready",
+          "a new exact ticket and new consumption restore readiness without reviving the old ticket")
+    restored_daily, _ = run("work-daily")
+    restored_dashboard = read_json(restored_daily["dashboard"])
+    check(wid not in {
+              item.get("work_id")
+              for item in restored_dashboard.get("active_work_items", [])
+          },
+          "a clean reapproval returns the still-closed item to the effective closed set")
+
     # Criterion 10 tail: deleting the consumption from the ledger kills the credit at status time.
     ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
               if line.strip()]
@@ -6588,6 +6995,414 @@ def test_approval_authority_single_use_waiver_and_release_credit():
     check({e["pathway"]: e["status"]
            for e in uncorroborated_status["summary"]["itinerary"]}["release"] == "required",
           "a release proof whose approval is missing from the ledger loses credit at status time")
+    check(uncorroborated_status["summary"]["work_item"].get("status") == "active"
+          and uncorroborated_status["summary"]["work_item"].get("current_status_reason")
+          == "approval_uncorroborated",
+          "work-status reopens a closed item whose claimed release consumption is missing")
+    uncorroborated_daily, _ = run("work-daily")
+    uncorroborated_dashboard = read_json(uncorroborated_daily["dashboard"])
+    check(any(
+              item.get("work_id") == wid
+              and item.get("current_status_reason") == "approval_uncorroborated"
+              for item in uncorroborated_dashboard.get("active_work_items", [])
+          ),
+          "the dashboard exposes closed work with an uncorroborated approval claim")
+    uncorroborated_route, uncorroborated_route_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(uncorroborated_route_proc.returncode == 0
+          and uncorroborated_route.get("work_id") == wid,
+          "pathway-next can continue closed work with an uncorroborated approval claim")
+    uncorroborated_portfolio, _ = run("portfolio-next")
+    uncorroborated_portfolio_row = next(
+        row for row in uncorroborated_portfolio.get("records", [])
+        if row.get("project") == proj.name
+    )
+    check(uncorroborated_portfolio_row.get("active_work") == 1,
+          "portfolio-next counts uncorroborated historically closed work as active")
+
+
+def test_production_secure_closed_view_rechecks_current_readiness():
+    """Deleting approval claims cannot hide a forged production-secure close."""
+    reset()
+    proj = ROOT / "projects" / "closed-view-root-authority-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "production authority current-view regression",
+        "--tier", "production-secure",
+    ])
+    wid = started["work_id"]
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+    items = [
+        json.loads(line)
+        for line in work_items_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    target = next(item for item in items if item.get("work_id") == wid)
+    target["status"] = "closed"
+    target["closed_at"] = "2026-08-31T00:00:00Z"
+    claimed = target["itinerary"][0]
+    claimed.update({
+        "status": "na",
+        "reason": "forged approval claim fixture",
+        "waiver_digest": "0" * 64,
+        "waiver_consumed_id": "AC-000000000000",
+    })
+    work_items_path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in items),
+        encoding="utf-8",
+    )
+    claimed_status, _ = run("work-status", ["--work-id", wid])
+    check(claimed_status["summary"]["work_item"].get("current_status_reason")
+          == "approval_uncorroborated",
+          "a forged approval claim cannot keep a production-secure item closed")
+
+    # Deleting the claim fields must not turn the historical closed label into authority.
+    for field in ("waiver_digest", "waiver_consumed_id"):
+        claimed.pop(field, None)
+    work_items_path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in items),
+        encoding="utf-8",
+    )
+    stripped_status, _ = run("work-status", ["--work-id", wid])
+    current_item = stripped_status["summary"]["work_item"]
+    check(current_item.get("status") == "active"
+          and current_item.get("persisted_status") == "closed"
+          and current_item.get("current_status_reason")
+          == "production_secure_not_ready",
+          "claim deletion still reopens a not-ready production-secure close")
+    daily, _ = run("work-daily")
+    dashboard = read_json(daily["dashboard"])
+    check(any(item.get("work_id") == wid
+              for item in dashboard.get("active_work_items", [])),
+          "the dashboard exposes a bare forged production-secure close")
+    routed, routed_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(routed_proc.returncode == 0 and routed.get("work_id") == wid,
+          "pathway-next continues a bare forged production-secure close")
+    portfolio, _ = run("portfolio-next")
+    portfolio_row = next(
+        row for row in portfolio.get("records", []) if row.get("project") == proj.name
+    )
+    check(portfolio_row.get("active_work") == 1,
+          "portfolio-next counts a bare forged production-secure close as active")
+    calibration, _ = run("tier-calibrate")
+    secure_tier = next(
+        tier for tier in calibration.get("tiers", [])
+        if tier.get("tier") == "production-secure"
+    )
+    check(secure_tier.get("closed_outcomes") == 0,
+          "tier calibration excludes a bare forged production-secure close")
+    persisted = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted.get("status") == "closed",
+          "current-view correction preserves the append-only historical close")
+
+
+def test_approval_invalidation_revokes_exact_ticket_credit():
+    """Invalidation is append-only, exact-ticket, and retroactive for waiver and release credit."""
+    opl = load_cli("approval_invalidation")
+    reset()
+    proj = ROOT / "projects" / "approval-invalidation-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "invalidate compromised approval tickets",
+        "--tier", "production-secure",
+    ])
+    wid = started["work_id"]
+    approvals_path = ROOT / "out/operator-intelligence/approvals.ndjson"
+
+    waiver_reason = "runtime proof was independently replaced"
+    waiver_issue, _ = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "observability", "--reason", waiver_reason,
+    ])
+    waiver_ticket = waiver_issue["records"][0]["ticket_id"]
+    covered, _ = run("work-cover", [
+        "--work-id", wid, "--pathway", "observability", "--na", "--reason", waiver_reason,
+    ])
+    waiver_entry = next(
+        entry for entry in covered["records"][0]["itinerary"]
+        if entry["pathway"] == "observability"
+    )
+    events = opl.approval_events_for(type("Paths", (), {"approvals_path": approvals_path})())
+    check(opl.waiver_corroborated(waiver_entry, covered["records"][0], events),
+          "the waiver credits before its exact ticket is invalidated")
+
+    # Make every other pathway independently ready, then close through the real gate. This makes
+    # the observability ticket causally load-bearing instead of force-closing unrelated debt.
+    waiver_status, _ = run("work-status", ["--work-id", wid])
+    for pathway in waiver_status["summary"]["itinerary_coverage"]["open"]:
+        if pathway == "observability":
+            continue
+        reason = f"{pathway} is independently waived in the exact-ticket fixture"
+        run("approval-issue", [
+            "--kind", "production-secure-waiver", "--work-id", wid,
+            "--pathway", pathway, "--reason", reason,
+        ])
+        run("work-cover", [
+            "--work-id", wid, "--pathway", pathway, "--na", "--reason", reason,
+        ])
+    run_evidence = write("out/operator-artifacts/waiver-invalidation-run.txt", "run exists\n")
+    run("work-log", [
+        "--work-id", wid, "--pathway", "govern", "--kind", "note",
+        "--evidence", str(run_evidence), "--result", "recorded",
+    ])
+    closed, _ = run("work-close", ["--work-id", wid])
+    check(closed.get("closed") is True,
+          "the waiver invalidation fixture closes through fully corroborated current state")
+
+    # Reproduce the compromised historical shape: the ticket helped close the item before the
+    # bypass was discovered. Invalidation must restore it to active current work without
+    # deleting the old approval events.
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+
+    invalidated, _ = run("approval-invalidate", [
+        "--ticket-id", waiver_ticket, "--reason", "ticket was issued through an agent bypass",
+    ])
+    check(invalidated.get("status") == "invalidated"
+          and invalidated["records"][0].get("event") == "invalidated"
+          and invalidated["records"][0].get("ticket_id") == waiver_ticket,
+          "approval-invalidate appends an event bound to the exact waiver ticket")
+    persisted_item = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted_item.get("status") == "closed",
+          "invalidation preserves the historical closed work record")
+    daily, _ = run("work-daily")
+    daily_dashboard = read_json(daily["dashboard"])
+    current_item = next(
+        item for item in daily_dashboard.get("active_work_items", [])
+        if item.get("work_id") == wid
+    )
+    check(current_item.get("status") == "active"
+          and current_item.get("persisted_status") == "closed"
+          and current_item.get("current_status_reason") == "approval_invalidated",
+          "the invalidated closed item returns to the current active-work dashboard view")
+    check(daily.get("summary", {}).get("active") == 1
+          and daily.get("summary", {}).get("closed") == 0,
+          "dashboard counts use invalidation-aware current status")
+    events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    check(not opl.waiver_corroborated(waiver_entry, persisted_item, events),
+          "an invalidated consumed waiver loses corroboration")
+    current_context_sha = opl.work_context_sha256(persisted_item, "observability")
+    blocked_consumption, refusal = opl.consume_approval(
+        type("Paths", (), {"approvals_path": approvals_path})(),
+        opl.waiver_subject(
+            wid, proj.name, "observability", waiver_reason, current_context_sha
+        ),
+        f"work-cover:{wid}:observability",
+    )
+    check(blocked_consumption is None and refusal == "invalidated",
+          "invalidation is checked before idempotent consumption reuse")
+    status, _ = run("work-status", ["--work-id", wid])
+    check({entry["pathway"]: entry["status"]
+           for entry in status["summary"]["itinerary"]}["observability"] == "required",
+          "status recomputation reopens an invalidated waiver")
+    check(status["summary"]["work_item"].get("status") == "active"
+          and status["summary"]["work_item"].get("current_status_reason")
+          == "approval_invalidated",
+          "work-status exposes the same invalidation-aware current status as the dashboard")
+    calibration, _ = run("tier-calibrate")
+    production_secure_tier = next(
+        tier for tier in calibration.get("tiers", [])
+        if tier.get("tier") == "production-secure"
+    )
+    check(production_secure_tier.get("closed_outcomes") == 0,
+          "tier calibration excludes a historically closed outcome reopened by invalidation")
+    routed, routed_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(routed_proc.returncode == 0 and routed.get("work_id") == wid,
+          "pathway-next can continue an invalidated historically closed work item")
+    portfolio, _ = run("portfolio-next")
+    portfolio_row = next(
+        row for row in portfolio.get("records", []) if row.get("project") == proj.name
+    )
+    check(portfolio_row.get("active_work") == 1,
+          "portfolio-next counts invalidated historically closed work as currently active")
+
+    repeated, _ = run("approval-invalidate", [
+        "--ticket-id", waiver_ticket, "--reason", "repeat correction is idempotent",
+    ])
+    events_after_repeat = [
+        json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    check(repeated.get("status") == "already_invalidated"
+          and len([event for event in events_after_repeat
+                   if event.get("event") == "invalidated"
+                   and event.get("ticket_id") == waiver_ticket]) == 1,
+          "repeating an invalidation is idempotent and does not append a duplicate")
+
+    reissued, _ = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "observability", "--reason", waiver_reason,
+    ])
+    check(reissued["records"][0]["ticket_id"] != waiver_ticket,
+          "a later deliberate issue receives a distinct ticket id")
+    still_open, _ = run("work-status", ["--work-id", wid])
+    check({entry["pathway"]: entry["status"]
+           for entry in still_open["summary"]["itinerary"]}["observability"] == "required",
+          "a clean reissue without a new consumption cannot launder the old consumption")
+    recovered, _ = run("work-cover", [
+        "--work-id", wid, "--pathway", "observability", "--na", "--reason", waiver_reason,
+    ])
+    recovered_entry = next(
+        entry for entry in recovered["records"][0]["itinerary"]
+        if entry["pathway"] == "observability"
+    )
+    check(recovered_entry.get("waiver_consumed_id") != waiver_entry.get("waiver_consumed_id"),
+          "the new ticket earns credit only after its own new consumption")
+    recovered_events = opl.approval_events_for(
+        type("Paths", (), {"approvals_path": approvals_path})()
+    )
+    recovered_consumption = next(
+        event for event in reversed(recovered_events)
+        if event.get("event") == "consumed"
+        and event.get("consumption_id") == recovered_entry.get("waiver_consumed_id")
+    )
+    check(recovered_consumption.get("ticket_id") == reissued["records"][0]["ticket_id"]
+          and opl.waiver_corroborated(
+              recovered_entry, recovered["records"][0], recovered_events
+          ),
+          "the replacement waiver corroborates only against its own ticket consumption")
+
+    # An invalidated ticket that was never consumed did not grant credit and cannot reopen work.
+    unused_reason = "docs is independently waived in the exact-ticket fixture"
+    unused_issue, _ = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "docs", "--reason", unused_reason,
+    ])
+    run("approval-invalidate", [
+        "--ticket-id", unused_issue["records"][0]["ticket_id"],
+        "--reason", "unused ticket correction fixture",
+    ])
+    unused_daily, _ = run("work-daily")
+    unused_dashboard = read_json(unused_daily["dashboard"])
+    check(wid not in {
+              item.get("work_id")
+              for item in unused_dashboard.get("active_work_items", [])
+          },
+          "invalidating an unconsumed ticket does not falsely reopen unrelated closed work")
+
+    # Authority corruption fails closed across every current-state surface while raw history
+    # remains untouched. Restore the bytes afterward so later exact-ticket checks stay isolated.
+    valid_ledger_bytes = approvals_path.read_bytes()
+    approvals_path.write_bytes(valid_ledger_bytes + b'{"event":"invalidated"')
+    invalid_status, _ = run("work-status", ["--work-id", wid])
+    check(invalid_status["summary"]["work_item"].get("status") == "active"
+          and invalid_status["summary"]["work_item"].get("current_status_reason")
+          == "approval_ledger_invalid",
+          "a truncated approval ledger reopens approval-dependent work-status fail closed")
+    invalid_daily, _ = run("work-daily")
+    invalid_dashboard = read_json(invalid_daily["dashboard"])
+    check(any(
+              item.get("work_id") == wid
+              and item.get("current_status_reason") == "approval_ledger_invalid"
+              for item in invalid_dashboard.get("active_work_items", [])
+          ),
+          "a truncated approval ledger reopens the dashboard current view")
+    invalid_route, invalid_route_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(invalid_route_proc.returncode == 0 and invalid_route.get("work_id") == wid,
+          "pathway-next can route approval-dependent work while authority is fail closed")
+    invalid_portfolio, _ = run("portfolio-next")
+    invalid_portfolio_row = next(
+        row for row in invalid_portfolio.get("records", []) if row.get("project") == proj.name
+    )
+    check(invalid_portfolio_row.get("active_work") == 1,
+          "portfolio-next exposes approval-dependent work while authority is fail closed")
+    approvals_path.write_bytes(valid_ledger_bytes)
+
+    receipt = write("out/operator-artifacts/invalidation-release.json", "{\"release\":true}\n")
+    receipt_sha = opl.sha256_file(receipt)
+    release_issue, _ = run("approval-issue", [
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(receipt), "--reason", "reviewed release correction fixture",
+    ])
+    release_ticket = release_issue["records"][0]["ticket_id"]
+    release_subject = opl.release_approval_subject(wid, proj.name, receipt_sha)
+    paths = type("Paths", (), {"approvals_path": approvals_path})()
+    consumption, refusal = opl.consume_approval(paths, release_subject, "P-invalidation-release")
+    check(consumption is not None and refusal == "",
+          "the release fixture consumes its exact ticket before invalidation")
+    release_proof = {
+        "work_id": wid,
+        "project": proj.name,
+        "proof_id": "P-invalidation-release",
+        "release_receipt_sha256": receipt_sha,
+        "release_approval_digest": release_issue["subject_digest"],
+        "release_approval_consumed_id": consumption["consumption_id"],
+    }
+    events = opl.approval_events_for(paths)
+    check(opl.release_approval_corroborated(release_proof, events),
+          "the release approval corroborates before invalidation")
+
+    proofs_path = ROOT / "out/operator-intelligence/proofs.ndjson"
+    carry_forward_path = ROOT / "out/operator-intelligence/pathway-carry-forward.ndjson"
+    proofs_path.write_text(json.dumps(release_proof, sort_keys=True) + "\n", encoding="utf-8")
+    carry_forward = {
+        "carry_forward_id": "CF-invalidation-release",
+        "work_id": wid,
+        "project": proj.name,
+        "pathway": "release",
+        "source_artifact": str(receipt),
+        "summary": "Release proof previously credited.",
+        "what_changed": ["Release was marked proved."],
+        "more_relevant": [],
+        "less_relevant": [],
+        "next_pathway_must_use": ["Use the release proof."],
+        "do_not_do_yet": [],
+        "open_decisions": [],
+        "active_risk_overlays": [],
+        "artifact_sha256": receipt_sha,
+        "proof_id": release_proof["proof_id"],
+        "credits_pathway": True,
+        "pathway_outcome": "proved",
+        "created_at": "2026-08-30T00:00:00Z",
+    }
+    carry_forward_path.write_text(
+        json.dumps(carry_forward, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    view_paths = type("Paths", (), {
+        "approvals_path": approvals_path,
+        "proofs_path": proofs_path,
+        "carry_forward_path": carry_forward_path,
+    })()
+    check(opl.latest_carry_forward_for_work(view_paths, wid).get("credits_pathway") is True,
+          "a currently corroborated release baton remains proved")
+    run("approval-invalidate", [
+        "--ticket-id", release_ticket, "--reason", "release ticket came from an agent bypass",
+    ])
+    check(not opl.release_approval_corroborated(release_proof, opl.approval_events_for(paths)),
+          "an invalidated consumed release ticket loses corroboration")
+    corrected = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(corrected.get("credits_pathway") is False
+          and corrected.get("pathway_outcome") == "approval_invalidated",
+          "the current carry-forward view cannot retain proved release credit after invalidation")
+
+    missing, _ = run("approval-invalidate", [
+        "--ticket-id", "AT-ffffffffffff", "--reason", "unknown ticket regression",
+    ])
+    check("approval-invalidate-ticket-not-found" in ids(missing),
+          "approval-invalidate refuses an unknown exact ticket")
 
 
 def test_release_provider_action_consumes_approval_without_release_credit():
@@ -7356,7 +8171,10 @@ def main():
         test_approval_issue_guard_allows_non_issuance_text_and_fail_open_inputs,
         test_approval_issue_guard_installer_uses_one_canonical_source,
         test_approval_issue_guard_repeatable_verifier,
+        test_approval_ledger_strict_reader_and_authority_refusal_exit_codes,
         test_approval_authority_single_use_waiver_and_release_credit,
+        test_production_secure_closed_view_rechecks_current_readiness,
+        test_approval_invalidation_revokes_exact_ticket_credit,
         test_release_provider_action_consumes_approval_without_release_credit,
         test_approval_authority_survives_review_findings,
         test_proof_add_flips_itinerary_coverage,

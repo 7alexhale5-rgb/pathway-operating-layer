@@ -94,25 +94,53 @@ canary record remains evidence of a hold and cannot be relabeled by passing
 
 ## Approval Authority (single-use waivers and production approvals)
 
-The approval authority mirrors the external-send approval script
-(`approve-send.py`): a ticket is content-bound by a SHA-256 over its canonical
-JSON subject, expires 15 minutes after issue, is consumable exactly once, and
-every issue and consumption appends to `operator-intelligence/approvals.ndjson`.
-It is a forcing function and an audit trail, not a cryptographic barrier —
-issuing is a separate, deliberate, recorded act bound to reviewed content, and
-the standing rule is that Alex issues every ticket
-(`approval-issue --kind release-production-approval | production-secure-waiver`).
+The approval authority is separated from every project checkout. On macOS, the
+fixed trust root is the root-owned, mode `0644` ledger at
+`/Library/Application Support/Pathway/approval-authority.ndjson`; the only
+writer is the root-owned executable at `/usr/local/libexec/pathway-approval`.
+Neither path is configurable through arguments or environment variables. The
+repository CLI cannot issue, consume, or invalidate live authority. It validates
+the requested subject and renders the exact helper command for Alex to review
+and run from a normal Terminal with fresh `sudo` authentication.
+
+The tracked installer is a one-time trust ceremony because it starts in a
+mutable checkout. Never execute that repository copy directly with `sudo`.
+Review the installer and helper digests, stage both with fixed Apple tools into
+`/private/var/root/pathway-approval-bootstrap`, verify the root-owned staged bytes, and
+run only the verified staged installer. Steady-state separation begins only
+after the helper, authority directory, ledger, and password-required sudoers
+rule are root-owned and the installed helper verifies the full path chain. Do
+not treat an installed copy as proof that a particular approval was
+human-authorized; each authority mutation still requires a fresh, explicit
+Terminal invocation.
+
+The one-time bootstrap preserves the digest-pinned user ledger only as audit
+history and invalidates every legacy issuance. No legacy ticket receives live
+root authority merely because its old bytes were imported. Any still-needed
+waiver or release must be issued afresh through the installed helper.
+
+A ticket is content-bound by a SHA-256 over its canonical JSON subject and has a
+15-minute validity window. The helper requires the final consumer before issue
+and atomically appends both the `issued` and exact `consumed` events. This keeps
+the reviewed command bound to one release proof ID or one
+`work-cover:<work_id>:<pathway>` consumer. The legacy user ledger at
+`operator-intelligence/approvals.ndjson` remains historical evidence only and
+cannot grant live credit. The OS ledger is the durable authority that every
+status, routing, carry-forward, and closeout decision re-verifies.
 
 Two subjects exist. A release production approval binds kind, work ID, project,
 stage, and the release receipt's exact SHA-256, so editing one byte of the
 approved receipt orphans the ticket. A production-secure waiver binds kind,
-work ID, project, pathway, and the exact reason text, so `work-cover --na` must
-repeat the reviewed reason byte for byte. Consumption is bound to one consumer
-(the release proof's `proof_id`, or `work-cover:<work_id>:<pathway>`);
-re-consumption by the same consumer is idempotent, any other consumer is
-refused. Consumed, expired, subject-mismatched, or missing tickets fail closed
-with the refusal named. Release proofs consume their ticket only after every
-other release gate has passed, so a failing verifier never burns a ticket.
+schema version, work ID, project name, canonical work-context SHA-256, pathway,
+and the exact reason text. The context digest covers the resolved project path,
+goal, tier, outcome profile, risk overlays, and itinerary obligation identities.
+Changing any of those fields or deleting the claim cannot reuse the reviewed
+waiver for a different outcome. Consumption is bound to one consumer (the
+release proof's `proof_id`, or
+`work-cover:<work_id>:<pathway>`). A mismatched subject, receipt, project,
+pathway, reason, consumer, or ticket fails closed with the refusal named. The
+engine accepts only the pre-bound root-authority consumption. It never creates a
+live consumption from agent-controlled process state.
 
 The proof row is never the trust root: status recomputation re-joins every
 claim against the approvals ledger. A release proof whose claimed approval
@@ -128,13 +156,23 @@ ledger lacks a non-stale proof that still passes the current verifier. A
 production-secure outcome closes only from current verified pathway proof or a
 ledger-corroborated waiver, not from an assertion or cached status label.
 
-### Agent Bash issuance guard
+An append-only `invalidated` event revokes exactly one ticket. Historical issue
+and consumption events stay intact so current-state projection can prove that
+the invalidation causally removed credit. Closed work reopens only when that
+consumed ticket was load-bearing; invalidating an unused ticket changes audit
+history but not work status. A malformed, truncated, over-cap, reordered,
+symlinked, or permission-invalid authority ledger fails closed across every
+current-state surface.
 
-When loaded, the PreToolUse hook blocks agents from issuing approval tickets
-through direct Bash commands. It checks both `tool_input.command` and
-`tool_input.cmd`. It blocks direct `operating-layer.py approval-issue` calls
-before the shell starts. There is no override flag or environment escape.
-Fresh-session proof remains pending until Alex trusts the new Codex hook.
+### Agent Bash defense in depth
+
+When loaded, the PreToolUse hook blocks agents from attempting approval
+mutations through direct Bash commands. It checks both `tool_input.command` and
+`tool_input.cmd`, blocks direct repository CLI forms before the shell starts,
+and has no override flag or environment escape. The hook is defense in depth,
+not the authority boundary. The root-owned helper, fixed ledger, required
+consumer, and fresh password authentication are the live boundary even if a
+hook is absent or bypassed.
 
 The same tracked hook covers three settings files:
 
@@ -142,14 +180,10 @@ The same tracked hook covers three settings files:
 - Codex: `~/.codex/hooks.json`
 - GLM and Kimi: `~/.claude/glm-routing/claude-config/settings.json`
 
-Alex reviews the full command before issue. Alex then runs it in a normal
-Terminal or iTerm window. That manual path does not use agent PreToolUse hooks.
-
-This is still a forcing function, not human identity proof. It blocks clear
-agent Bash forms, including common wrappers and nested shells. Encoded commands,
-renamed script copies, direct engine imports, later-built commands, and other
-process tools remain outside its mechanical scope. Every approval still relies
-on the content-bound ticket, short expiry, single use, and durable ledger.
+Alex reviews the full rendered command and runs it in a normal Terminal or
+iTerm window. That manual path does not use agent PreToolUse hooks. The helper
+records the invoking `SUDO_USER` and `SUDO_UID`; this is a local OS ceremony and
+audit trail, not remote cryptographic identity proof.
 
 Pathway hashes the Markdown evidence, structured receipt, and every referenced
 release artifact before running the verifier. It re-reads and hashes the same

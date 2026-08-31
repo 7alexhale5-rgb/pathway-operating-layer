@@ -1,0 +1,903 @@
+#!/usr/bin/python3 -I
+"""Root-owned Pathway approval authority.
+
+Production has no path override.  The executable and append-only authority
+ledger live outside every project checkout.  Tests use the private
+``_test_config`` constructor directly; no environment variable or command-line
+flag can redirect production authority.
+"""
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import secrets
+import stat
+import sys
+import unicodedata
+from pathlib import Path
+
+
+INSTALLED_PATH = Path("/usr/local/libexec/pathway-approval")
+AUTHORITY_DIR = Path("/Library/Application Support/Pathway")
+AUTHORITY_LEDGER = AUTHORITY_DIR / "approval-authority.ndjson"
+SECURITY_ANCHOR = Path("/")
+LEDGER_MAX_BYTES = 64_000_000
+INPUT_MAX_BYTES = 64_000_000
+SUBJECT_JSON_MAX_BYTES = 16_384
+APPROVAL_TTL_SECONDS = 900
+
+APPROVAL_KIND_RELEASE = "release-production-approval"
+APPROVAL_KIND_WAIVER = "production-secure-waiver"
+APPROVAL_KINDS = frozenset({APPROVAL_KIND_RELEASE, APPROVAL_KIND_WAIVER})
+PATHWAYS = frozenset({
+    "govern", "research", "data", "security", "design", "implementation",
+    "quality", "field", "observability", "techdebt", "release", "docs",
+})
+
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+TICKET_ID_RE = re.compile(r"^AT-[0-9a-f]{12}$")
+CONSUMPTION_ID_RE = re.compile(r"^AC-[0-9a-f]{12}$")
+INVALIDATION_ID_RE = re.compile(r"^AI-[0-9a-f]{12}$")
+WORK_ID_RE = re.compile(r"^W-[A-Za-z0-9._-]{1,240}$")
+SUDO_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+
+ISSUED_FIELDS = frozenset({
+    "event", "kind", "subject_digest", "ticket_id", "subject", "issued_at",
+    "expires_at", "reason", "work_id", "issued_by",
+})
+CONSUMED_FIELDS = frozenset({
+    "event", "kind", "subject_digest", "ticket_id", "at", "work_id",
+    "pathway", "consumed_by", "consumption_id",
+})
+INVALIDATED_FIELDS = frozenset({
+    "event", "kind", "subject_digest", "ticket_id", "at", "work_id",
+    "reason", "invalidated_by", "invalidation_id",
+})
+RELEASE_SUBJECT_FIELDS = frozenset({
+    "kind", "work_id", "project", "stage", "release_receipt_sha256",
+})
+WAIVER_SUBJECT_V1_FIELDS = frozenset({
+    "kind", "work_id", "project", "pathway", "reason",
+})
+WAIVER_SUBJECT_V2_FIELDS = frozenset({
+    "kind", "schema_version", "work_id", "project", "pathway", "reason",
+    "work_context_sha256",
+})
+
+
+class AuthorityError(Exception):
+    """A bounded, user-safe authority refusal."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = str(code)
+        self.message = str(message)
+
+
+class Identity:
+    def __init__(self, user, uid):
+        self.user = str(user)
+        self.uid = int(uid)
+
+    @property
+    def attribution(self):
+        return f"euid=0 sudo_user={self.user} sudo_uid={self.uid}"
+
+
+class RuntimeConfig:
+    def __init__(
+        self,
+        *,
+        installed_path,
+        authority_dir,
+        authority_ledger,
+        installed_anchor,
+        authority_anchor,
+        owner_uid,
+        authority_gid,
+        max_ledger_bytes=LEDGER_MAX_BYTES,
+        enforce_installed_location=True,
+    ):
+        self.installed_path = Path(installed_path)
+        self.authority_dir = Path(authority_dir)
+        self.authority_ledger = Path(authority_ledger)
+        self.installed_anchor = Path(installed_anchor)
+        self.authority_anchor = Path(authority_anchor)
+        self.owner_uid = int(owner_uid)
+        self.authority_gid = int(authority_gid)
+        self.max_ledger_bytes = int(max_ledger_bytes)
+        self.enforce_installed_location = bool(enforce_installed_location)
+
+
+PRODUCTION_CONFIG = RuntimeConfig(
+    installed_path=INSTALLED_PATH,
+    authority_dir=AUTHORITY_DIR,
+    authority_ledger=AUTHORITY_LEDGER,
+    installed_anchor=SECURITY_ANCHOR,
+    authority_anchor=SECURITY_ANCHOR,
+    owner_uid=0,
+    authority_gid=0,
+)
+
+
+def _test_config(root, *, max_ledger_bytes=LEDGER_MAX_BYTES):
+    """Build a temp-only config for tests; production main never calls this."""
+    base = Path(root)
+    installed = base / "usr" / "local" / "libexec" / "pathway-approval"
+    authority_dir = base / "Library" / "Application Support" / "Pathway"
+    return RuntimeConfig(
+        installed_path=installed,
+        authority_dir=authority_dir,
+        authority_ledger=authority_dir / "approval-authority.ndjson",
+        installed_anchor=base,
+        authority_anchor=base,
+        owner_uid=os.getuid(),
+        authority_gid=os.getgid(),
+        max_ledger_bytes=max_ledger_bytes,
+        enforce_installed_location=False,
+    )
+
+
+def _sha256_bytes(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_json(value):
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise AuthorityError("invalid-json-value", "JSON contains an unsupported value.") from exc
+
+
+def _record_bytes(record):
+    return (_canonical_json(record) + "\n").encode("utf-8")
+
+
+def _reject_constant(value):
+    raise AuthorityError("invalid-json-number", f"JSON constant {value!r} is not allowed.")
+
+
+def _object_without_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise AuthorityError("duplicate-json-key", "JSON object keys must be unique.")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(text):
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_object_without_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+    except AuthorityError:
+        raise
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AuthorityError("malformed-json", "Input is not strict JSON.") from exc
+
+
+def _clean_string(value, field, *, minimum=1, maximum=4096, allow_empty=False):
+    if not isinstance(value, str):
+        raise AuthorityError("invalid-field", f"{field} must be a string.")
+    try:
+        length = len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise AuthorityError("invalid-field", f"{field} is not valid UTF-8 text.") from exc
+    unsafe_bidi = {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"}
+    if any(
+        unicodedata.category(character).startswith("C")
+        or unicodedata.category(character) in {"Zl", "Zp"}
+        or unicodedata.bidirectional(character) in unsafe_bidi
+        for character in value
+    ):
+        raise AuthorityError("invalid-field", f"{field} contains unsafe Unicode control text.")
+    if not allow_empty and length < minimum:
+        raise AuthorityError("invalid-field", f"{field} must not be empty.")
+    if length > maximum:
+        raise AuthorityError("invalid-field", f"{field} is too long.")
+    return value
+
+
+def _parse_timestamp(value, field):
+    _clean_string(value, field, maximum=20)
+    try:
+        parsed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise AuthorityError("invalid-timestamp", f"{field} must be canonical UTC time.") from exc
+    return parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def _format_timestamp(value):
+    return value.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _validate_subject(subject, *, allow_legacy=False):
+    if not isinstance(subject, dict):
+        raise AuthorityError("invalid-subject", "The approval subject must be a JSON object.")
+    kind = subject.get("kind")
+    if kind == APPROVAL_KIND_RELEASE:
+        if frozenset(subject) != RELEASE_SUBJECT_FIELDS:
+            raise AuthorityError("invalid-subject-schema", "Release subject fields do not match the fixed schema.")
+        _clean_string(subject.get("work_id"), "subject.work_id", maximum=242)
+        if not WORK_ID_RE.fullmatch(subject["work_id"]):
+            raise AuthorityError("invalid-work-id", "subject.work_id is not a Pathway work ID.")
+        _clean_string(subject.get("project"), "subject.project", maximum=512)
+        if subject.get("stage") != "production":
+            raise AuthorityError("invalid-stage", "Release subject stage must be production.")
+        if not DIGEST_RE.fullmatch(str(subject.get("release_receipt_sha256") or "")):
+            raise AuthorityError("invalid-receipt-digest", "Release receipt digest must be 64 lowercase hex characters.")
+    elif kind == APPROVAL_KIND_WAIVER:
+        fields = frozenset(subject)
+        is_v2 = fields == WAIVER_SUBJECT_V2_FIELDS
+        is_legacy = allow_legacy and fields == WAIVER_SUBJECT_V1_FIELDS
+        if not (is_v2 or is_legacy):
+            raise AuthorityError("invalid-subject-schema", "Waiver subject fields do not match the fixed v2 schema.")
+        if is_v2:
+            if type(subject.get("schema_version")) is not int or subject["schema_version"] != 2:
+                raise AuthorityError("invalid-subject-version", "Waiver schema_version must be integer 2.")
+            if not DIGEST_RE.fullmatch(str(subject.get("work_context_sha256") or "")):
+                raise AuthorityError("invalid-work-context-digest", "Waiver work_context_sha256 must be 64 lowercase hex characters.")
+        _clean_string(subject.get("work_id"), "subject.work_id", maximum=242)
+        if not WORK_ID_RE.fullmatch(subject["work_id"]):
+            raise AuthorityError("invalid-work-id", "subject.work_id is not a Pathway work ID.")
+        _clean_string(subject.get("project"), "subject.project", maximum=512)
+        if subject.get("pathway") not in PATHWAYS:
+            raise AuthorityError("invalid-pathway", "Waiver subject pathway is not canonical.")
+        _clean_string(subject.get("reason"), "subject.reason", maximum=4096)
+    else:
+        raise AuthorityError("invalid-kind", "Approval kind is not supported.")
+    return subject
+
+
+def _subject_digest(subject, *, allow_legacy=False):
+    _validate_subject(subject, allow_legacy=allow_legacy)
+    return _sha256_bytes(_canonical_json(subject).encode("utf-8"))
+
+
+def _validate_issued(event):
+    if frozenset(event) != ISSUED_FIELDS:
+        raise AuthorityError("invalid-event-schema", "Issued event fields do not match the fixed schema.")
+    if event.get("event") != "issued" or event.get("kind") not in APPROVAL_KINDS:
+        raise AuthorityError("invalid-issued-event", "Issued event kind is invalid.")
+    if not TICKET_ID_RE.fullmatch(str(event.get("ticket_id") or "")):
+        raise AuthorityError("invalid-ticket-id", "Issued ticket ID is invalid.")
+    subject = _validate_subject(event.get("subject"), allow_legacy=True)
+    digest = _subject_digest(subject, allow_legacy=True)
+    if event.get("subject_digest") != digest:
+        raise AuthorityError("subject-digest-mismatch", "Issued subject digest does not match its content.")
+    if event.get("kind") != subject.get("kind") or event.get("work_id") != subject.get("work_id"):
+        raise AuthorityError("ticket-binding-mismatch", "Issued event does not match its subject.")
+    _clean_string(event.get("reason"), "reason", maximum=4096)
+    if event["kind"] == APPROVAL_KIND_WAIVER and event["reason"] != subject["reason"]:
+        raise AuthorityError("ticket-binding-mismatch", "Waiver reason does not match its subject.")
+    _clean_string(event.get("issued_by"), "issued_by", maximum=1024)
+    issued_at = _parse_timestamp(event.get("issued_at"), "issued_at")
+    expires_at = _parse_timestamp(event.get("expires_at"), "expires_at")
+    if int((expires_at - issued_at).total_seconds()) != APPROVAL_TTL_SECONDS:
+        raise AuthorityError("invalid-ticket-window", "Issued ticket lifetime must be exactly 15 minutes.")
+    return issued_at, expires_at
+
+
+def _validate_consumed(event, issued):
+    if frozenset(event) != CONSUMED_FIELDS:
+        raise AuthorityError("invalid-event-schema", "Consumed event fields do not match the fixed schema.")
+    if event.get("event") != "consumed" or event.get("kind") not in APPROVAL_KINDS:
+        raise AuthorityError("invalid-consumed-event", "Consumed event kind is invalid.")
+    if not CONSUMPTION_ID_RE.fullmatch(str(event.get("consumption_id") or "")):
+        raise AuthorityError("invalid-consumption-id", "Consumption ID is invalid.")
+    _clean_string(event.get("consumed_by"), "consumed_by", maximum=1024)
+    _clean_string(event.get("pathway"), "pathway", maximum=64, allow_empty=True, minimum=0)
+    for field in ("kind", "subject_digest", "ticket_id", "work_id"):
+        if event.get(field) != issued.get(field):
+            raise AuthorityError("ticket-binding-mismatch", "Consumed event does not match its issued ticket.")
+    expected_pathway = issued["subject"].get("pathway", "")
+    if event.get("pathway") != expected_pathway:
+        raise AuthorityError("ticket-binding-mismatch", "Consumed pathway does not match its issued subject.")
+    consumed_at = _parse_timestamp(event.get("at"), "consumed.at")
+    issued_at = _parse_timestamp(issued.get("issued_at"), "issued_at")
+    expires_at = _parse_timestamp(issued.get("expires_at"), "expires_at")
+    if not issued_at <= consumed_at <= expires_at:
+        raise AuthorityError("invalid-consumption-time", "Consumption falls outside the ticket window.")
+
+
+def _validate_invalidated(event, issued):
+    if frozenset(event) != INVALIDATED_FIELDS:
+        raise AuthorityError("invalid-event-schema", "Invalidated event fields do not match the fixed schema.")
+    if event.get("event") != "invalidated" or event.get("kind") not in APPROVAL_KINDS:
+        raise AuthorityError("invalid-invalidated-event", "Invalidated event kind is invalid.")
+    if not INVALIDATION_ID_RE.fullmatch(str(event.get("invalidation_id") or "")):
+        raise AuthorityError("invalid-invalidation-id", "Invalidation ID is invalid.")
+    _clean_string(event.get("reason"), "invalidation.reason", maximum=4096)
+    _clean_string(event.get("invalidated_by"), "invalidated_by", maximum=1024)
+    for field in ("kind", "subject_digest", "ticket_id", "work_id"):
+        if event.get(field) != issued.get(field):
+            raise AuthorityError("ticket-binding-mismatch", "Invalidation does not match its issued ticket.")
+    invalidated_at = _parse_timestamp(event.get("at"), "invalidated.at")
+    issued_at = _parse_timestamp(issued.get("issued_at"), "issued_at")
+    if invalidated_at < issued_at:
+        raise AuthorityError("invalid-invalidation-time", "Invalidation predates issuance.")
+
+
+def _parse_ledger_bytes(raw):
+    if raw and not raw.endswith(b"\n"):
+        raise AuthorityError("truncated-ledger", "Ledger does not end with a complete NDJSON record.")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise AuthorityError("invalid-ledger-utf8", "Ledger is not valid UTF-8.") from exc
+    records = []
+    issued_by_ticket = {}
+    consumed_tickets = set()
+    invalidated_tickets = set()
+    consumption_ids = set()
+    invalidation_ids = set()
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line:
+            raise AuthorityError("blank-ledger-line", f"Ledger line {line_number} is blank.")
+        try:
+            event = _strict_json_loads(line)
+        except AuthorityError as exc:
+            raise AuthorityError(exc.code, f"Ledger line {line_number} is invalid: {exc.message}") from exc
+        if not isinstance(event, dict):
+            raise AuthorityError("invalid-event", f"Ledger line {line_number} is not an object.")
+        event_kind = event.get("event")
+        ticket_id = event.get("ticket_id")
+        if event_kind == "issued":
+            _validate_issued(event)
+            if ticket_id in issued_by_ticket:
+                raise AuthorityError("duplicate-ticket", f"Ledger line {line_number} repeats a ticket ID.")
+            issued_by_ticket[ticket_id] = event
+        elif event_kind in {"consumed", "invalidated"}:
+            issued = issued_by_ticket.get(ticket_id)
+            if issued is None:
+                raise AuthorityError("event-before-issue", f"Ledger line {line_number} precedes its issue event.")
+            if event_kind == "consumed":
+                _validate_consumed(event, issued)
+                consumption_id = event.get("consumption_id")
+                if ticket_id in consumed_tickets or consumption_id in consumption_ids:
+                    raise AuthorityError("duplicate-consumption", f"Ledger line {line_number} repeats a consumption.")
+                if ticket_id in invalidated_tickets:
+                    raise AuthorityError("consumed-after-invalidation", f"Ledger line {line_number} consumes an invalidated ticket.")
+                consumed_tickets.add(ticket_id)
+                consumption_ids.add(consumption_id)
+            else:
+                _validate_invalidated(event, issued)
+                invalidation_id = event.get("invalidation_id")
+                if ticket_id in invalidated_tickets or invalidation_id in invalidation_ids:
+                    raise AuthorityError("duplicate-invalidation", f"Ledger line {line_number} repeats an invalidation.")
+                invalidated_tickets.add(ticket_id)
+                invalidation_ids.add(invalidation_id)
+        else:
+            raise AuthorityError("unknown-event", f"Ledger line {line_number} has an unsupported event.")
+        records.append(event)
+    return records
+
+
+def _validated_identity(euid=None, environment=None):
+    actual_euid = os.geteuid() if euid is None else int(euid)
+    env = os.environ if environment is None else environment
+    if actual_euid != 0:
+        raise AuthorityError("root-required", "Run the installed authority through sudo.")
+    sudo_user = str(env.get("SUDO_USER") or "")
+    sudo_uid_raw = str(env.get("SUDO_UID") or "")
+    if not SUDO_USER_RE.fullmatch(sudo_user) or not sudo_uid_raw.isdigit():
+        raise AuthorityError("sudo-caller-required", "A real sudo caller is required.")
+    sudo_uid = int(sudo_uid_raw)
+    if sudo_uid <= 0:
+        raise AuthorityError("sudo-caller-required", "The sudo caller must be a non-root user.")
+    try:
+        account = pwd.getpwuid(sudo_uid)
+    except KeyError as exc:
+        raise AuthorityError("sudo-caller-invalid", "The sudo caller UID is not a local account.") from exc
+    if account.pw_name != sudo_user:
+        raise AuthorityError("sudo-caller-invalid", "SUDO_USER and SUDO_UID do not identify the same account.")
+    return Identity(sudo_user, sudo_uid)
+
+
+def _relative_parts(path, anchor):
+    if not path.is_absolute() or not anchor.is_absolute():
+        raise AuthorityError("unsafe-path", "Authority paths must be absolute.")
+    if ".." in path.parts or ".." in anchor.parts:
+        raise AuthorityError("unsafe-path", "Authority paths cannot contain traversal.")
+    try:
+        return path.relative_to(anchor).parts
+    except ValueError as exc:
+        raise AuthorityError("unsafe-path", "Authority path escapes its fixed security anchor.") from exc
+
+
+def _require_secure_node(path, *, owner_uid, directory):
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise AuthorityError("security-node-missing", "A required authority path is missing.") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise AuthorityError("symlink-refused", "Authority paths cannot be symlinks.")
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(metadata.st_mode):
+        raise AuthorityError("wrong-file-type", "Authority path has the wrong file type.")
+    if metadata.st_uid != owner_uid:
+        raise AuthorityError("unsafe-owner", "Authority paths must be owned by the authority account.")
+    if metadata.st_mode & 0o022:
+        raise AuthorityError("user-writable-authority", "Authority paths cannot be group or other writable.")
+    if not directory and metadata.st_nlink != 1:
+        raise AuthorityError("hardlink-refused", "Authority files must have exactly one hard link.")
+    return metadata
+
+
+def _require_secure_chain(path, anchor, *, owner_uid, final_directory):
+    parts = _relative_parts(path, anchor)
+    current = anchor
+    _require_secure_node(current, owner_uid=owner_uid, directory=True)
+    for index, part in enumerate(parts):
+        current = current / part
+        is_last = index == len(parts) - 1
+        _require_secure_node(
+            current,
+            owner_uid=owner_uid,
+            directory=(not is_last or final_directory),
+        )
+
+
+def _validate_runtime(config, *, allow_missing_ledger=False):
+    if config.enforce_installed_location:
+        invoked = Path(os.path.abspath(__file__))
+        if invoked != INSTALLED_PATH or config.installed_path != INSTALLED_PATH:
+            raise AuthorityError("installed-path-required", "Run the fixed installed authority executable.")
+        if config.authority_ledger != AUTHORITY_LEDGER:
+            raise AuthorityError("fixed-ledger-required", "The authority ledger path is fixed.")
+    _require_secure_chain(
+        config.installed_path,
+        config.installed_anchor,
+        owner_uid=config.owner_uid,
+        final_directory=False,
+    )
+    _require_secure_chain(
+        config.authority_dir,
+        config.authority_anchor,
+        owner_uid=config.owner_uid,
+        final_directory=True,
+    )
+    if config.authority_ledger.exists() or config.authority_ledger.is_symlink():
+        ledger_metadata = _require_secure_node(
+            config.authority_ledger, owner_uid=config.owner_uid, directory=False,
+        )
+        if (ledger_metadata.st_gid != config.authority_gid
+                or stat.S_IMODE(ledger_metadata.st_mode) != 0o644):
+            raise AuthorityError(
+                "unsafe-ledger-permissions",
+                "Authority ledger must be authority-owned, group-bound, and mode 0644.",
+            )
+    elif not allow_missing_ledger:
+        raise AuthorityError("authority-ledger-missing", "The authority ledger has not been bootstrapped.")
+
+
+def _read_descriptor(descriptor, size_limit):
+    metadata_before = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata_before.st_mode):
+        raise AuthorityError("wrong-file-type", "Ledger reference is not a regular file.")
+    if metadata_before.st_nlink != 1:
+        raise AuthorityError("hardlink-refused", "Ledger references must have exactly one hard link.")
+    if metadata_before.st_size > size_limit:
+        raise AuthorityError("ledger-over-cap", "Ledger exceeds its fixed read cap.")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    remaining = metadata_before.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(1_048_576, remaining))
+        if not chunk:
+            raise AuthorityError("short-read", "Ledger changed during its exact read.")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    metadata_after = os.fstat(descriptor)
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if any(getattr(metadata_before, field) != getattr(metadata_after, field) for field in stable_fields):
+        raise AuthorityError("ledger-changed", "Ledger changed during its exact read.")
+    return raw
+
+
+def _open_authority(config, *, create=False):
+    flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if create:
+        flags |= os.O_CREAT | os.O_EXCL
+    created = False
+    try:
+        descriptor = os.open(config.authority_ledger, flags, 0o644)
+        created = create
+    except FileExistsError:
+        descriptor = os.open(
+            config.authority_ledger,
+            os.O_RDWR | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise AuthorityError("authority-ledger-open-failed", "Authority ledger could not be opened safely.") from exc
+    try:
+        if created:
+            os.fchmod(descriptor, 0o644)
+            os.fchown(descriptor, config.owner_uid, config.authority_gid)
+            os.fsync(descriptor)
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            directory_descriptor = os.open(config.authority_dir, directory_flags)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise AuthorityError("unsafe-authority-ledger", "Authority ledger must be one regular file.")
+        if (metadata.st_uid != config.owner_uid
+                or metadata.st_gid != config.authority_gid
+                or stat.S_IMODE(metadata.st_mode) != 0o644):
+            raise AuthorityError(
+                "user-writable-authority",
+                "Authority ledger must be authority-owned, group-bound, and mode 0644.",
+            )
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _authority_transaction(config, operation, *, create=False):
+    descriptor = _open_authority(config, create=create)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        raw = _read_descriptor(descriptor, config.max_ledger_bytes)
+        records = _parse_ledger_bytes(raw)
+        additions, result = operation(records, raw)
+        payload = b"".join(_record_bytes(record) for record in additions)
+        if len(raw) + len(payload) > config.max_ledger_bytes:
+            raise AuthorityError("projected-ledger-over-cap", "The requested append would exceed the ledger cap.")
+        if payload:
+            os.lseek(descriptor, 0, os.SEEK_END)
+            count = os.write(descriptor, payload)
+            if count != len(payload):
+                raise AuthorityError("append-failed", "Authority append did not complete in one write.")
+            os.fsync(descriptor)
+        result["ledger_sha256"] = _sha256_bytes(raw + payload)
+        result["ledger_bytes"] = len(raw) + len(payload)
+        return result
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _read_source_ledger(path, expected_sha256, identity):
+    if not DIGEST_RE.fullmatch(str(expected_sha256 or "")):
+        raise AuthorityError("invalid-expected-digest", "--expected-sha256 must be 64 lowercase hex characters.")
+    source = Path(path)
+    if not source.is_absolute() or ".." in source.parts:
+        raise AuthorityError("unsafe-source-path", "Bootstrap source must be one absolute path without traversal.")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise AuthorityError("source-open-failed", "Bootstrap source could not be opened safely.") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise AuthorityError("unsafe-source", "Bootstrap source must be one regular file.")
+        if metadata.st_uid != identity.uid:
+            raise AuthorityError("unsafe-source-owner", "Bootstrap source must belong to the sudo caller.")
+        if metadata.st_mode & 0o022:
+            raise AuthorityError("unsafe-source-permissions", "Bootstrap source cannot be group or other writable.")
+        raw = _read_descriptor(descriptor, INPUT_MAX_BYTES)
+    finally:
+        os.close(descriptor)
+    actual_sha256 = _sha256_bytes(raw)
+    if not secrets.compare_digest(actual_sha256, expected_sha256):
+        raise AuthorityError("source-digest-mismatch", "Bootstrap source does not match --expected-sha256.")
+    return _parse_ledger_bytes(raw), actual_sha256
+
+
+def _new_invalidation(issued, reason, identity, now=None):
+    at = _format_timestamp(now or _utc_now())
+    ticket_id = issued["ticket_id"]
+    return {
+        "event": "invalidated",
+        "kind": issued["kind"],
+        "subject_digest": issued["subject_digest"],
+        "ticket_id": ticket_id,
+        "at": at,
+        "work_id": issued["work_id"],
+        "reason": reason,
+        "invalidated_by": identity.attribution,
+        "invalidation_id": "AI-" + hashlib.sha256(
+            f"{ticket_id}|{at}|{reason}".encode("utf-8")
+        ).hexdigest()[:12],
+    }
+
+
+def _command_bootstrap(args, config, identity):
+    if args.invalidate_all_issued is not True:
+        raise AuthorityError(
+            "legacy-authority-refused",
+            "Bootstrap must invalidate every legacy issuance; audit history cannot become live authority.",
+        )
+    reason = _clean_string(args.reason, "reason", maximum=4096)
+    source_records, source_sha256 = _read_source_ledger(
+        args.source_ledger, args.expected_sha256, identity,
+    )
+    issued_by_ticket = {
+        event["ticket_id"]: event for event in source_records if event["event"] == "issued"
+    }
+    reject_tickets = list(issued_by_ticket)
+    if not reject_tickets:
+        raise AuthorityError("legacy-authority-empty", "Bootstrap source has no issuance history to preserve.")
+    source_invalidated = {
+        event["ticket_id"] for event in source_records if event["event"] == "invalidated"
+    }
+    transformed_base = []
+    for event in source_records:
+        transformed_base.append(event)
+    pending_invalidations = [
+        ticket_id for ticket_id in reject_tickets if ticket_id not in source_invalidated
+    ]
+    _parse_ledger_bytes(b"".join(_record_bytes(event) for event in transformed_base))
+
+    def operation(existing, raw):
+        if existing and existing[:len(transformed_base)] != transformed_base:
+            raise AuthorityError("bootstrap-ledger-conflict", "Existing authority ledger is not an exact bootstrap prefix.")
+        if existing and len(existing) < len(transformed_base):
+            raise AuthorityError("bootstrap-ledger-conflict", "Existing authority ledger is a partial bootstrap record.")
+        tail = existing[len(transformed_base):]
+        bootstrap_suffix = tail[:len(pending_invalidations)]
+        for index, event in enumerate(bootstrap_suffix):
+            ticket_id = pending_invalidations[index]
+            if (event.get("event") != "invalidated"
+                    or event.get("ticket_id") != ticket_id
+                    or event.get("reason") != reason):
+                raise AuthorityError("bootstrap-ledger-conflict", "Existing authority ledger is missing its exact bootstrap prefix.")
+            _validate_invalidated(event, issued_by_ticket[ticket_id])
+        if len(bootstrap_suffix) < len(pending_invalidations) and len(tail) > len(bootstrap_suffix):
+            raise AuthorityError("bootstrap-ledger-conflict", "Later authority events precede bootstrap completion.")
+        additions = [] if existing else list(transformed_base)
+        for ticket_id in pending_invalidations[len(bootstrap_suffix):]:
+            additions.append(_new_invalidation(issued_by_ticket[ticket_id], reason, identity))
+        combined = [*existing, *additions] if existing else additions
+        _parse_ledger_bytes(b"".join(_record_bytes(event) for event in combined))
+        if existing and not additions:
+            status = "already_bootstrapped"
+        elif existing:
+            status = "bootstrap_completed"
+        else:
+            status = "bootstrapped"
+        final_records = combined
+        return additions, {
+            "ok": True,
+            "command": "bootstrap",
+            "status": status,
+            "source_sha256": source_sha256,
+            "source_records": len(source_records),
+            "issued": sum(event["event"] == "issued" for event in final_records),
+            "consumed": sum(event["event"] == "consumed" for event in final_records),
+            "invalidated": sum(event["event"] == "invalidated" for event in final_records),
+            "invalidated_legacy_tickets": reject_tickets,
+        }
+
+    return _authority_transaction(config, operation, create=True)
+
+
+def _command_issue(args, config, identity):
+    raw_subject = str(args.subject_json or "")
+    if len(raw_subject.encode("utf-8", errors="strict")) > SUBJECT_JSON_MAX_BYTES:
+        raise AuthorityError("subject-json-over-cap", "--subject-json exceeds its fixed size cap.")
+    subject = _strict_json_loads(raw_subject)
+    _validate_subject(subject)
+    consumer = _clean_string(args.consumer, "consumer", maximum=1024)
+    reason = _clean_string(args.reason, "reason", maximum=4096)
+    if subject["kind"] == APPROVAL_KIND_WAIVER and reason != subject["reason"]:
+        raise AuthorityError("waiver-reason-mismatch", "Waiver --reason must exactly match subject.reason.")
+    digest = _subject_digest(subject)
+
+    def operation(existing, raw):
+        now = _utc_now()
+        issued_at = _format_timestamp(now)
+        expires_at = _format_timestamp(now + datetime.timedelta(seconds=APPROVAL_TTL_SECONDS))
+        existing_ticket_ids = {event["ticket_id"] for event in existing}
+        ticket_id = ""
+        for _ in range(16):
+            candidate = "AT-" + hashlib.sha256(
+                f"{digest}|{issued_at}|{secrets.token_hex(16)}".encode("utf-8")
+            ).hexdigest()[:12]
+            if candidate not in existing_ticket_ids:
+                ticket_id = candidate
+                break
+        if not ticket_id:
+            raise AuthorityError("ticket-id-collision", "Could not allocate a unique ticket ID.")
+        issue = {
+            "event": "issued",
+            "kind": subject["kind"],
+            "subject_digest": digest,
+            "ticket_id": ticket_id,
+            "subject": subject,
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+            "reason": reason,
+            "work_id": subject["work_id"],
+            "issued_by": identity.attribution,
+        }
+        consumed = {
+            "event": "consumed",
+            "kind": subject["kind"],
+            "subject_digest": digest,
+            "ticket_id": ticket_id,
+            "at": issued_at,
+            "work_id": subject["work_id"],
+            "pathway": subject.get("pathway", ""),
+            "consumed_by": consumer,
+            "consumption_id": "AC-" + hashlib.sha256(
+                f"{ticket_id}|{digest}|{consumer}".encode("utf-8")
+            ).hexdigest()[:12],
+        }
+        _validate_issued(issue)
+        _validate_consumed(consumed, issue)
+        return [issue, consumed], {
+            "ok": True,
+            "command": "issue",
+            "status": "issued_and_consumed",
+            "ticket_id": ticket_id,
+            "subject_digest": digest,
+            "consumption_id": consumed["consumption_id"],
+            "consumer": consumer,
+            "expires_at": expires_at,
+            "expires_in_seconds": APPROVAL_TTL_SECONDS,
+        }
+
+    return _authority_transaction(config, operation)
+
+
+def _command_invalidate(args, config, identity):
+    ticket_id = str(args.ticket_id or "")
+    if not TICKET_ID_RE.fullmatch(ticket_id):
+        raise AuthorityError("invalid-ticket-id", "--ticket-id must be an exact AT ticket ID.")
+    reason = _clean_string(args.reason, "reason", maximum=4096)
+
+    def operation(existing, raw):
+        issued = next(
+            (event for event in existing if event["event"] == "issued" and event["ticket_id"] == ticket_id),
+            None,
+        )
+        if issued is None:
+            raise AuthorityError("ticket-not-found", "No issued authority ticket has that ID.")
+        prior = next(
+            (event for event in existing if event["event"] == "invalidated" and event["ticket_id"] == ticket_id),
+            None,
+        )
+        if prior is not None:
+            return [], {
+                "ok": True,
+                "command": "invalidate",
+                "status": "already_invalidated",
+                "ticket_id": ticket_id,
+                "invalidation_id": prior["invalidation_id"],
+            }
+        event = _new_invalidation(issued, reason, identity)
+        _validate_invalidated(event, issued)
+        return [event], {
+            "ok": True,
+            "command": "invalidate",
+            "status": "invalidated",
+            "ticket_id": ticket_id,
+            "invalidation_id": event["invalidation_id"],
+        }
+
+    return _authority_transaction(config, operation)
+
+
+def _command_verify(args, config, identity):
+    ticket_filter = str(args.ticket_id or "")
+    digest_filter = str(args.subject_digest or "")
+    if ticket_filter and not TICKET_ID_RE.fullmatch(ticket_filter):
+        raise AuthorityError("invalid-ticket-id", "--ticket-id must be an exact AT ticket ID.")
+    if digest_filter and not DIGEST_RE.fullmatch(digest_filter):
+        raise AuthorityError("invalid-subject-digest", "--subject-digest must be 64 lowercase hex characters.")
+
+    def operation(existing, raw):
+        selected = [
+            event for event in existing
+            if (not ticket_filter or event["ticket_id"] == ticket_filter)
+            and (not digest_filter or event["subject_digest"] == digest_filter)
+        ]
+        if (ticket_filter or digest_filter) and not selected:
+            raise AuthorityError("authority-record-not-found", "No authority record matches the exact filter.")
+        issued = [event for event in selected if event["event"] == "issued"]
+        consumed = [event for event in selected if event["event"] == "consumed"]
+        invalidated = [event for event in selected if event["event"] == "invalidated"]
+        return [], {
+            "ok": True,
+            "command": "verify",
+            "status": "valid",
+            "records": len(selected),
+            "issued": len(issued),
+            "consumed": len(consumed),
+            "invalidated": len(invalidated),
+            "ticket_ids": sorted({event["ticket_id"] for event in issued}),
+            "consumption_ids": sorted(event["consumption_id"] for event in consumed),
+            "invalidation_ids": sorted(event["invalidation_id"] for event in invalidated),
+        }
+
+    return _authority_transaction(config, operation)
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise AuthorityError("invalid-command", message)
+
+
+def _build_parser():
+    parser = _Parser(description="OS-separated Pathway approval authority", allow_abbrev=False)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    bootstrap = commands.add_parser("bootstrap", allow_abbrev=False)
+    bootstrap.add_argument("--source-ledger", required=True)
+    bootstrap.add_argument("--expected-sha256", required=True)
+    bootstrap.add_argument("--invalidate-all-issued", action="store_true", required=True)
+    bootstrap.add_argument("--reason", required=True)
+
+    issue = commands.add_parser("issue", allow_abbrev=False)
+    issue.add_argument("--subject-json", required=True)
+    issue.add_argument("--consumer", required=True)
+    issue.add_argument("--reason", required=True)
+
+    invalidate = commands.add_parser("invalidate", allow_abbrev=False)
+    invalidate.add_argument("--ticket-id", required=True)
+    invalidate.add_argument("--reason", required=True)
+
+    verify = commands.add_parser("verify", allow_abbrev=False)
+    filters = verify.add_mutually_exclusive_group()
+    filters.add_argument("--ticket-id")
+    filters.add_argument("--subject-digest")
+    return parser
+
+
+def _dispatch(argv, config, identity):
+    command_argv = list(argv)
+    if any(argument.startswith("--ledger") or argument.startswith("--authority-dir") for argument in command_argv):
+        raise AuthorityError("path-override-refused", "Production authority paths cannot be overridden.")
+    args = _build_parser().parse_args(command_argv)
+    _validate_runtime(config, allow_missing_ledger=args.command == "bootstrap")
+    handlers = {
+        "bootstrap": _command_bootstrap,
+        "issue": _command_issue,
+        "invalidate": _command_invalidate,
+        "verify": _command_verify,
+    }
+    return handlers[args.command](args, config, identity)
+
+
+def _emit(payload, stream):
+    stream.write(_canonical_json(payload) + "\n")
+    stream.flush()
+
+
+def main(argv=None):
+    try:
+        identity = _validated_identity()
+        result = _dispatch(sys.argv[1:] if argv is None else argv, PRODUCTION_CONFIG, identity)
+    except AuthorityError as exc:
+        _emit({"ok": False, "error": exc.code, "message": exc.message}, sys.stderr)
+        return 2
+    _emit(result, sys.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
