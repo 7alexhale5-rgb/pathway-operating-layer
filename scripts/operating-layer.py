@@ -3910,6 +3910,27 @@ def release_approval_corroborated(proof, events):
     )
 
 
+def release_approval_failure_state(proof, events):
+    """Classify why one historical release claim is not currently corroborated."""
+    if not approval_events_valid(events):
+        return "approval_ledger_invalid"
+    if not isinstance(proof, dict):
+        return "release_proof_missing"
+    consumed = next(
+        (
+            event for event in events
+            if event.get("event") == "consumed"
+            and event.get("subject_digest") == proof.get("release_approval_digest")
+            and event.get("consumption_id") == proof.get("release_approval_consumed_id")
+            and event.get("consumed_by") == proof.get("proof_id")
+        ),
+        None,
+    )
+    if consumed and approval_ticket_invalidated(events, consumed.get("ticket_id", "")):
+        return "approval_invalidated"
+    return "approval_uncorroborated"
+
+
 def waiver_corroborated(entry, item, events):
     """A production-secure N/A row survives status recomputation only when its waiver claim maps
     back to an issued subject for this exact work/project/pathway/reason and to that row's own
@@ -4432,22 +4453,61 @@ def latest_carry_forward_for_work(paths, work_id):
         ),
         None,
     )
-    if release_proof is None:
-        return latest
+    release_state = release_approval_failure_state(release_proof, approval_events)
+    release_messages = {
+        "approval_ledger_invalid": (
+            "The approval authority ledger is unavailable or invalid; release proof is open again.",
+            "Current approval-ledger state cannot corroborate the historical release credit.",
+            "Restore the OS-owned approval authority ledger, then recheck release credit.",
+        ),
+        "approval_invalidated": (
+            "The release approval no longer corroborates; release proof is open again.",
+            "Current approval-ledger state invalidated the release credit.",
+            "Re-establish independent human approval before release credit.",
+        ),
+        "approval_uncorroborated": (
+            "The release claim does not match current approval authority; release proof is open again.",
+            "Current approval-ledger state does not corroborate the historical release claim.",
+            "Reconcile the exact issued ticket, consumption, and release proof binding.",
+        ),
+        "release_proof_missing": (
+            "The credited release baton has no referenced proof row; release proof is open again.",
+            "The current proof ledger cannot resolve the historical release baton.",
+            "Restore or replace the exact release proof before relying on release credit.",
+        ),
+    }
+    release_summary, release_change, release_next = release_messages[release_state]
+    release_what_changed = [release_change]
+    release_next_pathway_must_use = [release_next]
+    release_hold = ["Do not treat the historical release carry-forward as proved."]
     corrected = dict(latest)
     corrected.update({
         "release_credit_current": False,
-        "release_pathway_outcome": "approval_invalidated",
-        "invalidated_release_proof_id": release_proof.get("proof_id", ""),
-        "summary": "The release approval no longer corroborates; release proof is open again.",
-        "what_changed": ["Current approval-ledger state invalidated the release credit."],
-        "next_pathway_must_use": ["Re-establish independent human approval before release credit."],
-        "do_not_do_yet": ["Do not treat the historical release carry-forward as proved."],
-        "source": "operating-layer invalidation-aware carry-forward view",
+        "release_pathway_outcome": release_state,
+        "release_proof_id": (
+            release_proof.get("proof_id", "")
+            if release_proof is not None else latest_release.get("proof_id", "")
+        ),
+        "release_approval_state_reason": (
+            getattr(approval_events, "error", "") or release_state
+        ),
+        "release_approval_summary": release_summary,
+        "release_approval_what_changed": release_what_changed,
+        "release_approval_next_pathway_must_use": release_next_pathway_must_use,
+        "release_approval_do_not_do_yet": release_hold,
     })
+    if release_state == "approval_invalidated":
+        corrected["invalidated_release_proof_id"] = release_proof.get("proof_id", "")
     if latest.get("pathway") == "release":
-        corrected["credits_pathway"] = False
-        corrected["pathway_outcome"] = "approval_invalidated"
+        corrected.update({
+            "credits_pathway": False,
+            "pathway_outcome": release_state,
+            "summary": release_summary,
+            "what_changed": release_what_changed,
+            "next_pathway_must_use": release_next_pathway_must_use,
+            "do_not_do_yet": release_hold,
+            "source": "operating-layer invalidation-aware carry-forward view",
+        })
     return corrected
 
 

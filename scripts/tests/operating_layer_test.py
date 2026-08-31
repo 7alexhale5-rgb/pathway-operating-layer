@@ -6998,6 +6998,15 @@ def test_approval_authority_single_use_waiver_and_release_credit():
         "pathway": "docs",
         "proof_id": "P-later-docs",
         "summary": "Documentation followed the historical release proof.",
+        "source_artifact": "/tmp/later-docs.md",
+        "what_changed": ["The operator guide now names the current workflow."],
+        "more_relevant": ["Use the current operator guide."],
+        "less_relevant": ["Ignore the superseded draft."],
+        "next_pathway_must_use": ["Read the current operator guide first."],
+        "do_not_do_yet": ["Do not skip the docs review."],
+        "open_decisions": ["Choose the final navigation label."],
+        "active_risk_overlays": ["rollback", "docs-freshness"],
+        "source": "docs carry-forward fixture",
         "created_at": "2099-01-01T00:00:00Z",
     }
     raw_carry_forwards.append(later_docs)
@@ -7012,6 +7021,83 @@ def test_approval_authority_single_use_waiver_and_release_credit():
           and corrected_later_baton.get("release_pathway_outcome")
           == "approval_invalidated",
           "a later non-release baton still carries the current release invalidation overlay")
+    preserved_docs_fields = {
+        key: corrected_later_baton.get(key)
+        for key in (
+            "summary", "source_artifact", "what_changed", "more_relevant", "less_relevant",
+            "next_pathway_must_use", "do_not_do_yet", "open_decisions",
+            "active_risk_overlays", "source",
+        )
+    }
+    check(preserved_docs_fields == {key: later_docs[key] for key in preserved_docs_fields}
+          and corrected_later_baton.get("release_approval_summary")
+          == "The release approval no longer corroborates; release proof is open again."
+          and corrected_later_baton.get("invalidated_release_proof_id")
+          == historical_release.get("proof_id"),
+          "release invalidation overlays a later baton without clobbering its continuity fields")
+
+    invalidated_ledger_bytes = approvals_path.read_bytes()
+    proof_rows = [
+        json.loads(line) for line in proofs_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    release_proof_row = next(
+        row for row in proof_rows
+        if row.get("proof_id") == historical_release.get("proof_id")
+    )
+    original_consumption_id = release_proof_row["release_approval_consumed_id"]
+    release_proof_row["release_approval_consumed_id"] = "AC-ffffffffffff"
+    proofs_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in proof_rows),
+        encoding="utf-8",
+    )
+    uncorroborated_carry = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(uncorroborated_carry.get("release_pathway_outcome")
+          == "approval_uncorroborated"
+          and uncorroborated_carry.get("summary") == later_docs["summary"],
+          "a mismatched release claim is classified as uncorroborated without clobbering docs")
+    release_proof_row["release_approval_consumed_id"] = original_consumption_id
+    proofs_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in proof_rows),
+        encoding="utf-8",
+    )
+
+    approvals_path.write_bytes(invalidated_ledger_bytes + b'{"event":"invalidated"')
+    invalid_ledger_carry = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(invalid_ledger_carry.get("release_pathway_outcome")
+          == "approval_ledger_invalid"
+          and invalid_ledger_carry.get("release_approval_state_reason")
+          == "truncated-tail"
+          and invalid_ledger_carry.get("summary") == later_docs["summary"],
+          "an invalid authority ledger is classified separately and preserves the later baton")
+    approvals_path.write_bytes(invalidated_ledger_bytes)
+
+    proof_ledger_bytes = proofs_path.read_bytes()
+    carry_forward_bytes = carry_forward_path.read_bytes()
+    proofs_path.write_text(
+        "".join(
+            json.dumps(row, sort_keys=True) + "\n" for row in proof_rows
+            if row.get("proof_id") != historical_release.get("proof_id")
+        ),
+        encoding="utf-8",
+    )
+    missing_proof_docs = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(missing_proof_docs.get("release_pathway_outcome") == "release_proof_missing"
+          and missing_proof_docs.get("credits_pathway") is True
+          and missing_proof_docs.get("summary") == later_docs["summary"],
+          "a missing release proof overlays a later docs baton without clobbering it")
+    carry_forward_path.write_text(
+        json.dumps(historical_release, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    missing_proof_release = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(missing_proof_release.get("credits_pathway") is False
+          and missing_proof_release.get("pathway_outcome") == "release_proof_missing"
+          and missing_proof_release.get("release_proof_id")
+          == historical_release.get("proof_id"),
+          "a missing release proof removes credit from the latest release baton")
+    proofs_path.write_bytes(proof_ledger_bytes)
+    carry_forward_path.write_bytes(carry_forward_bytes)
+
     raw_after_invalidation = next(
         row for row in reversed([
             json.loads(line)
