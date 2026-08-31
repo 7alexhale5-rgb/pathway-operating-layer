@@ -16,7 +16,7 @@
   "verification": {
     "frozen_characterization": "5/5",
     "constant_fidelity": "24/24",
-    "canonical_suite": "1295/1295"
+    "canonical_suite": "1313/1313"
   },
   "what_changed": [
     "Tradebot observability constants now have a versioned contract file behind the Phase 1 loader and schema gate."
@@ -51,7 +51,7 @@
     {
       "command": "python3 scripts/tests/operating_layer_test.py",
       "result": "PASS",
-      "observed": "1295/1295 checks passed"
+      "observed": "1313/1313 checks passed"
     }
   ],
   "artifact_sha256": {

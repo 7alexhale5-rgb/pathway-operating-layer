@@ -19,15 +19,17 @@ Done against the shared work ID:
   `9ecedb6` engine constants; the loader and fail-closed schema gate are wired
   into the canonical suite; trust state is derived from the extracted verifier
   digest; G1 is complete locally with 5/5 frozen scenarios, 24/24 fidelity
-  matches, and 1306/1306 canonical checks. The durable receipt and executable
+  matches, and 1313/1313 canonical checks. The durable receipt and executable
   verifier live under `quality/receipt-phase1-g1.json` and
-  `quality/verify_phase1_g1.py`.
-- data proof `P-b9e7466dbdcd` / run
-  `R-W-20260830-pathway-operating-layer-per-project-observabilit-e65d28-data-004`
-  is registered with `template_check.valid=true`, a complete JSON carry-forward
-  baton, and `canary_mutant_failed=true` against the exact G1 receipt. The two
-  earlier slow full-G1 registrations remain audit history and did not run a
-  canary because the verifier exceeded the 30-second canary ceiling.
+  `quality/verify_phase1_fidelity.py`.
+- data proof `P-dc83fe5ed5ea` / run
+  `R-W-20260830-pathway-operating-layer-per-project-observabilit-e65d28-data-006`
+  is the current registered proof. It binds the corrected 1313/1313 receipt to
+  the final strict verifier with `template_check.valid=true`, a complete JSON
+  carry-forward baton, and `canary_mutant_failed=true`. Proofs
+  `P-b9e7466dbdcd` / data-004 and `P-99265a126957` / data-005 remain audit
+  history; data-005 predates the final canonical-count correction and does not
+  supersede data-006.
 
 Next: Phase 2 (resolve by project, G2), Phase 3 (agents contract, G3 =
 observability proof), and Phase 4 (docs). The extracted Phase 1 contract and the
