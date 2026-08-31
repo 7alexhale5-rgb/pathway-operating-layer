@@ -15,6 +15,10 @@ BASE_REF = "9ecedb6"
 BASE_COMMIT = "9ecedb620169fdcd5919e5cd7f3fd26d9ac67387"
 ENGINE_PATH = "scripts/operating-layer.py"
 CONTRACT_PATH = REPO / "contracts" / "observability" / "rainman-thorp.json"
+EXPECTED_RECEIPT_SUMMARY = (
+    "Phase 1 mechanically extracted the Rainman/Thorp observability contract and preserved "
+    "the Phase 2 containment boundary."
+)
 METADATA = {
     "schema_version": 1,
     "contract_type": "observability_evidence_contract",
@@ -86,7 +90,43 @@ def base_constants(source: bytes):
     return found
 
 
+def validate_g1_receipt(path: Path, contract_sha256: str) -> list[str]:
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return [f"G1 receipt is unreadable: {exc}"]
+    errors = []
+    expected = {
+        "work_id": "W-20260830-pathway-operating-layer-per-project-observabilit-e65d28",
+        "phase": 1,
+        "gate": "G1",
+        "result": "PASS",
+        "base_commit": BASE_COMMIT,
+        "summary": EXPECTED_RECEIPT_SUMMARY,
+    }
+    for key, value in expected.items():
+        if receipt.get(key) != value or type(receipt.get(key)) is not type(value):
+            errors.append(f"G1 receipt field mismatch: {key}")
+    carry_forward_fields = (
+        "what_changed", "more_relevant", "less_relevant", "next_pathway_must_use",
+        "do_not_do_yet", "open_decisions", "active_risk_overlays",
+    )
+    if any(not isinstance(receipt.get(field), list) for field in carry_forward_fields):
+        errors.append("G1 receipt carry-forward fields are incomplete")
+    if receipt.get("fidelity", {}).get("matched_constant_count") != 24:
+        errors.append("G1 receipt does not record 24 matched constants")
+    if receipt.get("fidelity", {}).get("mismatches") != []:
+        errors.append("G1 receipt records fidelity mismatches")
+    if (receipt.get("artifact_sha256", {}).get("contracts/observability/rainman-thorp.json")
+            != contract_sha256):
+        errors.append("G1 receipt contract digest does not match the current contract")
+    return errors
+
+
 def main() -> int:
+    if len(sys.argv) > 2:
+        print("usage: verify_phase1_fidelity.py [receipt-phase1-g1.json]", file=sys.stderr)
+        return 2
     resolved = subprocess.run(
         ["git", "rev-parse", f"{BASE_REF}^{{commit}}"], cwd=REPO,
         capture_output=True, check=True, text=True,
@@ -123,6 +163,8 @@ def main() -> int:
     )
     if old_trust_state != derived_trust_state:
         mismatches.append("derived trust state differs from OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE")
+    if len(sys.argv) == 2:
+        mismatches.extend(validate_g1_receipt(Path(sys.argv[1]).resolve(), sha256_bytes(contract_raw)))
 
     matched = len(CONTRACT_TO_CONSTANT) + 1 - len([
         item for item in mismatches if item.startswith(("missing base constant", "value mismatch", "derived"))

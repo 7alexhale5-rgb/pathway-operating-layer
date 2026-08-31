@@ -9,7 +9,7 @@ Goal: tradebot-pinned observability enums become per-project contract files;
 any project can earn observability credit honestly. Spec:
 `.planning/2026-08-30-per-project-observability-contracts.md` (locked).
 
-Done (all canary-verified against the shared work ID):
+Done against the shared work ID:
 
 - govern — spec approved (prior session)
 - research — dossier + verified claims; 36 constants + 3 inline sites
@@ -19,13 +19,19 @@ Done (all canary-verified against the shared work ID):
   `9ecedb6` engine constants; the loader and fail-closed schema gate are wired
   into the canonical suite; trust state is derived from the extracted verifier
   digest; G1 is complete locally with 5/5 frozen scenarios, 24/24 fidelity
-  matches, and 1295/1295 canonical checks. The durable receipt and executable
+  matches, and 1306/1306 canonical checks. The durable receipt and executable
   verifier live under `quality/receipt-phase1-g1.json` and
   `quality/verify_phase1_g1.py`.
+- data proof `P-b9e7466dbdcd` / run
+  `R-W-20260830-pathway-operating-layer-per-project-observabilit-e65d28-data-004`
+  is registered with `template_check.valid=true`, a complete JSON carry-forward
+  baton, and `canary_mutant_failed=true` against the exact G1 receipt. The two
+  earlier slow full-G1 registrations remain audit history and did not run a
+  canary because the verifier exceeded the 30-second canary ceiling.
 
-Next: register the executed G1 proof against the shared work ID and preserve
-the extraction as its own commit. Then Phase 2 (resolve by project, G2), Phase
-3 (agents contract, G3 = observability proof), and Phase 4 (docs).
+Next: Phase 2 (resolve by project, G2), Phase 3 (agents contract, G3 =
+observability proof), and Phase 4 (docs). The extracted Phase 1 contract and the
+separate approval-authority repair are already preserved in distinct commits.
 
 Decision at G1: Phase 1 preserves `trusted_verifier_sha256` in the contract
 verbatim because extraction fidelity is the goal. Moving the trust root is a

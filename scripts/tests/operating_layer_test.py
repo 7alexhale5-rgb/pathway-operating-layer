@@ -5363,6 +5363,65 @@ def test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contract
         hollow = opl.check_verifier_template(pathway, "")
         complete = opl.check_verifier_template(pathway, baton + "\n" + "\n".join(spec["required_artifact_terms"]))
         check(not hollow["valid"] and complete["valid"], f"{pathway} template rejects hollow artifacts and accepts its contract")
+    json_baton = json.dumps({
+        "scope": "Mechanical contract extraction with durable continuity.",
+        "lineage": {"source": "engine constants"},
+        "verification": {"fidelity": "24/24"},
+        "what_changed": ["The contract was extracted."],
+        "more_relevant": ["Phase 2 containment."],
+        "less_relevant": [],
+        "next_pathway_must_use": ["Read the locked constraints."],
+        "do_not_do_yet": ["Do not resolve arbitrary project paths yet."],
+        "open_decisions": [],
+        "active_risk_overlays": ["rollback"],
+    })
+    parsed_json = opl.extract_carry_forward_sections(json_baton)
+    check(opl.check_verifier_template("data", json_baton)["valid"]
+          and parsed_json.get("summary")
+          == "Mechanical contract extraction with durable continuity."
+          and parsed_json.get("do_not_do_yet")
+          == ["Do not resolve arbitrary project paths yet."]
+          and parsed_json.get("open_decisions") == [],
+          "strict JSON receipts preserve complete carry-forward fields, including empty lists")
+    duplicate_json = json_baton[:-1] + ',"what_changed":["shadowed"]}'
+    check(not opl.check_verifier_template("data", duplicate_json)["valid"],
+          "duplicate-key JSON receipts fail the carry-forward template closed")
+    markdown_suffix = baton + "\nlineage\nverification"
+    duplicate_with_headings = (
+        '{\n  "summary": "first",\n  "summary": "second"\n}\n' + markdown_suffix
+    )
+    nan_with_headings = '{"summary": NaN}\n' + markdown_suffix
+    check(not opl.check_verifier_template("data", duplicate_with_headings)["valid"]
+          and not opl.check_verifier_template("data", nan_with_headings)["valid"],
+          "invalid JSON candidates cannot fall through to valid-looking Markdown headings")
+    empty_json_baton = json.dumps({
+        "summary": "An explicitly empty continuity fixture.",
+        "lineage": {},
+        "verification": {},
+        **{field: [] for field in opl.CARRY_FORWARD_LIST_FIELDS},
+    })
+    empty_evidence = write("out/operator-artifacts/empty-json-baton.json", empty_json_baton)
+    empty_record = opl.build_carry_forward_record({
+        "work_id": "W-empty-json-baton",
+        "project": "fixture-project",
+        "project_path": str(ROOT / "projects" / "fixture-project"),
+        "pathway": "data",
+        "evidence_path": str(empty_evidence),
+        "artifact_sha256": opl.sha256_file(empty_evidence),
+        "proof_id": "P-empty-json-baton",
+        "result": "pass",
+        "verifier_strength": "executed",
+        "exit_code": 0,
+        "trivial_verifier": False,
+        "canary_mutant_failed": True,
+    }, {
+        "project": str(ROOT / "projects" / "fixture-project"),
+        "project_name": "fixture-project",
+        "risk_overlays": [{"id": "rollback"}],
+    })
+    check(empty_record is not None
+          and all(empty_record[field] == [] for field in opl.CARRY_FORWARD_LIST_FIELDS),
+          "the carry-forward builder preserves every explicit empty JSON list without fallback")
 
 
 def test_audit_proof_integrity_uses_active_outcomes_and_reports_history():

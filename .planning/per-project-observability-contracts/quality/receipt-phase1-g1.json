@@ -6,6 +6,7 @@
   "result": "PASS",
   "verified_at": "2026-08-31T16:22:14Z",
   "base_commit": "9ecedb620169fdcd5919e5cd7f3fd26d9ac67387",
+  "summary": "Phase 1 mechanically extracted the Rainman/Thorp observability contract and preserved the Phase 2 containment boundary.",
   "scope": "Mechanical extraction of the Rainman/Thorp observability contract, fail-closed schema validation, derived verifier trust state, and unchanged frozen behavior.",
   "lineage": {
     "source": "scripts/operating-layer.py at 9ecedb620169fdcd5919e5cd7f3fd26d9ac67387",
@@ -56,7 +57,7 @@
   "artifact_sha256": {
     "contracts/observability/rainman-thorp.json": "1ad3ebe7c5d2f580af955b34ccca8f209d824da6ea352157a699a111aaaf522e",
     "scripts/tests/test_observability_contracts.py": "9dd0b50ae53f8481e711aca64a5483fc4b33e99e1f326365c3f35fa08782dfe6",
-    ".planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py": "416fc1cbd9f863a76766cc3d5a3a17880444b00673882511516fef5ff5a55058"
+    ".planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py": "5529b3db33812e018256a7a0b76dd28631f587bd7e94accc86487d3585ae0c6f"
   },
   "fidelity": {
     "contract_key_count": 27,

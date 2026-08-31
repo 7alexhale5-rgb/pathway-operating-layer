@@ -4152,13 +4152,71 @@ def _bullet_lines(text):
     return out
 
 
-def extract_carry_forward_sections(text):
-    """Best-effort parser for human evidence artifacts.
+def _json_carry_forward_sections(text):
+    """Extract a carry-forward baton from one strict JSON object.
 
-    The store is authoritative and structured; this parser only lets an artifact provide better
-    values than the safe defaults. It recognizes markdown headings such as `## What Changed` and
-    keeps the rest deterministic/stdlib-only.
+    JSON receipts are first-class proof artifacts, so they must preserve the same durable
+    continuity fields as Markdown reports. Duplicate keys, non-finite numbers, malformed list
+    fields, and non-object roots fail closed instead of silently degrading to fallback prose.
     """
+    if not (text or "").lstrip().startswith("{"):
+        return None
+    duplicates = []
+
+    def unique_object(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                duplicates.append(str(key))
+            else:
+                obj[key] = value
+        return obj
+
+    def reject_constant(value):
+        raise ValueError(f"non-finite number {value}")
+
+    def finite_number(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"non-finite number {value}")
+        return number
+
+    try:
+        data = json.loads(
+            text,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+            parse_float=finite_number,
+        )
+    except (TypeError, ValueError):
+        return {}
+    if duplicates or not isinstance(data, dict):
+        return {}
+
+    parsed = {}
+    summary = data.get("summary") or data.get("scope")
+    if isinstance(summary, str) and summary.strip():
+        parsed["summary"] = summary.strip()[:500]
+    for field in CARRY_FORWARD_LIST_FIELDS:
+        if field not in data:
+            continue
+        values = data[field]
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            return {}
+        parsed[field] = [item.strip() for item in values if item.strip()][:12]
+    return parsed
+
+
+def extract_carry_forward_sections(text):
+    """Parse durable carry-forward fields from JSON receipts or Markdown artifacts.
+
+    The store is authoritative and structured; this parser lets an artifact provide better values
+    than the safe defaults. JSON is strict and fail-closed. Markdown recognizes headings such as
+    `## What Changed`. Both paths remain deterministic and stdlib-only.
+    """
+    json_sections = _json_carry_forward_sections(text)
+    if json_sections is not None:
+        return json_sections
     aliases = {
         "summary": "summary",
         "what changed": "what_changed",
@@ -4272,23 +4330,27 @@ def build_carry_forward_record(proof, work_item=None, approval_events=None):
         "pathway": pathway,
         "source_artifact": source_artifact,
         "summary": extracted.get("summary") or fallback_summary,
-        "what_changed": extracted.get("what_changed") or ([
+        "what_changed": extracted["what_changed"] if "what_changed" in extracted else ([
             f"{pathway} completed with verified evidence at {source_artifact}."
         ] if credits_pathway else [
             f"{pathway} recorded a verified hold at {source_artifact}; coverage remains open."
         ]),
-        "more_relevant": extracted.get("more_relevant") or [
+        "more_relevant": extracted["more_relevant"] if "more_relevant" in extracted else [
             f"Use the {pathway} proof before ranking or executing the next pathway."
         ],
-        "less_relevant": extracted.get("less_relevant") or [],
-        "next_pathway_must_use": extracted.get("next_pathway_must_use") or [
+        "less_relevant": extracted["less_relevant"] if "less_relevant" in extracted else [],
+        "next_pathway_must_use": (
+            extracted["next_pathway_must_use"]
+            if "next_pathway_must_use" in extracted else [
             f"Read {source_artifact} before acting on the next recommendation."
-        ],
-        "do_not_do_yet": extracted.get("do_not_do_yet") or [],
-        "open_decisions": extracted.get("open_decisions") or [],
-        "active_risk_overlays": extracted.get("active_risk_overlays") or [
+        ]),
+        "do_not_do_yet": extracted["do_not_do_yet"] if "do_not_do_yet" in extracted else [],
+        "open_decisions": extracted["open_decisions"] if "open_decisions" in extracted else [],
+        "active_risk_overlays": (
+            extracted["active_risk_overlays"]
+            if "active_risk_overlays" in extracted else [
             o.get("id", "") for o in (work_item or {}).get("risk_overlays", []) if o.get("id")
-        ],
+        ]),
         "artifact_sha256": artifact_sha256,
         "proof_id": proof.get("proof_id", ""),
         "run_id": proof.get("run_id", ""),
