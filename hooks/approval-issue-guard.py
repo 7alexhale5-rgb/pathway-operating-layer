@@ -7,10 +7,7 @@ reduces accidental attempts on shells that actually invoke it.
 from __future__ import annotations
 
 import json
-import re
-import shlex
 import sys
-from pathlib import Path
 
 
 DENIAL = (
@@ -31,8 +28,8 @@ BASH_TOOL_NAMES = frozenset(
 )
 SHELL_NAMES = frozenset({"bash", "sh", "zsh"})
 SHELL_SEPARATORS = frozenset({";", "&", "|", "\n", "(", ")", "{", "}"})
-ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
-PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?\Z")
+ASSIGNMENT_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*=.*"
+PYTHON_PATTERN = r"python(?:\d+(?:\.\d+)*)?\Z"
 MAX_NESTED_COMMANDS = 32
 PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
 SHELL_VALUE_OPTIONS = frozenset({"--init-file", "--rcfile", "-o", "+o", "-O", "+O"})
@@ -91,34 +88,62 @@ VALUE_OPTIONS = frozenset(
 
 # Used only when shlex rejects malformed shell text. The match must begin at a
 # command boundary and place the real runner before the restricted subcommand.
-SUSPICIOUS_FALLBACK_RE = re.compile(
+SUSPICIOUS_FALLBACK_PATTERN = (
     r"(?:\A|&&|\|\||[;\n])\s*"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
     r"(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?"
     r"(?:command\s+)?"
     r"(?:(?:\S*/)?python(?:\d+(?:\.\d+)*)?(?:\s+-\S+)*\s+)?"
-    r"(?:\S*/)?operating-layer\.py\s+[^;\n]*\bapproval-(?:issue|invalidate)\b",
-    re.DOTALL | re.IGNORECASE,
+    r"(?:\S*/)?operating-layer\.py\s+[^;\n]*\bapproval-(?:issue|invalidate)\b"
 )
 
 
 def _basename(value: str) -> str:
-    return Path(value).name.casefold()
+    import os
+
+    return os.path.basename(value).casefold()
 
 
 def _normalize_quote_prefixes(command: str) -> str:
     """Make literal Bash ANSI-C and locale quotes parse like ordinary quotes."""
+    import re
+
     continued = command.replace("\\\r\n", "").replace("\\\n", "")
     return re.sub(r"\$(?=['\"])", "", continued)
 
 
+def _assignment_matches(value: str) -> bool:
+    import re
+
+    return re.fullmatch(ASSIGNMENT_PATTERN, value, flags=re.DOTALL) is not None
+
+
+def _python_matches(value: str) -> bool:
+    import re
+
+    return re.fullmatch(PYTHON_PATTERN, value) is not None
+
+
+def _suspicious_fallback_matches(command: str) -> bool:
+    import re
+
+    return re.search(
+        SUSPICIOUS_FALLBACK_PATTERN,
+        command,
+        flags=re.DOTALL | re.IGNORECASE,
+    ) is not None
+
+
 def _could_contain_restricted_subcommand(command: str) -> bool:
     """Cheap prefilter which cannot reject a literal shell-joined subcommand."""
-    dequoted = command.casefold().translate(str.maketrans("", "", "'\"\\"))
+    continued = command.replace("\\\r\n", "").replace("\\\n", "")
+    dequoted = continued.casefold().translate(str.maketrans("", "", "'\"\\$"))
     return any(subcommand in dequoted for subcommand in RESTRICTED_SUBCOMMANDS)
 
 
 def _shell_tokens(command: str) -> list[str]:
+    import shlex
+
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n()<>{}")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
@@ -187,7 +212,7 @@ def _segments(tokens: list[str]):
 
 
 def _skip_assignments(tokens: list[str], index: int) -> int:
-    while index < len(tokens) and ASSIGNMENT_RE.fullmatch(tokens[index]):
+    while index < len(tokens) and _assignment_matches(tokens[index]):
         index += 1
     return index
 
@@ -290,7 +315,7 @@ def _env_command_tokens(tokens: list[str], env_index: int) -> list[str] | None:
         index = 0
         while index < len(arguments):
             token = arguments[index]
-            if ASSIGNMENT_RE.fullmatch(token):
+            if _assignment_matches(token):
                 index += 1
                 continue
             if token == "--":
@@ -314,6 +339,8 @@ def _env_command_tokens(tokens: list[str], env_index: int) -> list[str] | None:
                 if expansions > MAX_NESTED_COMMANDS:
                     return None
                 try:
+                    import shlex
+
                     split_tokens = shlex.split(
                         _normalize_quote_prefixes(split_value), comments=False, posix=True,
                     )
@@ -417,7 +444,7 @@ def _segment_issues(tokens: list[str], depth: int) -> bool:
         return False
 
     script_index = index
-    if PYTHON_RE.fullmatch(executable):
+    if _python_matches(executable):
         script_index = _python_script_index(tokens, index)
         if script_index is None or script_index >= len(tokens):
             return False
@@ -428,6 +455,8 @@ def _segment_issues(tokens: list[str], depth: int) -> bool:
 
 
 def command_changes_approval_authority(command: str, depth: int = 0) -> bool:
+    if not _could_contain_restricted_subcommand(command):
+        return False
     normalized = _normalize_quote_prefixes(command)
     if not _could_contain_restricted_subcommand(normalized):
         return False
@@ -437,7 +466,7 @@ def command_changes_approval_authority(command: str, depth: int = 0) -> bool:
     try:
         tokens = _shell_tokens(normalized)
     except ValueError:
-        return bool(SUSPICIOUS_FALLBACK_RE.search(normalized))
+        return _suspicious_fallback_matches(normalized)
     return any(_segment_issues(segment, depth) for segment in _segments(tokens))
 
 

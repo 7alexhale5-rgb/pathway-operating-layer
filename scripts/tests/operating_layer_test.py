@@ -6341,9 +6341,11 @@ def test_approval_issue_guard_repeatable_verifier():
         "--runs", "4",
     ]
 
-    def verify():
+    def verify(runs="4"):
+        command = list(verifier_cmd)
+        command[command.index("--runs") + 1] = runs
         return subprocess.run(
-            verifier_cmd, capture_output=True, text=True, timeout=30,
+            command, capture_output=True, text=True, timeout=30,
         )
 
     def verify_source(source, runs="1"):
@@ -6365,12 +6367,15 @@ def test_approval_issue_guard_repeatable_verifier():
         except (TypeError, ValueError):
             return {}
 
-    passed = verify()
+    # With four samples nearest-rank p95 is the maximum, so one scheduler
+    # outlier can masquerade as a guard regression. Match the production
+    # verifier's 120-run sample while preserving its strict 50ms threshold.
+    passed = verify(runs="120")
     summary = verifier_json(passed)
     check(passed.returncode == 0,
           f"repeatable approval guard verifier passes its complete fixture ({passed.stderr.strip()})")
     check(summary.get("status") == "pass", "approval guard verifier returns a JSON pass status")
-    check(summary.get("run_count") == 4, "approval guard verifier honors its run-count override")
+    check(summary.get("run_count") == 120, "approval guard verifier honors its run-count override")
     check(summary.get("settings_checked") == 3,
           "approval guard verifier reports all three settings files")
     check(summary.get("symlinks_checked") == 2,
