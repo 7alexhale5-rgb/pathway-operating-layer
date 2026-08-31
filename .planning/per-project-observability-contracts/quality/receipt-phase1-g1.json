@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "work_id": "W-20260830-pathway-operating-layer-per-project-observabilit-e65d28",
+  "phase": 1,
+  "gate": "G1",
+  "result": "PASS",
+  "verified_at": "2026-08-31T16:22:14Z",
+  "base_commit": "9ecedb620169fdcd5919e5cd7f3fd26d9ac67387",
+  "scope": "Mechanical extraction of the Rainman/Thorp observability contract, fail-closed schema validation, derived verifier trust state, and unchanged frozen behavior.",
+  "lineage": {
+    "source": "scripts/operating-layer.py at 9ecedb620169fdcd5919e5cd7f3fd26d9ac67387",
+    "destination": "contracts/observability/rainman-thorp.json",
+    "method": "AST extraction of 23 literal constants plus one mechanically derived trust state"
+  },
+  "verification": {
+    "frozen_characterization": "5/5",
+    "constant_fidelity": "24/24",
+    "canonical_suite": "1295/1295"
+  },
+  "what_changed": [
+    "Tradebot observability constants now have a versioned contract file behind the Phase 1 loader and schema gate."
+  ],
+  "more_relevant": [
+    "Phase 2 must resolve contracts by canonical project identity and enforce containment before project-specific credit is enabled."
+  ],
+  "less_relevant": [
+    "The separate OS-owned approval-authority repair does not establish or alter Phase 1 extraction fidelity."
+  ],
+  "next_pathway_must_use": [
+    "Read this G1 receipt and the locked threat-model constraints before implementing Phase 2 resolution."
+  ],
+  "do_not_do_yet": [
+    "Do not reuse the Phase 1 loader for arbitrary project paths until Phase 2 containment and project-key binding pass."
+  ],
+  "open_decisions": [],
+  "active_risk_overlays": [
+    "rollback"
+  ],
+  "commands": [
+    {
+      "command": "python3 scripts/tests/test_observability_contracts.py",
+      "result": "PASS",
+      "observed": "5/5 characterization scenarios match goldens"
+    },
+    {
+      "command": "python3 .planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py",
+      "result": "PASS",
+      "observed": "24/24 extracted or derived constants match base commit"
+    },
+    {
+      "command": "python3 scripts/tests/operating_layer_test.py",
+      "result": "PASS",
+      "observed": "1295/1295 checks passed"
+    }
+  ],
+  "artifact_sha256": {
+    "contracts/observability/rainman-thorp.json": "1ad3ebe7c5d2f580af955b34ccca8f209d824da6ea352157a699a111aaaf522e",
+    "scripts/tests/test_observability_contracts.py": "9dd0b50ae53f8481e711aca64a5483fc4b33e99e1f326365c3f35fa08782dfe6",
+    ".planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py": "416fc1cbd9f863a76766cc3d5a3a17880444b00673882511516fef5ff5a55058"
+  },
+  "fidelity": {
+    "contract_key_count": 27,
+    "metadata_key_count": 4,
+    "extracted_constant_count": 23,
+    "derived_constant_count": 1,
+    "matched_constant_count": 24,
+    "mismatches": []
+  },
+  "separate_scope": "The approval-authority trust repair is intentionally excluded from this G1 receipt and must be reviewed and committed separately."
+}

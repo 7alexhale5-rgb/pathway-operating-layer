@@ -1483,138 +1483,8 @@ def release_provider_action_verifier_binding(stdout, expected_action, receipt_sh
     return {"markers": markers, "errors": errors, "bound": not errors}
 
 
-OBSERVABILITY_METRIC_NAMES = {
-    "tradebot_market_data_age_seconds",
-    "tradebot_risk_decisions_total",
-    "tradebot_order_ack_latency_seconds",
-    "tradebot_reconciliation_mismatches_total",
-    "tradebot_policy_violations_total",
-    "tradebot_drawdown_ratio",
-    "tradebot_component_heartbeat_age_seconds",
-}
-OBSERVABILITY_METRIC_LABEL_VALUES = {
-    "tradebot_market_data_age_seconds": {
-        "asset": {"BTC-USD", "ETH-USD"},
-        "source": {"SOURCE_UNSELECTED"},
-    },
-    "tradebot_risk_decisions_total": {
-        "decision": {"APPROVE", "DENY", "ABSTAIN"},
-        "reason": {
-            "POLICY_PASS", "POLICY_VIOLATION", "STALE_DATA", "UNKNOWN_STATE",
-            "RECONCILIATION_MISMATCH", "AMBIGUOUS_SUBMIT",
-            "UNRESOLVED_PARTIAL_FILL", "STAGE_DENIED",
-        },
-    },
-    "tradebot_order_ack_latency_seconds": {"venue": {"VENUE_UNSELECTED"}},
-    "tradebot_reconciliation_mismatches_total": {
-        "asset": {"BTC-USD", "ETH-USD"},
-        "class": {"POSITION", "BALANCE", "ORDER", "RESERVATION", "SEQUENCE"},
-    },
-    "tradebot_policy_violations_total": {
-        "type": {"AUTHORITY", "STAGE", "RISK", "ARTIFACT", "SIGNATURE", "ORDER_STATE"},
-    },
-    "tradebot_drawdown_ratio": {"mode": {"SIMULATE_ONLY", "OBSERVE_ONLY"}},
-    "tradebot_component_heartbeat_age_seconds": {
-        "component": {
-            "MARKET_DATA", "DETERMINISTIC_EVALUATOR", "RISK_ENGINE",
-            "EXECUTION_ADAPTER", "AUDIT_LEDGER", "TELEMETRY_EXPORTER", "RECONCILER",
-        },
-    },
-}
-OBSERVABILITY_EVENT_NAMES = {
-    "tradebot.proposal.created", "tradebot.proposal.rejected", "tradebot.risk.decision",
-    "tradebot.order.state_changed", "tradebot.order.submit_ambiguous",
-    "tradebot.reconciliation.completed", "tradebot.halt.latched",
-    "tradebot.halt.release_requested", "tradebot.halt.release_denied",
-    "tradebot.halt.release_approved", "tradebot.kill_switch.activated",
-    "tradebot.rollback.started", "tradebot.rollback.completed", "tradebot.rollback.failed",
-    "tradebot.stage.transition_requested", "tradebot.stage.transition.denied",
-    "tradebot.stage.transition.approved", "tradebot.audit.checkpoint_signed",
-    "tradebot.telemetry.gap_detected",
-}
-OBSERVABILITY_CORRELATION_FIELDS = {
-    "event_id", "sequence", "previous_digest", "payload_hash", "producer_id",
-    "producer_key_id", "occurred_at", "trace_id",
-    "decision_id", "cycle_id", "intent_id", "client_order_id", "manifest_hash",
-    "strategy_hash", "risk_policy_hash", "data_snapshot_hash", "account_snapshot_seq",
-    "asset", "mode", "market_event_ts", "observed_at", "risk_decision", "reason_code",
-}
-OBSERVABILITY_CORRELATION_HASH_FIELDS = {
-    "previous_digest", "payload_hash", "manifest_hash", "strategy_hash",
-    "risk_policy_hash", "data_snapshot_hash",
-}
-OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS = {"occurred_at", "market_event_ts", "observed_at"}
-OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS = {"sequence", "account_snapshot_seq"}
-OBSERVABILITY_ALLOWED_ASSETS = {"BTC-USD", "ETH-USD"}
-OBSERVABILITY_ALLOWED_MODES = {"SIMULATE_ONLY", "OBSERVE_ONLY"}
-OBSERVABILITY_ALLOWED_RISK_DECISIONS = {"APPROVE", "DENY", "ABSTAIN"}
-OBSERVABILITY_ALLOWED_REASON_CODES = {
-    "POLICY_PASS", "POLICY_VIOLATION", "STALE_DATA", "UNKNOWN_STATE",
-    "RECONCILIATION_MISMATCH", "AMBIGUOUS_SUBMIT", "UNRESOLVED_PARTIAL_FILL",
-    "STAGE_DENIED",
-}
-OBSERVABILITY_DRILL_INCIDENT = {
-    "event_name": "tradebot.halt.latched",
-    "asset": "BTC-USD",
-    "mode": "SIMULATE_ONLY",
-    "risk_decision": "DENY",
-    "reason_code": "STALE_DATA",
-}
-OBSERVABILITY_DRILL_TRACE_NAME = "halt.activate"
-OBSERVABILITY_DRILL_ALERT = {
-    "alert_id": "stale-feed",
-    "condition": "market data absent",
-    "status": "FIRED",
-    "safe_action": "HALT_ENTRIES_RECONCILE_ONLY",
-}
-OBSERVABILITY_RUNBOOK_QUESTION_IDS = {
-    "CURRENT_AUTHORIZED_STAGE_AND_MODE",
-    "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS",
-    "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES",
-    "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS",
-    "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE",
-    "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE",
-    "WHY_HALT_ENTRIES_LATCHED",
-    "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED",
-    "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING",
-    "HUMAN_DISPOSITION_REQUIRED_NEXT",
-}
-OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS = {
-    "metric_artifact", "log_artifact", "trace_artifact", "alert_artifact", "canary_artifact",
-}
-OBSERVABILITY_RUNBOOK_DISPOSITIONS = {
-    "RETAIN_HALT_AND_RECONCILE",
-    "ESCALATE_AND_RETAIN_HALT",
-}
-OBSERVABILITY_RUNBOOK_ANSWER_CODES = {
-    "CURRENT_AUTHORIZED_STAGE_AND_MODE": "AUTHORITY_CONFIRMED_NO_RUNTIME",
-    "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS": "CORRELATION_IDENTIFIERS_RECONSTRUCTED",
-    "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES": "AUTHORITATIVE_HASHES_RECONSTRUCTED",
-    "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS": "TRUSTED_TIMESTAMPS_RECONSTRUCTED",
-    "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE": "VENUE_ACKNOWLEDGEMENT_REMAINS_UNCERTAIN",
-    "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE": "WORST_CASE_RESERVATION_RETAINED",
-    "WHY_HALT_ENTRIES_LATCHED": "HALT_LATCH_CONFIRMED",
-    "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED": "PROHIBITED_ACTIONS_CONFIRMED",
-    "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING": "MISSING_RECONCILIATION_EVIDENCE_IDENTIFIED",
-    "HUMAN_DISPOSITION_REQUIRED_NEXT": "HUMAN_RECONCILIATION_REQUIRED",
-}
-OBSERVABILITY_RUNBOOK_ENUM_VALUES = {
-    "order_uncertainty": {"ACKNOWLEDGEMENT_UNCERTAIN"},
-    "last_venue_evidence": {"NO_TERMINAL_VENUE_EVIDENCE"},
-    "reservation_state": {"WORST_CASE_RESERVATION_RETAINED"},
-    "exposure_state": {"OPEN_SYNTHETIC_BTC_EXPOSURE"},
-    "ledger_mismatch_state": {"LEDGER_VENUE_MISMATCH_UNRESOLVED"},
-    "halt_reason": {"STALE_MARKET_DATA_AND_UNCERTAIN_VENUE_ACK"},
-    "human_disposition": {"RETAIN_HALT_AND_RECONCILE"},
-    "next_action": {"RECONCILE_BY_CLIENT_ORDER_ID"},
-}
-OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE = {
-    "AUTHORITATIVE_VENUE_ORDER_STATE",
-}
 OBSERVABILITY_ALLOWED_STAGES = {"NONE"}
 OBSERVABILITY_ALLOWED_VERDICTS = {"NO_PROMOTE"}
-OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE = "TRUSTED_VERIFIER_NOT_CONFIGURED"
-OBSERVABILITY_TRUSTED_VERIFIER_SHA256 = frozenset()
 OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS = (
     "metric_artifact", "log_artifact", "trace_artifact", "alert_artifact",
     "runbook_drill_artifact", "canary_artifact", "verifier_artifact",
@@ -1651,71 +1521,6 @@ OBSERVABILITY_MAX_FUTURE_SKEW_SECONDS = 300
 OBSERVABILITY_MAX_OBSERVATION_WINDOW_SECONDS = 300
 OBSERVABILITY_MAX_JSON_BYTES = 5_000_000
 OBSERVABILITY_MAX_ABS_METRIC_VALUE = 10 ** 100
-OBSERVABILITY_METRIC_DOMAINS = {
-    "tradebot_market_data_age_seconds": (0, None),
-    "tradebot_risk_decisions_total": (0, None),
-    "tradebot_order_ack_latency_seconds": (0, None),
-    "tradebot_reconciliation_mismatches_total": (0, None),
-    "tradebot_policy_violations_total": (0, None),
-    "tradebot_drawdown_ratio": (0, 1),
-    "tradebot_component_heartbeat_age_seconds": (0, None),
-}
-OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT = {
-    "CURRENT_AUTHORIZED_STAGE_AND_MODE": {
-        "fields": {"authorized_stage": "stage", "mode": "mode"},
-        "evidence": ("log_artifact",),
-    },
-    "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS": {
-        "fields": {
-            "decision_id": "identifier", "cycle_id": "identifier", "intent_id": "identifier",
-            "client_order_id": "identifier",
-        },
-        "evidence": ("log_artifact",),
-    },
-    "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES": {
-        "fields": {
-            "strategy_hash": "sha256", "data_snapshot_hash": "sha256",
-            "risk_policy_hash": "sha256", "manifest_hash": "sha256",
-        },
-        "evidence": ("log_artifact",),
-    },
-    "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS": {
-        "fields": {"market_timestamp": "timestamp", "private_feed_timestamp": "timestamp"},
-        "evidence": ("log_artifact", "metric_artifact"),
-    },
-    "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE": {
-        "fields": {"order_uncertainty": "enum", "last_venue_evidence": "enum"},
-        "evidence": ("log_artifact", "trace_artifact"),
-    },
-    "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE": {
-        "fields": {
-            "reservation_state": "enum", "exposure_state": "enum",
-            "ledger_mismatch_state": "enum",
-        },
-        "evidence": ("log_artifact", "metric_artifact"),
-    },
-    "WHY_HALT_ENTRIES_LATCHED": {
-        "fields": {"halt_reason": "enum", "halt_latched": "true"},
-        "evidence": ("alert_artifact", "log_artifact"),
-    },
-    "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED": {
-        "fields": {
-            "retry_prohibited": "true", "flatten_prohibited": "true",
-            "halt_release_prohibited": "true",
-        },
-        "evidence": ("alert_artifact",),
-    },
-    "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING": {
-        "fields": {"missing_reconciliation_evidence": "evidence_list"},
-        "evidence": ("log_artifact", "metric_artifact"),
-    },
-    "HUMAN_DISPOSITION_REQUIRED_NEXT": {
-        "fields": {"human_disposition": "enum", "next_action": "enum"},
-        "evidence": ("alert_artifact",),
-    },
-}
-
-
 def _read_strict_json_object(path, label="observability companion"):
     """Read a JSON object while rejecting duplicate keys and non-finite numbers."""
     duplicates = []
@@ -1763,6 +1568,366 @@ def _read_strict_json_object(path, label="observability companion"):
         errors.append(f"{label} must be a JSON object")
         data = {}
     return data, errors
+
+
+# ---------------------------------------------------------------------------
+# Per-project observability evidence contracts.
+#
+# The tradebot evidence schema that used to live here as module constants is
+# now versioned DATA: contracts/observability/rainman-thorp.json (extracted
+# verbatim 2026-08-30). A contract defines WHAT the evidence describes; it can
+# never lower HOW MUCH proof is required -- the receipt shape, sha256/canary/
+# restoration binding, and snapshot checks stay engine-side above and in
+# proof_is_verified. The loader below fails closed: no readable, schema-valid
+# contract means every observability receipt is refused outright.
+
+OBSERVABILITY_CONTRACT_MAX_BYTES = 65_536
+OBSERVABILITY_CONTRACT_MEMBER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{3,127}\Z")
+OBSERVABILITY_RUNBOOK_FACT_KINDS = frozenset({
+    "enum", "evidence_list", "identifier", "mode", "sha256", "stage", "timestamp", "true",
+})
+OBSERVABILITY_RUNBOOK_EVIDENCE_INVENTORY = frozenset(OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS) - {
+    "runbook_drill_artifact", "verifier_artifact",
+}
+OBSERVABILITY_DRILL_INCIDENT_FIELDS = frozenset({
+    "event_name", "asset", "mode", "risk_decision", "reason_code",
+})
+OBSERVABILITY_CONTRACT_ENUM_FLOORS = {
+    "metric_names": 3,
+    "event_names": 3,
+    "correlation_fields": 8,
+    "correlation_hash_fields": 1,
+    "correlation_timestamp_fields": 1,
+    "correlation_sequence_fields": 1,
+    "allowed_assets": 1,
+    "allowed_modes": 1,
+    "allowed_risk_decisions": 1,
+    "allowed_reason_codes": 1,
+    "runbook_question_ids": 3,
+    "runbook_evidence_fields": 3,
+    "runbook_dispositions": 1,
+    "runbook_missing_evidence": 1,
+}
+
+
+def observability_contracts_dir():
+    """Engine-owned contracts root, realpath-contained inside this repo.
+
+    Resolves through symlinks (including a symlinked contracts/ directory)
+    and refuses any resolution that escapes the repo root, per threat T4.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    contracts_dir = (repo_root / "contracts" / "observability").resolve()
+    if contracts_dir != repo_root / "contracts" / "observability":
+        return None
+    return contracts_dir
+
+
+def _observability_contract_enum_errors(contract, key, floor):
+    if key not in contract:
+        return [f"observability contract is missing required key {key}"]
+    value = contract.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return [f"observability contract {key} must be a list of strings"]
+    errors = []
+    if len(value) != len(set(value)):
+        errors.append(f"observability contract {key} must not contain duplicates")
+    if len(value) < floor:
+        errors.append(
+            f"observability contract {key} needs at least {floor} member(s)"
+        )
+    for member in value:
+        if not OBSERVABILITY_CONTRACT_MEMBER_RE.fullmatch(member):
+            errors.append(
+                f"observability contract {key} member {member!r} fails the quality gate"
+            )
+            break
+    return errors
+
+
+def _observability_string_list(value):
+    """Return a validated string list or an inert empty list, never a crashable scalar."""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return value
+
+
+def _observability_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def validate_observability_contract(contract):
+    """Schema gate for one contract object. Returns a list of errors."""
+    if not isinstance(contract, dict):
+        return ["observability contract must be an object"]
+    errors = []
+    if type(contract.get("schema_version")) is not int or contract.get("schema_version") != 1:
+        errors.append("observability contract schema_version must be integer 1")
+    if contract.get("contract_type") != "observability_evidence_contract":
+        errors.append("observability contract_type must be observability_evidence_contract")
+    if not isinstance(contract.get("project_key"), str) or not contract.get("project_key").strip():
+        errors.append("observability contract requires a non-empty project_key")
+    for key, floor in OBSERVABILITY_CONTRACT_ENUM_FLOORS.items():
+        errors.extend(_observability_contract_enum_errors(contract, key, floor))
+
+    metric_names = set(_observability_string_list(contract.get("metric_names")))
+    labels = contract.get("metric_label_values")
+    if not isinstance(labels, dict) or set(labels) != metric_names or not all(
+        isinstance(entry, dict)
+        and all(
+            isinstance(values, list) and values
+            and all(isinstance(v, str) and v.strip() for v in values)
+            and len(values) == len(set(values))
+            for values in entry.values()
+        )
+        for entry in labels.values()
+    ):
+        errors.append("observability contract metric_label_values must cover exactly metric_names")
+    domains = contract.get("metric_domains")
+    domains_valid = isinstance(domains, dict) and set(domains) == metric_names
+    if domains_valid:
+        for bounds in domains.values():
+            if not isinstance(bounds, list) or len(bounds) != 2:
+                domains_valid = False
+                break
+            minimum, maximum = bounds
+            if (not _observability_finite_number(minimum)
+                    or (maximum is not None and not _observability_finite_number(maximum))
+                    or (maximum is not None and maximum < minimum)):
+                domains_valid = False
+                break
+    if not domains_valid:
+        errors.append("observability contract metric_domains must cover exactly metric_names")
+
+    correlation = set(_observability_string_list(contract.get("correlation_fields")))
+    for subset_key in (
+        "correlation_hash_fields", "correlation_timestamp_fields",
+        "correlation_sequence_fields",
+    ):
+        if not set(_observability_string_list(contract.get(subset_key))).issubset(correlation):
+            errors.append(
+                f"observability contract {subset_key} must be a subset of correlation_fields"
+            )
+
+    question_ids = set(_observability_string_list(contract.get("runbook_question_ids")))
+    answer_codes = contract.get("runbook_answer_codes")
+    if not isinstance(answer_codes, dict) or set(answer_codes) != question_ids or not all(
+        isinstance(code, str) and code.strip() for code in answer_codes.values()
+    ):
+        errors.append("observability contract runbook_answer_codes must cover exactly runbook_question_ids")
+    enum_values = contract.get("runbook_enum_values")
+    enum_values_valid = isinstance(enum_values, dict) and all(
+        isinstance(field, str) and isinstance(values, list) and values
+        and all(isinstance(v, str) and v.strip() for v in values)
+        and len(values) == len(set(values))
+        for field, values in enum_values.items()
+    )
+    if not enum_values_valid:
+        errors.append("observability contract runbook_enum_values must map fields to value lists")
+    evidence_fields = set(_observability_string_list(contract.get("runbook_evidence_fields")))
+    if not evidence_fields.issubset(OBSERVABILITY_RUNBOOK_EVIDENCE_INVENTORY):
+        errors.append(
+            "observability contract runbook_evidence_fields must come from the receipt artifact inventory"
+        )
+    answer_contract = contract.get("runbook_answer_contract")
+    answer_contract_valid = isinstance(answer_contract, dict) and set(answer_contract) == question_ids
+    enum_fact_fields = set()
+    if answer_contract_valid:
+        for entry in answer_contract.values():
+            if not isinstance(entry, dict):
+                answer_contract_valid = False
+                break
+            fields = entry.get("fields")
+            evidence = entry.get("evidence")
+            if (not isinstance(fields, dict) or not fields
+                    or not all(
+                        isinstance(field, str) and isinstance(kind, str)
+                        and kind in OBSERVABILITY_RUNBOOK_FACT_KINDS
+                        for field, kind in fields.items()
+                    )
+                    or not isinstance(evidence, list) or not evidence
+                    or not all(isinstance(ref, str) for ref in evidence)
+                    or len(evidence) != len(set(evidence))
+                    or not set(evidence).issubset(evidence_fields)
+                    or not set(evidence).issubset(OBSERVABILITY_RUNBOOK_EVIDENCE_INVENTORY)):
+                answer_contract_valid = False
+                break
+            enum_fact_fields.update(field for field, kind in fields.items() if kind == "enum")
+    if not answer_contract_valid:
+        errors.append(
+            "observability contract runbook_answer_contract must cover exactly runbook_question_ids"
+        )
+    if enum_values_valid and enum_fact_fields != set(enum_values):
+        errors.append(
+            "observability contract enum facts must map exactly to runbook_enum_values"
+        )
+
+    drill_incident = contract.get("drill_incident")
+    if (not isinstance(drill_incident, dict)
+            or set(drill_incident) != OBSERVABILITY_DRILL_INCIDENT_FIELDS
+            or not all(
+                isinstance(drill_incident.get(field), str)
+                for field in OBSERVABILITY_DRILL_INCIDENT_FIELDS
+            )
+            or drill_incident.get("event_name") not in set(
+                _observability_string_list(contract.get("event_names")))
+            or drill_incident.get("asset") not in set(
+                _observability_string_list(contract.get("allowed_assets")))
+            or drill_incident.get("mode") not in set(
+                _observability_string_list(contract.get("allowed_modes")))
+            or drill_incident.get("risk_decision") not in set(
+                _observability_string_list(contract.get("allowed_risk_decisions")))
+            or drill_incident.get("reason_code") not in set(
+                _observability_string_list(contract.get("allowed_reason_codes")))):
+        errors.append("observability contract drill_incident must bind the five canonical incident fields")
+    if not isinstance(contract.get("drill_trace_name"), str) or not contract.get("drill_trace_name").strip():
+        errors.append("observability contract requires a drill_trace_name")
+    drill_alert = contract.get("drill_alert")
+    if (not isinstance(drill_alert, dict)
+            or set(drill_alert) != {"alert_id", "condition", "status", "safe_action"}
+            or drill_alert.get("status") != "FIRED" or not all(
+        isinstance(drill_alert.get(field), str) and drill_alert.get(field).strip()
+        for field in ("alert_id", "condition", "status", "safe_action")
+    )):
+        errors.append("observability contract drill_alert must carry alert_id/condition/status/safe_action")
+
+    trusted = contract.get("trusted_verifier_sha256")
+    trusted_valid = isinstance(trusted, list) and all(
+        isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) for digest in trusted
+    )
+    if not trusted_valid or len(trusted) != len(set(trusted)):
+        errors.append(
+            "observability contract trusted_verifier_sha256 must be a unique list of lowercase sha256 digests"
+        )
+    return errors
+
+
+def load_observability_contract_file(contract_path):
+    """Load + schema-gate one contract file. Returns (contract, errors), fail-closed."""
+    contract_path = Path(contract_path)
+    if contract_path.is_symlink():
+        return {}, ["observability contract must not be a symlink"]
+    if not contract_path.is_file():
+        return {}, ["observability_contract_not_registered"]
+    try:
+        if contract_path.stat().st_size > OBSERVABILITY_CONTRACT_MAX_BYTES:
+            return {}, [
+                f"observability contract exceeds the {OBSERVABILITY_CONTRACT_MAX_BYTES}-byte limit"
+            ]
+    except OSError:
+        return {}, ["observability contract is unreadable"]
+    contract, errors = _read_strict_json_object(contract_path, "observability contract")
+    if errors:
+        return {}, errors
+    errors = validate_observability_contract(contract)
+    if errors:
+        return {}, errors
+    return contract, []
+
+
+_OBSERVABILITY_DEFAULT_CONTRACT, OBSERVABILITY_DEFAULT_CONTRACT_ERRORS = (
+    load_observability_contract_file(observability_contracts_dir() / "rainman-thorp.json")
+    if observability_contracts_dir() is not None
+    else ({}, ["observability contracts directory escapes the repo root"])
+)
+
+if OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+    OBSERVABILITY_METRIC_NAMES = frozenset()
+    OBSERVABILITY_METRIC_LABEL_VALUES = {}
+    OBSERVABILITY_METRIC_DOMAINS = {}
+    OBSERVABILITY_EVENT_NAMES = frozenset()
+    OBSERVABILITY_CORRELATION_FIELDS = frozenset()
+    OBSERVABILITY_CORRELATION_HASH_FIELDS = frozenset()
+    OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS = frozenset()
+    OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS = frozenset()
+    OBSERVABILITY_ALLOWED_ASSETS = frozenset()
+    OBSERVABILITY_ALLOWED_MODES = frozenset()
+    OBSERVABILITY_ALLOWED_RISK_DECISIONS = frozenset()
+    OBSERVABILITY_ALLOWED_REASON_CODES = frozenset()
+    OBSERVABILITY_DRILL_INCIDENT = {}
+    OBSERVABILITY_DRILL_TRACE_NAME = ""
+    OBSERVABILITY_DRILL_ALERT = {}
+    OBSERVABILITY_RUNBOOK_QUESTION_IDS = frozenset()
+    OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS = frozenset()
+    OBSERVABILITY_RUNBOOK_DISPOSITIONS = frozenset()
+    OBSERVABILITY_RUNBOOK_ANSWER_CODES = {}
+    OBSERVABILITY_RUNBOOK_ENUM_VALUES = {}
+    OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE = frozenset()
+    OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT = {}
+    OBSERVABILITY_TRUSTED_VERIFIER_SHA256 = frozenset()
+else:
+    OBSERVABILITY_METRIC_NAMES = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["metric_names"])
+    OBSERVABILITY_METRIC_LABEL_VALUES = {
+        name: {label: frozenset(values) for label, values in entry.items()}
+        for name, entry in _OBSERVABILITY_DEFAULT_CONTRACT["metric_label_values"].items()
+    }
+    OBSERVABILITY_METRIC_DOMAINS = {
+        name: (bounds[0], bounds[1])
+        for name, bounds in _OBSERVABILITY_DEFAULT_CONTRACT["metric_domains"].items()
+    }
+    OBSERVABILITY_EVENT_NAMES = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["event_names"])
+    OBSERVABILITY_CORRELATION_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_fields"]
+    )
+    OBSERVABILITY_CORRELATION_HASH_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_hash_fields"]
+    )
+    OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_timestamp_fields"]
+    )
+    OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_sequence_fields"]
+    )
+    OBSERVABILITY_ALLOWED_ASSETS = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["allowed_assets"])
+    OBSERVABILITY_ALLOWED_MODES = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["allowed_modes"])
+    OBSERVABILITY_ALLOWED_RISK_DECISIONS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["allowed_risk_decisions"]
+    )
+    OBSERVABILITY_ALLOWED_REASON_CODES = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["allowed_reason_codes"]
+    )
+    OBSERVABILITY_DRILL_INCIDENT = dict(_OBSERVABILITY_DEFAULT_CONTRACT["drill_incident"])
+    OBSERVABILITY_DRILL_TRACE_NAME = _OBSERVABILITY_DEFAULT_CONTRACT["drill_trace_name"]
+    OBSERVABILITY_DRILL_ALERT = dict(_OBSERVABILITY_DEFAULT_CONTRACT["drill_alert"])
+    OBSERVABILITY_RUNBOOK_QUESTION_IDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_question_ids"]
+    )
+    OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_evidence_fields"]
+    )
+    OBSERVABILITY_RUNBOOK_DISPOSITIONS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_dispositions"]
+    )
+    OBSERVABILITY_RUNBOOK_ANSWER_CODES = dict(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_answer_codes"]
+    )
+    OBSERVABILITY_RUNBOOK_ENUM_VALUES = {
+        field: frozenset(values)
+        for field, values in _OBSERVABILITY_DEFAULT_CONTRACT["runbook_enum_values"].items()
+    }
+    OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_missing_evidence"]
+    )
+    OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT = {
+        question_id: {
+            "fields": dict(entry["fields"]),
+            "evidence": tuple(entry["evidence"]),
+        }
+        for question_id, entry in _OBSERVABILITY_DEFAULT_CONTRACT["runbook_answer_contract"].items()
+    }
+    OBSERVABILITY_TRUSTED_VERIFIER_SHA256 = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["trusted_verifier_sha256"]
+    )
+OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE = (
+    "CONFIGURED_AND_VERIFIED"
+    if OBSERVABILITY_TRUSTED_VERIFIER_SHA256 and not OBSERVABILITY_DEFAULT_CONTRACT_ERRORS
+    else "TRUSTED_VERIFIER_NOT_CONFIGURED"
+)
 
 
 def validate_pre_runtime_observability(envelope, expected=None):
@@ -1920,7 +2085,7 @@ def _valid_observability_drill_answer(answer):
                 and (not isinstance(value, str)
                      or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,127}", value))):
             return False
-        if kind == "enum" and value not in OBSERVABILITY_RUNBOOK_ENUM_VALUES.get(field, set()):
+        if kind == "enum" and value not in OBSERVABILITY_RUNBOOK_ENUM_VALUES[field]:
             return False
         if kind == "sha256" and not _is_sha256_digest(value):
             return False
@@ -1937,6 +2102,7 @@ def _valid_observability_drill_answer(answer):
             return False
     return (
         isinstance(evidence_refs, list)
+        and len(evidence_refs) == len(set(evidence_refs))
         and set(evidence_refs) == set(contract["evidence"])
         and all(ref in OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS for ref in evidence_refs)
     )
@@ -2009,6 +2175,11 @@ def _validate_observability_drill_correlations(
 
 def _validate_observability_json_artifact(field, artifact, receipt, now=None):
     """Validate one typed, nontrivial runtime evidence artifact."""
+    if OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(OBSERVABILITY_DEFAULT_CONTRACT_ERRORS[:3])
+        ]
     errors = []
     data, parse_errors = _read_strict_json_object(artifact, field)
     errors.extend(parse_errors)
@@ -2086,7 +2257,7 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
             and _nonempty_string(item.get("alert_id"))
             and _nonempty_string(item.get("condition"))
             and item.get("status") == "FIRED"
-            and item.get("safe_action") == "HALT_ENTRIES_RECONCILE_ONLY"
+            and item.get("safe_action") == OBSERVABILITY_DRILL_ALERT["safe_action"]
             for item in executions
         )
         if data.get("alerts_wired") is not True or not valid_executions:
@@ -2154,6 +2325,11 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
     """Validate the typed Tier-B receipt without trusting caller-supplied pass semantics."""
     if not isinstance(receipt, dict):
         return ["observability_receipt must be an object"]
+    if OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(OBSERVABILITY_DEFAULT_CONTRACT_ERRORS[:3])
+        ]
     now = now or utc_now()
     errors = []
     if receipt.get("schema_version") != 1 or isinstance(receipt.get("schema_version"), bool):

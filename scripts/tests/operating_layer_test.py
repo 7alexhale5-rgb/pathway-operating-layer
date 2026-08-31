@@ -176,6 +176,126 @@ def assert_no_secret_output(text, label):
     check("sk-proj-" not in text and "password=hunter2" not in lowered and "api_key=abc" not in lowered, label)
 
 
+
+def test_observability_contract_loader_fails_closed_and_gates_schema():
+    reset()
+    opl = load_cli("observability_contract_loader")
+    contracts_dir = opl.observability_contracts_dir()
+    check(contracts_dir is not None and contracts_dir.is_dir(),
+          "the engine resolves a contained contracts/observability directory")
+    check(opl.OBSERVABILITY_DEFAULT_CONTRACT_ERRORS == [],
+          "the shipped rainman-thorp contract passes the schema gate")
+    contract, errors = opl.load_observability_contract_file(contracts_dir / "rainman-thorp.json")
+    check(not errors and contract.get("project_key") == "rainman-thorp",
+          "the rainman-thorp contract loads with its project_key intact")
+    check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE == "TRUSTED_VERIFIER_NOT_CONFIGURED"
+          and opl.OBSERVABILITY_TRUSTED_VERIFIER_SHA256 == frozenset(),
+          "an empty trusted-sha list derives the unconfigured trust state")
+
+    _, errors = opl.load_observability_contract_file(ROOT / "projects" / "absent-contract.json")
+    check(errors == ["observability_contract_not_registered"],
+          "a missing contract file refuses with the registration error")
+
+    def gate(mutated):
+        return opl.validate_observability_contract(mutated)
+
+    mutated = dict(contract); mutated.pop("metric_names")
+    check(any("missing required key metric_names" in error for error in gate(mutated)),
+          "a contract missing a required enum key is refused (no .get defaults)")
+    mutated = dict(contract); mutated["schema_version"] = 1.0
+    check(any("schema_version must be integer 1" in error for error in gate(mutated)),
+          "a numerically equal float cannot satisfy the integer schema version")
+    mutated = dict(contract); mutated["metric_names"] = []
+    check(any("needs at least" in error for error in gate(mutated)),
+          "an empty required enum fails the cardinality floor")
+    mutated = dict(contract); mutated["event_names"] = ["*", "abc", "tradebot.ok.event"]
+    check(any("quality gate" in error for error in gate(mutated)),
+          "glob or members shorter than four characters fail the member quality gate")
+    mutated = dict(contract)
+    mutated["event_names"] = list(contract["event_names"]) + [contract["event_names"][0]]
+    check(any("must not contain duplicates" in error for error in gate(mutated)),
+          "duplicate enum members are refused")
+    mutated = dict(contract); mutated["trusted_verifier_sha256"] = ["not-a-digest"]
+    check(any("trusted_verifier_sha256" in error for error in gate(mutated)),
+          "a malformed trusted-verifier digest is refused")
+    mutated = dict(contract); mutated["correlation_hash_fields"] = ["field_outside_set"]
+    check(any("subset of correlation_fields" in error for error in gate(mutated)),
+          "hash fields outside correlation_fields are refused")
+
+    mutated = dict(contract); mutated["allowed_modes"] = "SIMULATE_ONLY"
+    check(any("allowed_modes must be a list of strings" in error for error in gate(mutated)),
+          "a scalar enum list is refused without crashing the schema gate")
+    mutated = dict(contract); mutated["event_names"] = [["unhashable"], "tradebot.ok.event"]
+    check(any("event_names must be a list of strings" in error for error in gate(mutated)),
+          "an unhashable enum member is refused without crashing the schema gate")
+
+    qid = "CURRENT_AUTHORIZED_STAGE_AND_MODE"
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_answer_contract"][qid]["fields"]["mode"] = "unchecked_kind"
+    check(any("runbook_answer_contract" in error for error in gate(mutated)),
+          "an unknown runbook fact kind fails closed")
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_evidence_fields"].append("phantom_artifact")
+    mutated["runbook_answer_contract"][qid]["evidence"] = ["phantom_artifact"]
+    check(any("artifact inventory" in error for error in gate(mutated)),
+          "a phantom runbook evidence field outside the receipt inventory is refused")
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_answer_contract"][qid]["evidence"] = ["log_artifact", "log_artifact"]
+    check(any("runbook_answer_contract" in error for error in gate(mutated)),
+          "duplicate runbook evidence references are refused")
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_enum_values"].pop("next_action")
+    check(any("enum facts" in error for error in gate(mutated)),
+          "every enum fact is bound to an exact runbook_enum_values entry")
+
+    mutated = json.loads(json.dumps(contract))
+    mutated["drill_incident"] = {"unrelated": None}
+    check(any("five canonical incident fields" in error for error in gate(mutated)),
+          "a nullable unrelated field cannot erase the drill predicate")
+    for field, malformed in (("event_name", []), ("asset", {})):
+        mutated = json.loads(json.dumps(contract))
+        mutated["drill_incident"][field] = malformed
+        check(any("five canonical incident fields" in error for error in gate(mutated)),
+              f"an unhashable nested drill {field} is refused without crashing")
+    mutated = json.loads(json.dumps(contract)); mutated["drill_alert"]["status"] = "OPEN"
+    check(any("drill_alert" in error for error in gate(mutated)),
+          "FIRED remains an engine-required alert invariant")
+
+    for label, bounds in (
+        ("null lower bound", [None, 1]),
+        ("boolean lower bound", [False, 1]),
+        ("boolean upper bound", [0, True]),
+        ("reversed bounds", [2, 1]),
+    ):
+        mutated = json.loads(json.dumps(contract))
+        mutated["metric_domains"]["tradebot_drawdown_ratio"] = bounds
+        check(any("metric_domains" in error for error in gate(mutated)),
+              f"{label} is refused before metric sample validation")
+
+    oversized = write("projects/oversized-contract.json",
+                      json.dumps(contract) + " " * (opl.OBSERVABILITY_CONTRACT_MAX_BYTES + 1))
+    _, errors = opl.load_observability_contract_file(oversized)
+    check(any("byte limit" in error for error in errors),
+          "an oversized contract file is refused before parsing")
+
+    real = write("projects/real-contract.json", json.dumps(contract))
+    link = ROOT / "projects" / "link-contract.json"
+    link.symlink_to(real)
+    _, errors = opl.load_observability_contract_file(link)
+    check(errors == ["observability contract must not be a symlink"],
+          "a symlinked contract file is refused")
+
+    opl.OBSERVABILITY_DEFAULT_CONTRACT_ERRORS = ["induced load failure"]
+    refusal = opl.validate_observability_runtime_receipt({"schema_version": 1})
+    check(bool(refusal) and refusal[0].startswith("observability_contract_not_registered"),
+          "a broken default contract makes receipt validation refuse outright")
+    refusal = opl._validate_observability_json_artifact(
+        "metric_artifact", ROOT / "projects" / "absent.json", {}
+    )
+    check(bool(refusal) and refusal[0].startswith("observability_contract_not_registered"),
+          "a broken default contract makes artifact validation refuse outright")
+
+
 def _unregistered_test_names(namespace, tests):
     """Return module-level test_* callables missing from an explicit runner list."""
     registered = {getattr(t, "__name__", None) for t in tests}
@@ -7278,6 +7398,7 @@ def main():
         test_canary_selects_relevant_target_in_dirty_registered_checkout,
         test_canary_run_guard_skips_trivial_and_slow_verifiers,
         test_proof_canary_observability_report,
+        test_observability_contract_loader_fails_closed_and_gates_schema,
         test_cohens_kappa_inter_rater_agreement,
         test_fleiss_kappa_multi_rater_agreement,
         test_kappa_reliability_thresholds,
