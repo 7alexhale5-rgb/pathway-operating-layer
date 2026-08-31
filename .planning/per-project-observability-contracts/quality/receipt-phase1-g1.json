@@ -57,7 +57,7 @@
   "artifact_sha256": {
     "contracts/observability/rainman-thorp.json": "1ad3ebe7c5d2f580af955b34ccca8f209d824da6ea352157a699a111aaaf522e",
     "scripts/tests/test_observability_contracts.py": "9dd0b50ae53f8481e711aca64a5483fc4b33e99e1f326365c3f35fa08782dfe6",
-    ".planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py": "5529b3db33812e018256a7a0b76dd28631f587bd7e94accc86487d3585ae0c6f"
+    ".planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py": "628ee639274c4380074bf21b177e7cb7d9fe5205b78976bd754b94bc202dc07a"
   },
   "fidelity": {
     "contract_key_count": 27,

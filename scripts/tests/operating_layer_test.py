@@ -2949,11 +2949,16 @@ def test_tier_calibration_measures_defaults_from_closed_outcomes():
     wi_path = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
     wi_path.parent.mkdir(parents=True, exist_ok=True)
     # 3 closed "live" outcomes (across different projects — tier defs are global): every default
-    # pathway proved EXCEPT docs (always N/A), plus security (NOT in live's default) always proved.
+    # pathway proved EXCEPT docs and release (explicitly N/A), plus security (NOT in live's
+    # default) always proved. Release cannot be represented as proved without a currently
+    # corroborated approval-backed proof row; this calibration fixture is not testing that stack.
     live_default = ["govern", "data", "implementation", "quality", "observability", "release", "docs"]
     rows = []
     for i in range(3):
-        itin = [{"pathway": p, "status": ("na" if p == "docs" else "proved")} for p in live_default]
+        itin = [
+            {"pathway": p, "status": ("na" if p in {"docs", "release"} else "proved")}
+            for p in live_default
+        ]
         itin.append({"pathway": "security", "status": "proved"})
         if i == 0:
             itin.append({"pathway": "security", "status": "proved"})  # duplicate entry — must not double-count
@@ -5424,6 +5429,57 @@ def test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contract
           "the carry-forward builder preserves every explicit empty JSON list without fallback")
 
 
+def test_phase1_g1_verifier_rejects_ambiguous_receipts():
+    """The registered G1 verifier accepts only its exact, unambiguous continuity receipt."""
+    import importlib.util
+
+    reset()
+    verifier_path = (
+        REPO / ".planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py"
+    )
+    spec = importlib.util.spec_from_file_location("phase1_g1_fidelity_verifier", verifier_path)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    receipt_path = (
+        REPO / ".planning/per-project-observability-contracts/quality/receipt-phase1-g1.json"
+    )
+    raw = receipt_path.read_text(encoding="utf-8")
+    contract_sha256 = verifier.sha256_bytes(verifier.CONTRACT_PATH.read_bytes())
+    check(verifier.validate_g1_receipt(receipt_path, contract_sha256) == [],
+          "the canonical G1 receipt passes its strict verifier")
+
+    duplicate = raw.replace(
+        '  "summary": ',
+        '  "summary": "attacker-first-value",\n  "summary": ',
+        1,
+    )
+    nonfinite = raw[:-2] + ',\n  "ambiguous": NaN\n}\n'
+    duplicate_path = write("out/g1-mutants/duplicate.json", duplicate)
+    nonfinite_path = write("out/g1-mutants/nonfinite.json", nonfinite)
+    check(verifier.validate_g1_receipt(duplicate_path, contract_sha256)
+          and verifier.validate_g1_receipt(nonfinite_path, contract_sha256),
+          "duplicate keys and non-finite values fail the G1 verifier closed")
+
+    parsed = json.loads(raw)
+    non_string_path = write(
+        "out/g1-mutants/non-string-list.json",
+        json.dumps({**parsed, "open_decisions": [42]}),
+    )
+    missing_lineage = dict(parsed)
+    missing_lineage.pop("lineage")
+    missing_lineage_path = write(
+        "out/g1-mutants/missing-lineage.json", json.dumps(missing_lineage)
+    )
+    wrong_verification_path = write(
+        "out/g1-mutants/wrong-verification.json",
+        json.dumps({**parsed, "verification": "not a receipt object"}),
+    )
+    check(verifier.validate_g1_receipt(non_string_path, contract_sha256)
+          and verifier.validate_g1_receipt(missing_lineage_path, contract_sha256)
+          and verifier.validate_g1_receipt(wrong_verification_path, contract_sha256),
+          "malformed carry-forward, lineage, and verification fields cannot earn G1 credit")
+
+
 def test_audit_proof_integrity_uses_active_outcomes_and_reports_history():
     opl = load_cli("audit_proof_scope")
     active = {"work_id": "active", "verifier_strength": "executed", "exit_code": 0, "trivial_verifier": False, "canary_mutant_failed": None, "result": "pass"}
@@ -7035,6 +7091,11 @@ def test_approval_authority_single_use_waiver_and_release_credit():
           and corrected_later_baton.get("invalidated_release_proof_id")
           == historical_release.get("proof_id"),
           "release invalidation overlays a later baton without clobbering its continuity fields")
+    visible_overlay = opl.carry_forward_effect(corrected_later_baton, "release")
+    check(later_docs["summary"] in visible_overlay
+          and corrected_later_baton["release_approval_summary"] in visible_overlay
+          and corrected_later_baton["release_approval_do_not_do_yet"][0] in visible_overlay,
+          "a later docs baton stays primary while its release hold is operator-visible")
 
     invalidated_ledger_bytes = approvals_path.read_bytes()
     proof_rows = [
@@ -7250,6 +7311,103 @@ def test_production_secure_closed_view_rechecks_current_readiness():
     )
     check(persisted.get("status") == "closed",
           "current-view correction preserves the append-only historical close")
+
+
+def test_live_closed_view_reopens_when_release_proof_is_missing():
+    """A user-writable proof deletion cannot preserve cached release authority at live tier."""
+    opl = load_cli("live_release_proof_deletion")
+    reset()
+    proj = ROOT / "projects" / "live-release-proof-deletion-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "ship an internal live workflow",
+        "--tier", "live",
+    ])
+    wid = started["work_id"]
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+    items = [
+        json.loads(line)
+        for line in work_items_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    target = next(item for item in items if item.get("work_id") == wid)
+    target["status"] = "closed"
+    target["closed_at"] = "2026-08-31T00:00:00Z"
+    for entry in target["itinerary"]:
+        entry["status"] = "proved"
+        entry["proved_by_run"] = f"R-deleted-{entry['pathway']}"
+    work_items_path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in items),
+        encoding="utf-8",
+    )
+
+    # Preserve the stronger adversarial shape too: the root/user test ledger still records an
+    # invalidated consumed release ticket, while the same-user proof row it named is gone.
+    subject = opl.release_approval_subject(wid, proj.name, "a" * 64)
+    digest = opl.approval_subject_digest(subject)
+    approvals_path = ROOT / "out/operator-intelligence/approvals.ndjson"
+    approval_events = [
+        {
+            "event": "issued", "kind": opl.APPROVAL_KIND_RELEASE,
+            "subject_digest": digest, "ticket_id": "AT-111111111111",
+            "subject": subject, "issued_at": "2026-08-31T00:00:00Z",
+            "expires_at": "2026-08-31T00:15:00Z", "reason": "reviewed release",
+            "work_id": wid, "issued_by": "fixture-human",
+        },
+        {
+            "event": "consumed", "kind": opl.APPROVAL_KIND_RELEASE,
+            "subject_digest": digest, "ticket_id": "AT-111111111111",
+            "at": "2026-08-31T00:01:00Z", "work_id": wid, "pathway": "release",
+            "consumed_by": "P-deleted-release-proof", "consumption_id": "AC-222222222222",
+        },
+        {
+            "event": "invalidated", "kind": opl.APPROVAL_KIND_RELEASE,
+            "subject_digest": digest, "ticket_id": "AT-111111111111",
+            "at": "2026-08-31T00:02:00Z", "work_id": wid,
+            "reason": "compromised approval", "invalidated_by": "fixture-human",
+            "invalidation_id": "AI-333333333333",
+        },
+    ]
+    approvals_path.parent.mkdir(parents=True, exist_ok=True)
+    approvals_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in approval_events),
+        encoding="utf-8",
+    )
+
+    status, status_proc = run("work-status", ["--work-id", wid])
+    current = status["summary"]["work_item"]
+    release_entry = next(
+        entry for entry in status["summary"]["itinerary"]
+        if entry.get("pathway") == "release"
+    )
+    check(status_proc.returncode == 0
+          and release_entry.get("status") == "required"
+          and status["summary"]["closeout_readiness"] == "not_ready"
+          and current.get("status") == "active"
+          and current.get("persisted_status") == "closed"
+          and current.get("current_status_reason") == "release_proof_missing",
+          "a missing live-tier release proof reopens cached credit and the closed current view")
+    valid_ledger = approvals_path.read_bytes()
+    approvals_path.write_bytes(valid_ledger + b'{"event":"invalidated"')
+    invalid_status, invalid_status_proc = run("work-status", ["--work-id", wid])
+    invalid_current = invalid_status["summary"]["work_item"]
+    check(invalid_status_proc.returncode == 0
+          and invalid_status["summary"]["closeout_readiness"] == "not_ready"
+          and invalid_current.get("status") == "active"
+          and invalid_current.get("current_status_reason") == "approval_ledger_invalid",
+          "proof deletion plus an invalid authority ledger still reopens a live closed view")
+    approvals_path.write_bytes(valid_ledger)
+    persisted = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted.get("status") == "closed",
+          "missing-proof projection preserves the append-only historical close")
 
 
 def test_approval_invalidation_revokes_exact_ticket_credit():
@@ -8319,6 +8477,7 @@ def main():
         test_approval_ledger_strict_reader_and_authority_refusal_exit_codes,
         test_approval_authority_single_use_waiver_and_release_credit,
         test_production_secure_closed_view_rechecks_current_readiness,
+        test_live_closed_view_reopens_when_release_proof_is_missing,
         test_approval_invalidation_revokes_exact_ticket_credit,
         test_release_provider_action_consumes_approval_without_release_credit,
         test_approval_authority_survives_review_findings,
@@ -8354,6 +8513,7 @@ def main():
         test_observability_proof_revalidates_receipt_freshness_after_canaries,
         test_observability_proof_rejects_mid_verification_artifact_mutation,
         test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts,
+        test_phase1_g1_verifier_rejects_ambiguous_receipts,
         test_audit_proof_integrity_uses_active_outcomes_and_reports_history,
         test_canary_mutant_is_symlink_safe,
         test_canary_explicit_target_rejects_outside_and_unchanged_files,

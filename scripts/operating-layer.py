@@ -4511,6 +4511,33 @@ def latest_carry_forward_for_work(paths, work_id):
     return corrected
 
 
+def release_carry_forward_overlay(carry_forward):
+    """Render the namespaced release hold without replacing a later pathway's own baton."""
+    carry_forward = carry_forward if isinstance(carry_forward, dict) else {}
+    if carry_forward.get("release_credit_current") is not False:
+        return ""
+    raw_summary = carry_forward.get("release_approval_summary")
+    summary = raw_summary.strip() if isinstance(raw_summary, str) else ""
+
+    def string_items(value):
+        if not isinstance(value, list):
+            return []
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+    next_steps = "; ".join(string_items(
+        carry_forward.get("release_approval_next_pathway_must_use")
+    )[:2])
+    holds = "; ".join(string_items(
+        carry_forward.get("release_approval_do_not_do_yet")
+    )[:2])
+    pieces = [summary]
+    if next_steps:
+        pieces.append(f"Required: {next_steps}")
+    if holds:
+        pieces.append(f"Hold: {holds}")
+    return " ".join(piece for piece in pieces if piece)
+
+
 def carry_forward_effect(carry_forward, recommended_pathway):
     if not carry_forward:
         return "No prior carry-forward record exists for this active work item yet."
@@ -4519,10 +4546,14 @@ def carry_forward_effect(carry_forward, recommended_pathway):
     overlays = ", ".join(carry_forward.get("active_risk_overlays", [])[:4])
     changed_part = f" It changed: {changed}." if changed else ""
     overlay_part = f" Active overlays remain: {overlays}." if overlays else ""
-    return (
+    effect = (
         f"Latest `{carry_forward.get('pathway')}` output says: {carry_forward.get('summary')} "
         f"{changed_part}{overlay_part} Therefore `{recommended_pathway}` must use: {must_use}."
     )
+    release_overlay = release_carry_forward_overlay(carry_forward)
+    if release_overlay:
+        effect += f" Release approval overlay: {release_overlay}"
+    return effect
 
 
 def pathways_referenced_by_text(text):
@@ -7676,7 +7707,10 @@ def work_status_summary(paths, work_id, approval_events_override=None):
             unsupported_proved = (
                 entry.get("status") == "proved"
                 and pathway not in proved_pathway_map
-                and (production_secure or recorded_receipt)
+                # Release is always an approval-backed current-state claim. Unlike ordinary
+                # legacy/manual coverage, a persisted release label cannot survive deletion of
+                # the proof row that binds it to the authority ledger.
+                and (production_secure or recorded_receipt or pathway == "release")
             )
             waived = waiver_corroborated(entry, item, approval_events)
             if (production_secure and entry.get("status") == "na" and not waived) or unsupported_proved:
@@ -7733,6 +7767,13 @@ def current_work_item_view(paths, item, summary=None, approval_events=None):
     if not work_id:
         return item, summary
     events = approval_events if approval_events is not None else approval_events_for(paths)
+    proof_records = read_ndjson(paths.proofs_path)
+    persisted_release_proved = any(
+        isinstance(entry, dict)
+        and entry.get("pathway") == "release"
+        and entry.get("status") == "proved"
+        for entry in item.get("itinerary", [])
+    )
     if not approval_events_valid(events):
         has_waiver_claim = any(
             isinstance(entry, dict)
@@ -7746,7 +7787,7 @@ def current_work_item_view(paths, item, summary=None, approval_events=None):
                 proof.get("release_approval_digest")
                 or proof.get("release_approval_consumed_id")
             )
-            for proof in read_ndjson(paths.proofs_path)
+            for proof in proof_records
         )
         current_summary = summary or work_status_summary(
             paths, work_id, approval_events_override=events
@@ -7756,6 +7797,7 @@ def current_work_item_view(paths, item, summary=None, approval_events=None):
         if not (
             has_waiver_claim
             or has_release_claim
+            or persisted_release_proved
             or production_secure_waiver_locked(item)
         ):
             return item, current_summary
@@ -7764,11 +7806,48 @@ def current_work_item_view(paths, item, summary=None, approval_events=None):
             "persisted_status": "closed",
             "status": "active",
             "current_status": "active",
-            "current_status_reason": (
-                "approval_ledger_invalid"
-                if has_waiver_claim or has_release_claim
-                else "production_secure_not_ready"
+                "current_status_reason": (
+                    "approval_ledger_invalid"
+                    if has_waiver_claim or has_release_claim or persisted_release_proved
+                    else "production_secure_not_ready"
+                ),
+        })
+        current_summary = dict(current_summary)
+        current_summary["work_item"] = current_view
+        return current_view, current_summary
+
+    # A release `proved` label is a cached projection of a currently corroborated proof, never
+    # durable authority by itself. If the user-writable proof ledger loses that row, reopening must
+    # not depend on finding approval fields in the now-missing row: otherwise deleting the claim
+    # hides both the proof loss and any OS-ledger invalidation that followed it.
+    current_release_proofs = [
+        proof for proof in proof_records
+        if proof.get("work_id") == work_id and proof.get("pathway") == "release"
+    ]
+    if persisted_release_proved and not any(
+            proof_credits_pathway(proof, events) for proof in current_release_proofs):
+        current_summary = summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        referenced_proof_ids = {
+            entry.get("proved_by_run")
+            for entry in item.get("itinerary", [])
+            if isinstance(entry, dict) and entry.get("pathway") == "release"
+        }
+        release_proof = next(
+            (
+                proof for proof in reversed(current_release_proofs)
+                if proof.get("run_id") in referenced_proof_ids
+                or proof.get("proof_id") in referenced_proof_ids
             ),
+            current_release_proofs[-1] if current_release_proofs else None,
+        )
+        current_view = dict(item)
+        current_view.update({
+            "persisted_status": "closed",
+            "status": "active",
+            "current_status": "active",
+            "current_status_reason": release_approval_failure_state(release_proof, events),
         })
         current_summary = dict(current_summary)
         current_summary["work_item"] = current_view
@@ -7850,7 +7929,7 @@ def current_work_item_view(paths, item, summary=None, approval_events=None):
                 proof.get("release_approval_digest"),
                 proof.get("release_approval_consumed_id"),
             )
-            for proof in read_ndjson(paths.proofs_path)
+            for proof in proof_records
         )
     if not has_uncorroborated_claim:
         if not production_secure_waiver_locked(item):
@@ -8856,9 +8935,19 @@ def run_work_status(args, paths):
             )],
             "records": [],
         }
+    # Keep the append-only ledger row for current-view causality. The summary deliberately
+    # recomputes cached itinerary states, so passing its projected item would erase the historical
+    # `release: proved` marker before current_work_item_view can detect a deleted release proof.
+    persisted_item = next(
+        (
+            item for item in read_ndjson(paths.work_items_path)
+            if item.get("work_id") == args.work_id
+        ),
+        None,
+    )
     summary = work_status_summary(paths, args.work_id)
     current_item, current_summary = current_work_item_view(
-        paths, summary.get("work_item"), summary=summary
+        paths, persisted_item or summary.get("work_item"), summary=summary
     )
     if current_item is not None and current_summary is not None:
         summary = current_summary
@@ -9757,6 +9846,7 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
     confidence = confidence or recommendation_confidence(ranked, has_context, trust)
     if blocked_on_deferred:
         cf = latest_carry_forward or {}
+        release_overlay = release_carry_forward_overlay(cf)
         open_decisions = cf.get("open_decisions", []) or []
         do_not_do_yet = cf.get("do_not_do_yet", []) or []
         next_requirements = cf.get("next_pathway_must_use", []) or []
@@ -9778,6 +9868,7 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
             f"- Outcome: `{cf.get('pathway_outcome', '')}`",
             f"- Credits pathway: `{str(bool(cf.get('credits_pathway'))).lower()}`",
             f"- Continuity effect: {carry_forward_note}",
+            *([f"- Release approval overlay: {release_overlay}"] if release_overlay else []),
             "",
             "## Requirements to resolve",
             "",
@@ -9863,6 +9954,7 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
         lines += ["", "Missing evidence:"]
         lines.extend(f"- {item}" for item in missing)
     cf = latest_carry_forward or {}
+    release_overlay = release_carry_forward_overlay(cf)
     lines += [
         "",
         "## What Previous Work Changed",
@@ -9880,6 +9972,8 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
             f"- **Open decisions:** {'; '.join(cf.get('open_decisions', [])[:3]) or '—'}",
             f"- **Active risk overlays:** {', '.join(cf.get('active_risk_overlays', [])[:6]) or '—'}",
         ]
+        if release_overlay:
+            lines.append(f"- **Release approval overlay:** {release_overlay}")
     if autonomy:
         lines += [
             "",
