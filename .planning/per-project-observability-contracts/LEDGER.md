@@ -30,10 +30,34 @@ Done against the shared work ID:
   `P-b9e7466dbdcd` / data-004 and `P-99265a126957` / data-005 remain audit
   history; data-005 predates the final canonical-count correction and does not
   supersede data-006.
+- Phase 2 — project resolution and G2 are complete locally. The engine derives
+  the contract key only from the work item's canonical path relative to
+  `projects_root` (including owner family), refuses missing, mismatched,
+  traversing, dotted-name-colliding, or symlink-directed identities, and never
+  reads a receipt-supplied contract selector. Unknown observability work IDs
+  now hard-refuse before run/proof construction. Runtime validation consumes
+  one immutable resolved contract state; verifier source trust is checked
+  before any subprocess; the proof records contract key/path/schema/pre+post
+  SHA; and the post-run rehash plus historical bound-contract check reject
+  TOCTOU. Credit-scope classification is pure over the already validated
+  result. Reviewer follow-up closed four additional edges: the live
+  `/Projects/tradebot` identity maps through an engine-owned, namespace-reserved
+  `tradebot -> rainman-thorp` compatibility alias (the distinct native
+  `rainman-thorp` project is refused); contract semantics and SHA now come from
+  one captured byte snapshot; verifier bytes are rechecked against both receipt
+  and allowlist immediately before every subprocess and recorded/rehashed in
+  the proof; and all mutable contract fixtures use an injected temp root under
+  the suite's atexit-cleaned test tree. G2 and adversarial checks include
+  no-side-effect sentinels, dotted-name E2E resolution, and historical contract
+  invalidation and full-ledger no-write checks for unknown work IDs.
+  Verification: frozen Phase 1 characterization 5/5 exact; Phase 1 AST
+  fidelity 24/24; canonical suite 1343/1343. The corrected diff passed
+  independent re-review with no remaining P0, P1, or P2 finding.
 
-Next: Phase 2 (resolve by project, G2), Phase 3 (agents contract, G3 =
-observability proof), and Phase 4 (docs). The extracted Phase 1 contract and the
-separate approval-authority repair are already preserved in distinct commits.
+Next: Phase 3 (agents contract, G3 = observability proof), then Phase 4 (docs).
+The extracted Phase 1 contract and the separate approval-authority repair are
+already preserved in distinct commits. Phase 2 lands in the same local commit
+as this ledger update.
 
 Decision at G1: Phase 1 preserves `trusted_verifier_sha256` in the contract
 verbatim because extraction fidelity is the goal. Moving the trust root is a

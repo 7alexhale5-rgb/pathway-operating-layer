@@ -29,6 +29,7 @@ import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 
 # Portable defaults — derived from $HOME (and overridable by env), never a hardcoded username, so
@@ -1529,8 +1530,8 @@ OBSERVABILITY_MAX_FUTURE_SKEW_SECONDS = 300
 OBSERVABILITY_MAX_OBSERVATION_WINDOW_SECONDS = 300
 OBSERVABILITY_MAX_JSON_BYTES = 5_000_000
 OBSERVABILITY_MAX_ABS_METRIC_VALUE = 10 ** 100
-def _read_strict_json_object(path, label="observability companion"):
-    """Read a JSON object while rejecting duplicate keys and non-finite numbers."""
+def _parse_strict_json_object_bytes(raw, label="observability companion", max_bytes=None):
+    """Parse one captured byte snapshot, rejecting duplicates and non-finite numbers."""
     duplicates = []
 
     def unique_object(pairs):
@@ -1551,13 +1552,9 @@ def _read_strict_json_object(path, label="observability companion"):
             raise ValueError(f"non-finite number {value}")
         return number
 
-    try:
-        with open(path, "rb") as fh:
-            raw = fh.read(OBSERVABILITY_MAX_JSON_BYTES + 1)
-    except OSError as exc:
-        return {}, [f"{label} could not be read: {exc}"]
-    if len(raw) > OBSERVABILITY_MAX_JSON_BYTES:
-        return {}, [f"{label} exceeds the {OBSERVABILITY_MAX_JSON_BYTES}-byte limit"]
+    limit = OBSERVABILITY_MAX_JSON_BYTES if max_bytes is None else max_bytes
+    if len(raw) > limit:
+        return {}, [f"{label} exceeds the {limit}-byte limit"]
     try:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -1576,6 +1573,16 @@ def _read_strict_json_object(path, label="observability companion"):
         errors.append(f"{label} must be a JSON object")
         data = {}
     return data, errors
+
+
+def _read_strict_json_object(path, label="observability companion"):
+    """Read a JSON object while rejecting duplicate keys and non-finite numbers."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(OBSERVABILITY_MAX_JSON_BYTES + 1)
+    except OSError as exc:
+        return {}, [f"{label} could not be read: {exc}"]
+    return _parse_strict_json_object_bytes(raw, label)
 
 
 # ---------------------------------------------------------------------------
@@ -1618,15 +1625,20 @@ OBSERVABILITY_CONTRACT_ENUM_FLOORS = {
 }
 
 
-def observability_contracts_dir():
+def observability_contracts_dir(contract_root=None):
     """Engine-owned contracts root, realpath-contained inside this repo.
 
     Resolves through symlinks (including a symlinked contracts/ directory)
     and refuses any resolution that escapes the repo root, per threat T4.
     """
     repo_root = Path(__file__).resolve().parent.parent
-    contracts_dir = (repo_root / "contracts" / "observability").resolve()
-    if contracts_dir != repo_root / "contracts" / "observability":
+    configured = (
+        Path(contract_root).expanduser().absolute()
+        if contract_root is not None
+        else repo_root / "contracts" / "observability"
+    )
+    contracts_dir = configured.resolve()
+    if contracts_dir != configured:
         return None
     return contracts_dir
 
@@ -1815,33 +1827,157 @@ def validate_observability_contract(contract):
     return errors
 
 
-def load_observability_contract_file(contract_path):
-    """Load + schema-gate one contract file. Returns (contract, errors), fail-closed."""
+def load_observability_contract_snapshot(contract_path):
+    """Load, parse, and hash one exact contract byte snapshot, fail closed."""
     contract_path = Path(contract_path)
     if contract_path.is_symlink():
-        return {}, ["observability contract must not be a symlink"]
+        return {}, ["observability contract must not be a symlink"], ""
     if not contract_path.is_file():
-        return {}, ["observability_contract_not_registered"]
+        return {}, ["observability_contract_not_registered"], ""
     try:
-        if contract_path.stat().st_size > OBSERVABILITY_CONTRACT_MAX_BYTES:
-            return {}, [
-                f"observability contract exceeds the {OBSERVABILITY_CONTRACT_MAX_BYTES}-byte limit"
-            ]
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(contract_path, flags)
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return {}, ["observability contract must be a regular file"], ""
+            raw = fh.read(OBSERVABILITY_CONTRACT_MAX_BYTES + 1)
     except OSError:
-        return {}, ["observability contract is unreadable"]
-    contract, errors = _read_strict_json_object(contract_path, "observability contract")
+        return {}, ["observability contract is unreadable"], ""
+    contract, errors = _parse_strict_json_object_bytes(
+        raw, "observability contract", OBSERVABILITY_CONTRACT_MAX_BYTES)
     if errors:
-        return {}, errors
+        return {}, errors, ""
     errors = validate_observability_contract(contract)
     if errors:
-        return {}, errors
-    return contract, []
+        return {}, errors, ""
+    return contract, [], hashlib.sha256(raw).hexdigest()
 
 
-_OBSERVABILITY_DEFAULT_CONTRACT, OBSERVABILITY_DEFAULT_CONTRACT_ERRORS = (
-    load_observability_contract_file(observability_contracts_dir() / "rainman-thorp.json")
+def load_observability_contract_file(contract_path):
+    """Compatibility wrapper returning the schema-gated contract and errors."""
+    contract, errors, _digest = load_observability_contract_snapshot(contract_path)
+    return contract, errors
+
+
+def observability_project_key(project_path, projects_root=None):
+    """Return the canonical projects-root-relative identity, including owner family."""
+    root = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser().resolve()
+    resolved = Path(resolve_project_dir(project_path, root)).expanduser()
+    try:
+        resolved = resolved.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return "", ["observability project must resolve inside the canonical projects root"]
+    if (not relative.parts or any(
+            part in {"", ".", ".."} or part.startswith(("_", "."))
+            for part in relative.parts)):
+        return "", ["observability project key is not a canonical project path"]
+    return relative.as_posix(), []
+
+
+OBSERVABILITY_PROJECT_CONTRACT_ALIASES = MappingProxyType({
+    # The live work item and checkout are /Projects/tradebot; Phase 1 preserved
+    # the pre-existing Rainman/Thorp contract filename and project_key verbatim.
+    "tradebot": "rainman-thorp",
+})
+
+
+def _observability_contract_state(
+        contract, errors=(), path="", key="", digest="", project_key=""):
+    """Compile validated contract data into one read-only state passed through validation."""
+    contract = contract if isinstance(contract, dict) else {}
+    answer_contract = {
+        question_id: MappingProxyType({
+            "fields": MappingProxyType(dict(entry["fields"])),
+            "evidence": tuple(entry["evidence"]),
+        })
+        for question_id, entry in (contract.get("runbook_answer_contract") or {}).items()
+    }
+    values = {
+        "errors": tuple(errors),
+        "path": str(path or ""),
+        "key": str(key or contract.get("project_key") or ""),
+        "project_key": str(project_key or key or contract.get("project_key") or ""),
+        "sha256": str(digest or ""),
+        "schema_version": contract.get("schema_version"),
+        "metric_names": frozenset(contract.get("metric_names") or []),
+        "metric_label_values": MappingProxyType({
+            name: MappingProxyType({label: frozenset(members) for label, members in entry.items()})
+            for name, entry in (contract.get("metric_label_values") or {}).items()
+        }),
+        "metric_domains": MappingProxyType({
+            name: tuple(bounds) for name, bounds in (contract.get("metric_domains") or {}).items()
+        }),
+        "event_names": frozenset(contract.get("event_names") or []),
+        "correlation_fields": frozenset(contract.get("correlation_fields") or []),
+        "correlation_hash_fields": frozenset(contract.get("correlation_hash_fields") or []),
+        "correlation_timestamp_fields": frozenset(
+            contract.get("correlation_timestamp_fields") or []),
+        "correlation_sequence_fields": frozenset(
+            contract.get("correlation_sequence_fields") or []),
+        "allowed_assets": frozenset(contract.get("allowed_assets") or []),
+        "allowed_modes": frozenset(contract.get("allowed_modes") or []),
+        "allowed_risk_decisions": frozenset(contract.get("allowed_risk_decisions") or []),
+        "allowed_reason_codes": frozenset(contract.get("allowed_reason_codes") or []),
+        "drill_incident": MappingProxyType(dict(contract.get("drill_incident") or {})),
+        "drill_trace_name": str(contract.get("drill_trace_name") or ""),
+        "drill_alert": MappingProxyType(dict(contract.get("drill_alert") or {})),
+        "runbook_question_ids": frozenset(contract.get("runbook_question_ids") or []),
+        "runbook_evidence_fields": frozenset(contract.get("runbook_evidence_fields") or []),
+        "runbook_dispositions": frozenset(contract.get("runbook_dispositions") or []),
+        "runbook_answer_codes": MappingProxyType(dict(contract.get("runbook_answer_codes") or {})),
+        "runbook_enum_values": MappingProxyType({
+            field: frozenset(members)
+            for field, members in (contract.get("runbook_enum_values") or {}).items()
+        }),
+        "runbook_missing_evidence": frozenset(contract.get("runbook_missing_evidence") or []),
+        "runbook_answer_contract": MappingProxyType(answer_contract),
+        "trusted_verifier_sha256": frozenset(contract.get("trusted_verifier_sha256") or []),
+    }
+    return MappingProxyType(values)
+
+
+def resolve_observability_contract(project_path, projects_root=None, contract_root=None):
+    """Resolve exactly one project-owned contract without consulting receipt-controlled data."""
+    project_key, key_errors = observability_project_key(project_path, projects_root)
+    reserved_alias_targets = set(OBSERVABILITY_PROJECT_CONTRACT_ALIASES.values())
+    if (not key_errors and project_key in reserved_alias_targets
+            and project_key not in OBSERVABILITY_PROJECT_CONTRACT_ALIASES):
+        key_errors = [
+            "observability contract key is reserved for an explicit compatibility alias"
+        ]
+    key = OBSERVABILITY_PROJECT_CONTRACT_ALIASES.get(project_key, project_key)
+    root = observability_contracts_dir(contract_root)
+    if key_errors or root is None:
+        errors = key_errors or ["observability contracts directory escapes the repo root"]
+        return _observability_contract_state(
+            {}, errors=errors, key=key, project_key=project_key)
+    parts = key.split("/")
+    candidate = root.joinpath(*parts[:-1], f"{parts[-1]}.json")
+    try:
+        resolved_parent = candidate.parent.resolve()
+        resolved_parent.relative_to(root)
+    except (OSError, ValueError):
+        return _observability_contract_state(
+            {}, errors=["observability contract path escapes the contracts root"],
+            key=key, project_key=project_key)
+    if resolved_parent != candidate.parent:
+        return _observability_contract_state(
+            {}, errors=["observability contract path must not contain symlink directories"],
+            key=key, project_key=project_key)
+    contract, errors, digest = load_observability_contract_snapshot(candidate)
+    if not errors and contract.get("project_key") != key:
+        errors = ["observability contract project_key does not match the canonical project path"]
+        contract = {}
+    return _observability_contract_state(
+        contract, errors=errors, path=str(candidate), key=key, digest=digest,
+        project_key=project_key)
+
+
+_OBSERVABILITY_DEFAULT_CONTRACT, OBSERVABILITY_DEFAULT_CONTRACT_ERRORS, _OBSERVABILITY_DEFAULT_SHA256 = (
+    load_observability_contract_snapshot(observability_contracts_dir() / "rainman-thorp.json")
     if observability_contracts_dir() is not None
-    else ({}, ["observability contracts directory escapes the repo root"])
+    else ({}, ["observability contracts directory escapes the repo root"], "")
 )
 
 if OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
@@ -1936,6 +2072,13 @@ OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE = (
     if OBSERVABILITY_TRUSTED_VERIFIER_SHA256 and not OBSERVABILITY_DEFAULT_CONTRACT_ERRORS
     else "TRUSTED_VERIFIER_NOT_CONFIGURED"
 )
+_OBSERVABILITY_DEFAULT_STATE = _observability_contract_state(
+    _OBSERVABILITY_DEFAULT_CONTRACT,
+    errors=OBSERVABILITY_DEFAULT_CONTRACT_ERRORS,
+    path=str((observability_contracts_dir() or Path()) / "rainman-thorp.json"),
+    key="rainman-thorp",
+    digest=_OBSERVABILITY_DEFAULT_SHA256,
+)
 
 
 def validate_pre_runtime_observability(envelope, expected=None):
@@ -2024,35 +2167,37 @@ def _finite_observability_metric_value(value):
     return abs(value) <= OBSERVABILITY_MAX_ABS_METRIC_VALUE
 
 
-def _valid_observability_metric_sample(item):
-    if not isinstance(item, dict) or item.get("name") not in OBSERVABILITY_METRIC_NAMES:
+def _valid_observability_metric_sample(item, contract_state=None):
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
+    if not isinstance(item, dict) or item.get("name") not in state["metric_names"]:
         return False
     value = item.get("value")
     labels = item.get("labels")
-    allowed_labels = OBSERVABILITY_METRIC_LABEL_VALUES[item["name"]]
+    allowed_labels = state["metric_label_values"][item["name"]]
     if (not _finite_observability_metric_value(value) or not isinstance(labels, dict)
             or set(labels) != set(allowed_labels)
             or any(not isinstance(labels[key], str) or labels[key] not in allowed_labels[key]
                    for key in allowed_labels)):
         return False
-    minimum, maximum = OBSERVABILITY_METRIC_DOMAINS[item["name"]]
+    minimum, maximum = state["metric_domains"][item["name"]]
     return value >= minimum and (maximum is None or value <= maximum)
 
 
-def _valid_observability_correlation_record(record):
+def _valid_observability_correlation_record(record, contract_state=None):
     """Require typed, usable correlation values instead of merely present JSON keys."""
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
     if (not isinstance(record, dict)
-            or record.get("event_name") not in OBSERVABILITY_EVENT_NAMES):
+            or record.get("event_name") not in state["event_names"]):
         return False
-    for key in OBSERVABILITY_CORRELATION_FIELDS:
+    for key in state["correlation_fields"]:
         value = record.get(key)
-        if key in OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS:
+        if key in state["correlation_sequence_fields"]:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 return False
-        elif key in OBSERVABILITY_CORRELATION_HASH_FIELDS:
+        elif key in state["correlation_hash_fields"]:
             if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
                 return False
-        elif key in OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS:
+        elif key in state["correlation_timestamp_fields"]:
             if (not isinstance(value, str)
                     or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value)
                     or parse_ts(value) is None):
@@ -2060,40 +2205,41 @@ def _valid_observability_correlation_record(record):
         elif key == "trace_id":
             if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
                 return False
-        elif key == "asset" and value not in OBSERVABILITY_ALLOWED_ASSETS:
+        elif key == "asset" and value not in state["allowed_assets"]:
             return False
-        elif key == "mode" and value not in OBSERVABILITY_ALLOWED_MODES:
+        elif key == "mode" and value not in state["allowed_modes"]:
             return False
-        elif key == "risk_decision" and value not in OBSERVABILITY_ALLOWED_RISK_DECISIONS:
+        elif key == "risk_decision" and value not in state["allowed_risk_decisions"]:
             return False
-        elif key == "reason_code" and value not in OBSERVABILITY_ALLOWED_REASON_CODES:
+        elif key == "reason_code" and value not in state["allowed_reason_codes"]:
             return False
         elif not _nonempty_string(value):
             return False
     return True
 
 
-def _valid_observability_drill_answer(answer):
+def _valid_observability_drill_answer(answer, contract_state=None):
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
     if not isinstance(answer, dict):
         return False
     question_id = answer.get("question_id")
     evidence_refs = answer.get("evidence_refs")
-    contract = OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT.get(question_id)
+    contract = state["runbook_answer_contract"].get(question_id)
     facts = answer.get("facts")
-    if (not contract or answer.get("answer") != OBSERVABILITY_RUNBOOK_ANSWER_CODES.get(question_id)
+    if (not contract or answer.get("answer") != state["runbook_answer_codes"].get(question_id)
             or not isinstance(facts, dict) or set(facts) != set(contract["fields"])):
         return False
     for field, kind in contract["fields"].items():
         value = facts.get(field)
         if kind == "stage" and value not in OBSERVABILITY_ALLOWED_STAGES:
             return False
-        if kind == "mode" and value not in OBSERVABILITY_ALLOWED_MODES:
+        if kind == "mode" and value not in state["allowed_modes"]:
             return False
         if (kind == "identifier"
                 and (not isinstance(value, str)
                      or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,127}", value))):
             return False
-        if kind == "enum" and value not in OBSERVABILITY_RUNBOOK_ENUM_VALUES[field]:
+        if kind == "enum" and value not in state["runbook_enum_values"][field]:
             return False
         if kind == "sha256" and not _is_sha256_digest(value):
             return False
@@ -2106,27 +2252,28 @@ def _valid_observability_drill_answer(answer):
             return False
         if (kind == "evidence_list"
                 and (not isinstance(value, list) or len(value) != len(set(value))
-                     or not value or not set(value).issubset(OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE))):
+                     or not value or not set(value).issubset(state["runbook_missing_evidence"]))):
             return False
     return (
         isinstance(evidence_refs, list)
         and len(evidence_refs) == len(set(evidence_refs))
         and set(evidence_refs) == set(contract["evidence"])
-        and all(ref in OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS for ref in evidence_refs)
+        and all(ref in state["runbook_evidence_fields"] for ref in evidence_refs)
     )
 
 
 def _validate_observability_drill_correlations(
-        runbook, log_artifact, trace_artifact, alert_artifact, receipt):
+        runbook, log_artifact, trace_artifact, alert_artifact, receipt, contract_state=None):
     """Bind every frozen drill answer to one correlated synthetic incident record."""
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
     answers = {
         item.get("question_id"): item
         for item in (runbook.get("answered_questions") or [])
         if isinstance(item, dict)
     } if isinstance(runbook, dict) else {}
     records = log_artifact.get("records") if isinstance(log_artifact, dict) else None
-    if (set(answers) != OBSERVABILITY_RUNBOOK_QUESTION_IDS
-            or not all(_valid_observability_drill_answer(answer) for answer in answers.values())
+    if (set(answers) != state["runbook_question_ids"]
+            or not all(_valid_observability_drill_answer(answer, state) for answer in answers.values())
             or not isinstance(records, list)):
         return ["runbook drill cannot be correlated to the structured incident record"]
 
@@ -2147,7 +2294,7 @@ def _validate_observability_drill_correlations(
         if (
         isinstance(record, dict)
         and all(record.get(field) == value for field, value in match_fields.items())
-        and all(record.get(field) == value for field, value in OBSERVABILITY_DRILL_INCIDENT.items())
+        and all(record.get(field) == value for field, value in state["drill_incident"].items())
         )
     ]
     private_feed = parse_ts(timestamps.get("private_feed_timestamp"))
@@ -2160,7 +2307,7 @@ def _validate_observability_drill_correlations(
     if (not isinstance(spans, list)
             or not any(
                 isinstance(span, dict)
-                and span.get("name") == OBSERVABILITY_DRILL_TRACE_NAME
+                and span.get("name") == state["drill_trace_name"]
                 and span.get("trace_id") in incident_trace_ids
                 for span in spans
             )):
@@ -2170,7 +2317,7 @@ def _validate_observability_drill_correlations(
             or not any(
                 isinstance(execution, dict)
                 and all(execution.get(field) == value
-                        for field, value in OBSERVABILITY_DRILL_ALERT.items())
+                        for field, value in state["drill_alert"].items())
                 for execution in executions
             )):
         errors.append("runbook drill requires the canonical fired stale-feed alert")
@@ -2181,12 +2328,19 @@ def _validate_observability_drill_correlations(
     return errors
 
 
-def _validate_observability_json_artifact(field, artifact, receipt, now=None):
+def _validate_observability_json_artifact(
+        field, artifact, receipt, now=None, contract_state=None):
     """Validate one typed, nontrivial runtime evidence artifact."""
-    if OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
+    if contract_state is None and OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
         return [
             "observability_contract_not_registered: "
             + "; ".join(OBSERVABILITY_DEFAULT_CONTRACT_ERRORS[:3])
+        ]
+    if state["errors"]:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(state["errors"][:3])
         ]
     errors = []
     data, parse_errors = _read_strict_json_object(artifact, field)
@@ -2222,10 +2376,10 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
         } if isinstance(samples, list) else set()
         valid_samples = (
             isinstance(samples, list) and bool(samples)
-            and all(_valid_observability_metric_sample(item) for item in samples)
+            and all(_valid_observability_metric_sample(item, state) for item in samples)
         )
         if (not isinstance(names, list) or len(names) != len(name_set)
-                or name_set != OBSERVABILITY_METRIC_NAMES or sample_names != OBSERVABILITY_METRIC_NAMES
+                or name_set != state["metric_names"] or sample_names != state["metric_names"]
                 or not valid_samples):
             errors.append("metric_artifact must contain one typed sample for every canonical metric")
     elif field == "log_artifact":
@@ -2234,7 +2388,7 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
         records = data.get("records")
         valid_records = (
             isinstance(records, list) and bool(records)
-            and all(_valid_observability_correlation_record(item) for item in records)
+            and all(_valid_observability_correlation_record(item, state) for item in records)
         )
         receipt_observed_at = parse_ts(data.get("observed_at"))
         if valid_records and receipt_observed_at:
@@ -2245,7 +2399,7 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
                 for item in records
             )
         if (not isinstance(fields, list) or len(fields) != len(field_set)
-                or field_set != OBSERVABILITY_CORRELATION_FIELDS or not valid_records):
+                or field_set != state["correlation_fields"] or not valid_records):
             errors.append("log_artifact must contain correlated structured log records")
     elif field == "trace_artifact":
         spans = data.get("spans")
@@ -2265,7 +2419,7 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
             and _nonempty_string(item.get("alert_id"))
             and _nonempty_string(item.get("condition"))
             and item.get("status") == "FIRED"
-            and item.get("safe_action") == OBSERVABILITY_DRILL_ALERT["safe_action"]
+            and item.get("safe_action") == state["drill_alert"]["safe_action"]
             for item in executions
         )
         if data.get("alerts_wired") is not True or not valid_executions:
@@ -2278,13 +2432,13 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
         } if isinstance(answers, list) else set()
         valid_answers = (
             isinstance(answers, list)
-            and len(answers) == len(OBSERVABILITY_RUNBOOK_QUESTION_IDS)
-            and answer_ids == OBSERVABILITY_RUNBOOK_QUESTION_IDS
-            and all(_valid_observability_drill_answer(item) for item in answers)
+            and len(answers) == len(state["runbook_question_ids"])
+            and answer_ids == state["runbook_question_ids"]
+            and all(_valid_observability_drill_answer(item, state) for item in answers)
         )
         valid_recovery = isinstance(recovery, list) and len(recovery) >= 3 and all(
             isinstance(item, dict)
-            and item.get("artifact_field") in OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS
+            and item.get("artifact_field") in state["runbook_evidence_fields"]
             and re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256") or ""))
             and item.get("sha256") == (receipt.get("artifact_sha256") or {}).get(
                 item.get("artifact_field")
@@ -2295,7 +2449,7 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
                 or data.get("drill_executed") is not True
                 or not valid_answers
                 or data.get("prohibited_actions_taken") != []
-                or data.get("operator_disposition") not in OBSERVABILITY_RUNBOOK_DISPOSITIONS
+                or data.get("operator_disposition") not in state["runbook_dispositions"]
                 or not valid_recovery):
             errors.append("runbook_drill_artifact must contain the complete safe 3am drill receipt")
     elif field == "canary_artifact":
@@ -2329,14 +2483,21 @@ def _validate_observability_verifier_source(path):
     return errors
 
 
-def validate_observability_runtime_receipt(receipt, artifact_base=None, expected=None, now=None):
+def validate_observability_runtime_receipt(
+        receipt, artifact_base=None, expected=None, now=None, contract_state=None):
     """Validate the typed Tier-B receipt without trusting caller-supplied pass semantics."""
     if not isinstance(receipt, dict):
         return ["observability_receipt must be an object"]
-    if OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
+    if contract_state is None and OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
         return [
             "observability_contract_not_registered: "
             + "; ".join(OBSERVABILITY_DEFAULT_CONTRACT_ERRORS[:3])
+        ]
+    if state["errors"]:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(state["errors"][:3])
         ]
     now = now or utc_now()
     errors = []
@@ -2375,14 +2536,14 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
         isinstance(metric_names, list) and all(isinstance(item, str) for item in metric_names)
     ) else set()
     if (not isinstance(metric_names, list) or len(metric_names) != len(metric_name_set)
-            or metric_name_set != OBSERVABILITY_METRIC_NAMES):
+            or metric_name_set != state["metric_names"]):
         errors.append("runtime observability requires the exact canonical metric_names")
     correlations = receipt.get("log_correlation_fields")
     correlation_set = set(correlations) if (
         isinstance(correlations, list) and all(isinstance(item, str) for item in correlations)
     ) else set()
     if (not isinstance(correlations, list) or len(correlations) != len(correlation_set)
-            or correlation_set != OBSERVABILITY_CORRELATION_FIELDS):
+            or correlation_set != state["correlation_fields"]):
         errors.append("runtime observability requires every canonical log_correlation_field")
     issued_at, issued_errors = _observability_timestamp(receipt.get("issued_at"), "issued_at", now)
     expires_value = receipt.get("expires_at")
@@ -2426,7 +2587,8 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
             errors.append("observability artifact_sha256 map does not match current artifact bytes")
         for field in OBSERVABILITY_JSON_ARTIFACT_TYPES:
             if field in paths:
-                errors.extend(_validate_observability_json_artifact(field, paths[field], receipt, now))
+                errors.extend(_validate_observability_json_artifact(
+                    field, paths[field], receipt, now, state))
         drill_fields = (
             "runbook_drill_artifact", "log_artifact", "trace_artifact", "alert_artifact",
         )
@@ -2442,6 +2604,7 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
                     drill_artifacts["trace_artifact"],
                     drill_artifacts["alert_artifact"],
                     receipt,
+                    state,
                 ))
         verifier_path = paths.get("verifier_artifact")
         if verifier_path:
@@ -2451,9 +2614,9 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
     return errors
 
 
-def observability_receipt_credit_scope(receipt, envelope=None, now=None):
-    """Return runtime/production only when neither receipt nor envelope encodes a hold."""
-    if validate_observability_runtime_receipt(receipt, now=now):
+def observability_receipt_credit_scope(receipt, envelope=None, validation_errors=()):
+    """Classify already-validated state; this pure helper never reloads or revalidates."""
+    if validation_errors:
         return ""
     envelope = envelope if isinstance(envelope, dict) else {}
     decision = envelope.get("observability_decision")
@@ -2476,7 +2639,8 @@ def observability_receipt_credit_scope(receipt, envelope=None, now=None):
     return receipt.get("claim_scope", "")
 
 
-def observability_receipt_from_evidence(evidence_path, expected=None, now=None):
+def observability_receipt_from_evidence(
+        evidence_path, expected=None, now=None, contract_state=None):
     """Load either the exact Tier-A companion or a typed Tier-B same-stem receipt."""
     now = now or utc_now()
     primary = Path(evidence_path).expanduser() if evidence_path else Path()
@@ -2496,9 +2660,9 @@ def observability_receipt_from_evidence(evidence_path, expected=None, now=None):
         artifact_sha256, artifact_paths = {}, {}
         if isinstance(receipt, dict):
             errors = list(parse_errors) + validate_observability_runtime_receipt(
-                receipt, candidate.parent, expected, now
+                receipt, candidate.parent, expected, now, contract_state
             )
-            scope = observability_receipt_credit_scope(receipt, envelope, now)
+            scope = observability_receipt_credit_scope(receipt, envelope, errors)
             if not scope and not errors:
                 errors.append("observability envelope records a hold, not runtime credit")
             artifact_paths, artifact_sha256, _ = _resolve_observability_artifacts(
@@ -2637,9 +2801,15 @@ def parse_observability_verifier_command(command, cwd, verifier_path):
     return {"argv": [sys.executable, wanted, *argv[2:]], "errors": []}
 
 
-def run_observability_verifier_argv(argv, cwd, timeout=120):
-    """Execute an already-validated observability verifier without a shell."""
+def run_observability_verifier_argv(
+        argv, cwd, timeout=120, expected_verifier_sha256="", trusted_sha256=()):
+    """Execute only when the verifier bytes still match receipt and contract trust."""
     try:
+        if expected_verifier_sha256:
+            current_sha256 = sha256_file(argv[1]) if len(argv) >= 2 else ""
+            if (current_sha256 != expected_verifier_sha256
+                    or current_sha256 not in set(trusted_sha256 or ())):
+                return 126, "", 0, ""
         proc = subprocess.run(
             argv, cwd=cwd or None, capture_output=True, text=True, timeout=timeout, shell=False
         )
@@ -2663,13 +2833,16 @@ def _observability_mutant_bytes(original):
     return b""
 
 
-def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes, timeout=120):
+def run_observability_artifact_canaries(
+        argv, cwd, artifact_paths, before_hashes, timeout=120,
+        expected_verifier_sha256="", trusted_sha256=()):
     """Mutate, verify, and restore each bound artifact independently."""
     results, restoration_sha256, errors = {}, {}, []
     fields = list(OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
     noise_rounds = secrets.randbelow(len(fields) + 1)
     for _ in range(noise_rounds):
-        control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+        control_exit, _, _, _ = run_observability_verifier_argv(
+            argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
         if control_exit != 0:
             errors.append("verifier failed during randomized control prelude")
             return {"results": results, "restoration_sha256": restoration_sha256, "errors": errors}
@@ -2683,7 +2856,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
         try:
             if path.is_symlink() or not path.is_file():
                 raise OSError("artifact is unavailable or symlinked")
-            control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+            control_exit, _, _, _ = run_observability_verifier_argv(
+                argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
             if control_exit != 0:
                 raise ValueError("verifier failed on restored control before mutation")
             original = path.read_bytes()
@@ -2691,7 +2865,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
             if not mutated:
                 raise ValueError("artifact has no safe text mutation")
             _atomic_replace_bytes(path, mutated)
-            exit_code, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+            exit_code, _, _, _ = run_observability_verifier_argv(
+                argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
             result = exit_code != 0
         except (OSError, ValueError) as exc:
             errors.append(f"{field} mutation canary unavailable: {exc}")
@@ -2706,7 +2881,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
                 errors.append(f"{field} restoration hash mismatch")
                 result = None
             elif original:
-                control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+                control_exit, _, _, _ = run_observability_verifier_argv(
+                    argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
                 if control_exit != 0:
                     errors.append(f"{field} verifier failed after restoration")
                     result = None
@@ -2723,7 +2899,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
             if path.is_symlink() or not path.is_file():
                 raise OSError("artifact is unavailable or symlinked")
             for _ in range(secrets.randbelow(3)):
-                control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+                control_exit, _, _, _ = run_observability_verifier_argv(
+                    argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
                 if control_exit != 0:
                     raise ValueError("verifier failed during randomized replay control")
             original = path.read_bytes()
@@ -2731,7 +2908,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
             if not mutated:
                 raise ValueError("artifact has no safe text mutation")
             _atomic_replace_bytes(path, mutated)
-            exit_code, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+            exit_code, _, _, _ = run_observability_verifier_argv(
+                argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
             replay_result = exit_code != 0
         except (OSError, ValueError) as exc:
             errors.append(f"{field} replay mutation canary unavailable: {exc}")
@@ -3985,7 +4163,52 @@ def proof_result_is_passing(result):
     return bool(re.match(r"^(?:pass|passed)(?:[\s:_-].*)$", normalized))
 
 
-def proof_is_verified(proof, verifier_binding_cache=None):
+def observability_bound_contract_is_current(proof, contract_root=None):
+    """Verify a historical proof against its exact engine-owned contract snapshot."""
+    if not isinstance(proof, dict):
+        return False
+    key = str(proof.get("observability_contract_key") or "")
+    project_key = str(proof.get("observability_project_key") or "")
+    if (not key or key.startswith("/") or "\\" in key
+            or any(part in {"", ".", ".."} for part in key.split("/"))):
+        return False
+    if (project_key in set(OBSERVABILITY_PROJECT_CONTRACT_ALIASES.values())
+            and project_key not in OBSERVABILITY_PROJECT_CONTRACT_ALIASES):
+        return False
+    if OBSERVABILITY_PROJECT_CONTRACT_ALIASES.get(project_key, project_key) != key:
+        return False
+    root = observability_contracts_dir(contract_root)
+    if root is None:
+        return False
+    parts = key.split("/")
+    expected_path = root.joinpath(*parts[:-1], f"{parts[-1]}.json")
+    recorded_path = Path(str(proof.get("observability_contract_path") or ""))
+    if recorded_path != expected_path or expected_path.is_symlink():
+        return False
+    try:
+        if expected_path.parent.resolve() != expected_path.parent:
+            return False
+    except OSError:
+        return False
+    contract, errors, current_sha256 = load_observability_contract_snapshot(expected_path)
+    if errors or contract.get("project_key") != key:
+        return False
+    bound_sha256 = str(proof.get("observability_contract_sha256") or "")
+    verifier_sha256 = str(
+        (proof.get("observability_receipt") or {}).get("verifier_source_sha256") or "")
+    return (
+        bool(re.fullmatch(r"[0-9a-f]{64}", bound_sha256))
+        and current_sha256 == bound_sha256
+        and proof.get("observability_contract_post_sha256") == bound_sha256
+        and proof.get("observability_contract_schema_version") == contract.get("schema_version")
+        and verifier_sha256 in set(contract.get("trusted_verifier_sha256") or [])
+        and proof.get("observability_executed_verifier_sha256") == verifier_sha256
+        and proof.get("observability_post_verifier_sha256") == verifier_sha256
+    )
+
+
+def proof_is_verified(
+        proof, verifier_binding_cache=None, observability_contract_root=None):
     """Keystone: a proof counts as REAL verification ONLY when a re-executed verifier exited 0
     on an explicitly passing result. Free-text attestation (a --verified-by string) and bare human
     attestation (a --reviewer name) are claims, not verifications — a name is not a verifiable
@@ -4037,11 +4260,8 @@ def proof_is_verified(proof, verifier_binding_cache=None):
             and bool(proof.get("release_approval_consumed_id"))
         )
     if proof.get("pathway") == "observability":
-        verifier_digest = str(
-            (proof.get("observability_receipt") or {}).get("verifier_source_sha256") or ""
-        )
-        if (OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE != "CONFIGURED_AND_VERIFIED"
-                or verifier_digest not in OBSERVABILITY_TRUSTED_VERIFIER_SHA256):
+        if not observability_bound_contract_is_current(
+                proof, observability_contract_root):
             return False
         return (
             proof.get("canary_mutant_failed") is True
@@ -5356,7 +5576,7 @@ def resolve_project_dir(raw, projects_root=None):
 
 
 def build_proof_record(args, work_item=None, run_id="", measurement_id_value="", projects_root=None,
-                       paths=None):
+                       paths=None, observability_contract_root=None):
     evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
     if not evidence_path or not Path(evidence_path).exists():
         return None, finding(
@@ -5366,6 +5586,18 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "Proof registry requires --evidence pointing at an existing local artifact.",
             [line_evidence(evidence_path or "<missing>")],
             "Pass a real Markdown, JSON, screenshot, report, test output, or other verification artifact.",
+            "static",
+            "high",
+        )
+    if (args.pathway or "") == "observability" and not work_item:
+        return None, finding(
+            "proof-add-unlinked-observability-work-id",
+            "proof-registry",
+            "warn",
+            f"Observability proof refused for unknown work_id {args.work_id or '<missing>'}.",
+            [line_evidence((paths.work_items_path if paths else "<work-items>"),
+                           source=args.work_id or "<missing>")],
+            "Run work-start first and bind the proof to that canonical work item.",
             "static",
             "high",
         )
@@ -5394,6 +5626,15 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "project": project_name,
         "target_project": project_path,
     }
+    observability_contract_state = (
+        resolve_observability_contract(
+            project_path, projects_root, observability_contract_root)
+        if (args.pathway or "") == "observability" and work_item
+        else _observability_contract_state(
+            {}, errors=["observability_contract_not_registered"])
+        if (args.pathway or "") == "observability"
+        else _OBSERVABILITY_DEFAULT_STATE
+    )
     proof_id = proof_id_for(
         evidence_path, args.work_id or "", args.pathway or "", proof_type,
         args.recommendation_id or "")
@@ -5457,7 +5698,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "missing": [],
         }
     observability_receipt = (
-        observability_receipt_from_evidence(evidence_path, proof_context, now=utc_now())
+        observability_receipt_from_evidence(
+            evidence_path, proof_context, now=utc_now(),
+            contract_state=observability_contract_state)
         if (args.pathway or "") == "observability"
         else {
             "receipt": {}, "receipt_path": "", "receipt_sha256": "", "credit_scope": "",
@@ -5487,6 +5730,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
     observability_artifact_canary_results = {}
     observability_artifact_restoration_sha256 = {}
     observability_artifact_canary_errors = []
+    observability_executed_verifier_sha256 = ""
+    observability_post_verifier_sha256 = ""
     verify_error = ""
     verify_cwd = project_path or str(Path(evidence_path).parent)
     if verify_cmd:
@@ -5616,8 +5861,22 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 verify_cmd, verify_cwd,
                 observability_receipt["artifact_paths"].get("verifier_artifact", ""),
             )
-            if command_check["errors"] or observability_receipt["outcome"] != "runtime":
-                command_errors = command_check["errors"] or [
+            bound_verifier_sha256 = sha256_file(
+                observability_receipt["artifact_paths"].get("verifier_artifact", ""))
+            receipt_verifier_sha256 = str(
+                (observability_receipt.get("receipt") or {}).get(
+                    "verifier_source_sha256") or "")
+            trust_errors = []
+            if bound_verifier_sha256 != receipt_verifier_sha256:
+                trust_errors.append(
+                    "observability verifier source no longer matches the receipt digest")
+            if (bound_verifier_sha256 not in
+                    observability_contract_state["trusted_verifier_sha256"]):
+                trust_errors.append(
+                    "observability verifier source is not registered in the resolved contract")
+            if (command_check["errors"] or trust_errors
+                    or observability_receipt["outcome"] != "runtime"):
+                command_errors = command_check["errors"] + trust_errors or [
                     "runtime observability receipt is invalid; verifier was not executed"
                 ]
                 observability_receipt = {
@@ -5630,9 +5889,19 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 canary_target_reason = "observability_receipt_or_command_invalid"
             else:
                 _t0 = time.monotonic()
+                execution_candidate_sha256 = sha256_file(command_check["argv"][1])
                 exit_code, verify_stdout_sha256, verify_stdout_bytes, verify_stdout = (
-                    run_observability_verifier_argv(command_check["argv"], verify_cwd)
+                    run_observability_verifier_argv(
+                        command_check["argv"], verify_cwd,
+                        expected_verifier_sha256=receipt_verifier_sha256,
+                        trusted_sha256=observability_contract_state[
+                            "trusted_verifier_sha256"],
+                    )
                 )
+                if exit_code == 126:
+                    verify_error = "observability_verifier_digest_changed_before_execution"
+                else:
+                    observability_executed_verifier_sha256 = execution_candidate_sha256
                 first_run_secs = time.monotonic() - _t0
                 trivial_verifier = verify_stdout_bytes < STDOUT_BYTE_FLOOR
                 canary_target_reason = "observability_artifact_canaries_recorded_separately"
@@ -5641,6 +5910,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                         command_check["argv"], verify_cwd,
                         observability_receipt["artifact_paths"],
                         observability_receipt["artifact_sha256"],
+                        expected_verifier_sha256=receipt_verifier_sha256,
+                        trusted_sha256=observability_contract_state[
+                            "trusted_verifier_sha256"],
                     )
                     observability_artifact_canary_results = artifact_canaries["results"]
                     observability_artifact_restoration_sha256 = artifact_canaries[
@@ -5834,7 +6106,7 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "recommendation_id": args.recommendation_id or "",
             "project": project_name,
             "target_project": project_path,
-        }, now=utc_now())
+        }, now=utc_now(), contract_state=observability_contract_state)
         observability_post_receipt_sha256 = post_receipt["receipt_sha256"]
         observability_post_observability_artifact_sha256 = dict(post_receipt["artifact_sha256"])
         if observability_post_artifact_sha256 != artifact_sha256:
@@ -5866,6 +6138,30 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         if post_receipt["credit_scope"] != observability_receipt["credit_scope"]:
             observability_snapshot_errors.append(
                 "observability credit scope changed during verifier execution"
+            )
+        contract_path = Path(observability_contract_state["path"])
+        contract_post_sha256 = (
+            sha256_file(contract_path)
+            if contract_path.is_file() and not contract_path.is_symlink()
+            else ""
+        )
+        if contract_post_sha256 != observability_contract_state["sha256"]:
+            observability_snapshot_errors.append(
+                "observability contract changed during verifier execution"
+            )
+        verifier_path = Path(str(
+            observability_receipt.get("artifact_paths", {}).get(
+                "verifier_artifact", "")))
+        observability_post_verifier_sha256 = (
+            sha256_file(verifier_path)
+            if verifier_path.is_file() and not verifier_path.is_symlink()
+            else ""
+        )
+        if (observability_executed_verifier_sha256
+                and observability_post_verifier_sha256
+                != observability_executed_verifier_sha256):
+            observability_snapshot_errors.append(
+                "observability verifier changed during execution"
             )
         observability_snapshot_stable = not observability_snapshot_errors
         if observability_snapshot_errors:
@@ -5993,6 +6289,13 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "release_approval_consumed_id": release_approval_consumed_id,
         "release_approval_error": release_approval_error,
         "observability_receipt": observability_receipt["receipt"],
+        "observability_contract_key": observability_contract_state["key"],
+        "observability_project_key": observability_contract_state["project_key"],
+        "observability_contract_path": observability_contract_state["path"],
+        "observability_contract_schema_version": observability_contract_state["schema_version"],
+        "observability_contract_sha256": observability_contract_state["sha256"],
+        "observability_contract_post_sha256": (
+            contract_post_sha256 if (args.pathway or "") == "observability" else ""),
         "observability_receipt_path": observability_receipt["receipt_path"],
         "observability_receipt_sha256": observability_receipt["receipt_sha256"],
         "observability_credit_scope": observability_receipt["credit_scope"],
@@ -6014,6 +6317,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             observability_artifact_restoration_sha256
         ),
         "observability_artifact_canary_errors": observability_artifact_canary_errors,
+        "observability_executed_verifier_sha256": observability_executed_verifier_sha256,
+        "observability_post_verifier_sha256": observability_post_verifier_sha256,
         "reviewer": reviewer,
         "recommendation_id": args.recommendation_id or "",
         "run_id": run_id,
@@ -6027,7 +6332,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
     # a trivial transcript quietly parked the pathway in logged_unverified —
     # the caller had no signal until a later work-status archaeology dig
     # (2026-08-10: three re-log rounds before anyone saw cwd_invalid).
-    if (verify_cmd and not proof_is_verified(proof)
+    if (verify_cmd and not proof_is_verified(
+            proof, observability_contract_root=observability_contract_root)
             and not proof.get("release_provider_action_verified")):
         if verify_error == "cwd_invalid":
             reason = (
@@ -6104,10 +6410,10 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
               and proof.get("observability_outcome") == "blocked_no_runtime"):
             reason = "the verified blocked_no_runtime contract is carry-forward evidence, not observability credit."
         elif (proof.get("pathway") == "observability"
-              and OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE != "CONFIGURED_AND_VERIFIED"):
+              and not observability_bound_contract_is_current(proof)):
             reason = (
-                "runtime observability cannot earn credit until an external trusted-verifier "
-                "digest is configured and verified."
+                "runtime observability requires the resolved project contract, its unchanged "
+                "bound digest, and a verifier digest registered in that contract."
             )
         elif proof.get("pathway") == "observability" and proof.get("canary_mutant_failed") is not True:
             reason = "positive observability proof requires a successful anti-gaming verifier canary."
@@ -9058,6 +9364,8 @@ def run_work_log(args, paths):
             "static",
             "medium",
         ))
+        if args.pathway == "observability":
+            return {"findings": findings, "records": []}
 
     evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
     evidence_id = evidence_id_for_path(evidence_path) if evidence_path else ""
@@ -9248,6 +9556,21 @@ def run_proof_add(args, paths):
     work_item = None
     if args.work_id:
         work_item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
+    if args.pathway == "observability" and not work_item:
+        return {
+            "records": [],
+            "findings": [finding(
+                "proof-add-unlinked-observability-work-id",
+                "proof-registry",
+                "warn",
+                f"Observability proof refused for unknown work_id {args.work_id or '<missing>'}.",
+                [line_evidence(paths.work_items_path, source=args.work_id or "<missing>")],
+                "Run work-start first and bind the proof to that canonical work item.",
+                "static",
+                "high",
+            )],
+            "proofs_path": str(paths.proofs_path),
+        }
     proof, proof_finding = build_proof_record(
         args, work_item=work_item, projects_root=paths.projects_root, paths=paths)
     # No proof at all (e.g. missing evidence) is fatal. A proof accompanied by a

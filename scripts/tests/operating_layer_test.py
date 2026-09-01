@@ -298,6 +298,172 @@ def test_observability_contract_loader_fails_closed_and_gates_schema():
           "a broken default contract makes artifact validation refuse outright")
 
 
+def test_observability_contract_resolution_g2_and_identity_guards():
+    reset()
+    opl = load_cli("observability_contract_resolution_g2")
+    projects_root = ROOT / "projects"
+    contract_root = ROOT / "contract-fixtures" / "resolver"
+    contract_root.mkdir(parents=True)
+    owner_a = projects_root / "owner-a" / "shared"
+    owner_b = projects_root / "owner-b" / "shared"
+    dotted = projects_root / "owner-a" / "foo.v2"
+    for project in (owner_a, owner_b, dotted):
+        project.mkdir(parents=True, exist_ok=True)
+
+    first = opl.resolve_observability_contract(owner_a, projects_root, contract_root)
+    second = opl.resolve_observability_contract(owner_b, projects_root, contract_root)
+    dotted_state = opl.resolve_observability_contract(dotted, projects_root, contract_root)
+    check(first["key"] == "owner-a/shared" and second["key"] == "owner-b/shared",
+          "owner-family path remains part of the contract identity")
+    check(first["path"] != second["path"],
+          "same-basename projects in different owner families cannot collide")
+    check(dotted_state["path"].endswith("owner-a/foo.v2.json"),
+          "dotted project names append .json without dropping the dotted suffix")
+    check(first["errors"] == ("observability_contract_not_registered",),
+          "G2 refuses a non-Rainman project with the exact registration reason")
+    try:
+        first["key"] = "receipt-selected"
+        immutable = False
+    except TypeError:
+        immutable = True
+    check(immutable, "the resolved contract snapshot is immutable")
+
+    dotted_contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    dotted_contract["project_key"] = "owner-a/foo.v2"
+    dotted_path = contract_root / "owner-a" / "foo.v2.json"
+    dotted_path.parent.mkdir(parents=True)
+    dotted_path.write_text(json.dumps(dotted_contract) + "\n", encoding="utf-8")
+    collision_contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    collision_contract["project_key"] = "owner-a/foo"
+    collision_path = contract_root / "owner-a" / "foo.json"
+    collision_path.write_text(json.dumps(collision_contract) + "\n", encoding="utf-8")
+    dotted_loaded = opl.resolve_observability_contract(
+        dotted, projects_root, contract_root)
+    check(not dotted_loaded["errors"]
+          and dotted_loaded["key"] == "owner-a/foo.v2"
+          and dotted_loaded["path"] != str(collision_path),
+          "dotted project resolution loads its exact contract without colliding with foo.json")
+    dotted_path.unlink()
+    collision_path.unlink()
+
+    snapshot_contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    snapshot_contract["project_key"] = "snapshot-original"
+    snapshot_path = contract_root / "snapshot.json"
+    snapshot_path.write_text(json.dumps(snapshot_contract) + "\n", encoding="utf-8")
+    original_bytes = snapshot_path.read_bytes()
+    original_parser = opl._parse_strict_json_object_bytes
+
+    def mutate_after_capture(raw, label="observability contract", max_bytes=None):
+        replacement = json.loads(json.dumps(snapshot_contract))
+        replacement["project_key"] = "snapshot-replacement"
+        snapshot_path.write_text(json.dumps(replacement) + "\n", encoding="utf-8")
+        return original_parser(raw, label, max_bytes)
+
+    opl._parse_strict_json_object_bytes = mutate_after_capture
+    loaded_snapshot, snapshot_errors, snapshot_sha256 = (
+        opl.load_observability_contract_snapshot(snapshot_path))
+    opl._parse_strict_json_object_bytes = original_parser
+    check(not snapshot_errors
+          and loaded_snapshot["project_key"] == "snapshot-original"
+          and snapshot_sha256 == hashlib.sha256(original_bytes).hexdigest()
+          and snapshot_sha256 != opl.sha256_file(snapshot_path),
+          "contract semantics and digest come from one exact captured byte snapshot")
+    snapshot_path.unlink()
+
+    contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    contract["project_key"] = "owner-b/shared"
+    mismatch_path = contract_root / "owner-a" / "shared.json"
+    mismatch_path.parent.mkdir(parents=True, exist_ok=True)
+    mismatch_path.write_text(json.dumps(contract) + "\n", encoding="utf-8")
+    mismatch = opl.resolve_observability_contract(owner_a, projects_root, contract_root)
+    check(any("project_key does not match" in error for error in mismatch["errors"]),
+          "a contract cannot claim a different canonical project identity")
+    mismatch_path.unlink()
+    mismatch_path.parent.rmdir()
+
+    target_dir = contract_root / "resolver-target"
+    target_dir.mkdir()
+    symlink_dir = contract_root / "owner-a"
+    symlink_dir.symlink_to(target_dir, target_is_directory=True)
+    symlinked = opl.resolve_observability_contract(
+        owner_a, projects_root, contract_root)
+    check(any("symlink directories" in error for error in symlinked["errors"]),
+          "an in-root cross-family symlink cannot redirect contract identity")
+    symlink_dir.unlink()
+    target_dir.rmdir()
+
+    tradebot = projects_root / "tradebot"
+    native_rainman = projects_root / "rainman-thorp"
+    tradebot.mkdir()
+    native_rainman.mkdir()
+    tradebot_state = opl.resolve_observability_contract(tradebot, projects_root)
+    native_state = opl.resolve_observability_contract(native_rainman, projects_root)
+    check(not tradebot_state["errors"]
+          and tradebot_state["project_key"] == "tradebot"
+          and tradebot_state["key"] == "rainman-thorp"
+          and tradebot_state["path"].endswith("rainman-thorp.json"),
+          "the live tradebot identity selects the frozen Rainman contract via an engine alias")
+    check(any("reserved for an explicit compatibility alias" in error
+              for error in native_state["errors"]),
+          "the distinct native rainman-thorp project cannot silently share Tradebot's alias")
+
+    nested_tradebot = projects_root / "owner-a" / "tradebot"
+    nested_rainman = projects_root / "owner-a" / "rainman-thorp"
+    nested_tradebot.mkdir(parents=True)
+    nested_rainman.mkdir(parents=True)
+    nested_tradebot_state = opl.resolve_observability_contract(
+        nested_tradebot, projects_root, contract_root)
+    nested_rainman_state = opl.resolve_observability_contract(
+        nested_rainman, projects_root, contract_root)
+    check(nested_tradebot_state["key"] == "owner-a/tradebot"
+          and nested_tradebot_state["errors"] == (
+              "observability_contract_not_registered",)
+          and nested_rainman_state["key"] == "owner-a/rainman-thorp"
+          and nested_rainman_state["errors"] == (
+              "observability_contract_not_registered",),
+          "legacy aliases and reserved targets apply only to exact canonical project keys")
+
+    evidence = write("out/operator-artifacts/unknown-observability.md", "proof\n")
+    unknown_sentinel = ROOT / "out" / "unknown-observability-executed"
+    unknown_verifier = write(
+        "out/operator-artifacts/unknown-observability-verifier.py",
+        f"from pathlib import Path\nPath({str(unknown_sentinel)!r}).write_text('ran')\n"
+        "print('UNKNOWN_OBSERVABILITY=RAN')\n",
+    )
+    unknown_command = f"{sys.executable} {unknown_verifier}"
+    before_unknown_commands = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in ROOT.rglob("*") if path.is_file()
+    }
+    logged, _ = run("work-log", [
+        "--work-id", "W-unknown-observability", "--pathway", "observability",
+        "--kind", "verify", "--evidence", str(evidence), "--proof-type", "artifact",
+        "--verify-cmd", unknown_command,
+    ])
+    after_unknown_work_log = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in ROOT.rglob("*") if path.is_file()
+    }
+    check(logged.get("records") == [] and "work-log-unlinked-work-id" in ids(logged),
+          "observability work-log hard-refuses an unknown work ID before writing a run")
+    added, _ = run("proof-add", [
+        "--work-id", "W-unknown-observability", "--pathway", "observability",
+        "--kind", "verify", "--evidence", str(evidence), "--proof-type", "artifact",
+        "--verify-cmd", unknown_command,
+    ])
+    after_unknown_proof_add = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in ROOT.rglob("*") if path.is_file()
+    }
+    check(added.get("records") == []
+          and "proof-add-unlinked-observability-work-id" in ids(added),
+          "observability proof-add hard-refuses an unknown work ID before proof construction")
+    check(not unknown_sentinel.exists(),
+          "unknown observability work IDs cannot trigger verifier side effects")
+    check(before_unknown_commands == after_unknown_work_log == after_unknown_proof_add,
+          "unknown observability work IDs cannot mutate any run, proof, measurement, or carry-forward ledger")
+
+
 def _unregistered_test_names(namespace, tests):
     """Return module-level test_* callables missing from an explicit runner list."""
     registered = {getattr(t, "__name__", None) for t in tests}
@@ -4539,6 +4705,143 @@ print("OBSERVABILITY_RECEIPT_SHA256=" + hashlib.sha256(receipt_path.read_bytes()
     return evidence, receipt_path, receipt, artifacts["metric_artifact"], verifier
 
 
+def _install_observability_test_contract(
+        opl, proj, verifier, contract_root, trusted=True):
+    """Register one ephemeral Rainman-shaped contract for verifier-path adversarial tests."""
+    contract_root = Path(contract_root).resolve()
+    try:
+        contract_relative = contract_root.relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise AssertionError("test contract root must stay beneath the owned test root") from exc
+    if (not contract_relative.parts
+            or contract_relative.parts[0] != "contract-fixtures"):
+        raise AssertionError("test contract root must stay inside contract-fixtures")
+    key = proj.resolve().relative_to((ROOT / "projects").resolve()).as_posix()
+    contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    contract["project_key"] = key
+    contract["trusted_verifier_sha256"] = (
+        [opl.sha256_file(verifier)] if trusted else [])
+    parts = key.split("/")
+    path = contract_root.joinpath(*parts[:-1], f"{parts[-1]}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(contract) + "\n", encoding="utf-8")
+    return path
+
+
+def _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root):
+    import argparse
+    args = argparse.Namespace(
+        evidence=str(evidence), work_id=work_id, pathway="observability",
+        gate="observability-gate", kind="verify", result="pass", stale_after_days=30,
+        verified_by="", recommendation_id=recommendation_id,
+        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
+        proof_type="artifact", canary_target=None, project=str(proj),
+    )
+    return opl.build_proof_record(
+        args,
+        work_item={"work_id": work_id, "project": str(proj), "project_name": proj.name},
+        projects_root=str(ROOT / "projects"),
+        observability_contract_root=contract_root,
+    )
+
+
+def test_observability_untrusted_verifier_has_no_side_effects():
+    reset()
+    proj = ROOT / "projects" / "observability-untrusted"
+    proj.mkdir(parents=True)
+    work_id = "W-observability-untrusted"
+    recommendation_id = "REC-observability-untrusted"
+    opl = load_cli("observability_untrusted_side_effect")
+    evidence, receipt_path, receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-untrusted")
+    sentinel = ROOT / "out" / "untrusted-verifier-executed"
+    verifier.write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('ran')\n"
+        + verifier.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    receipt["verifier_source_sha256"] = opl.sha256_file(verifier)
+    receipt["artifact_sha256"] = {
+        **receipt["artifact_sha256"], "verifier_artifact": opl.sha256_file(verifier),
+    }
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
+    }), encoding="utf-8")
+    contract_root = ROOT / "contract-fixtures" / "untrusted"
+    contract_root.mkdir(parents=True)
+    helper_refused_repo_root = False
+    try:
+        _install_observability_test_contract(
+            opl, proj, verifier, REPO / "contracts" / "observability",
+            trusted=False)
+    except AssertionError:
+        helper_refused_repo_root = True
+    check(helper_refused_repo_root,
+          "mutable contract fixtures cannot target the checked-in contracts root")
+    _install_observability_test_contract(
+        opl, proj, verifier, contract_root, trusted=False)
+    proof, warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    check(proof.get("exit_code") is None
+          and proof.get("observability_executed_verifier_sha256") == "",
+          "a registered project with an untrusted verifier refuses before subprocess execution")
+    check(not sentinel.exists(),
+          "a registered-but-untrusted verifier cannot produce external file side effects")
+    check(any("not registered in the resolved contract" in error
+              for error in proof.get("observability_receipt_errors", [])),
+          "the refusal identifies the selected contract allowlist")
+    check(warning is not None and warning.get("id") == "proof-logged-unverified",
+          "untrusted verifier refusal is surfaced as a loud unverified proof")
+
+    late_sentinel = ROOT / "out" / "late-swapped-verifier-executed"
+    late_verifier = write(
+        "out/operator-artifacts/late-swapped-verifier.py",
+        "print('ORIGINAL_TRUSTED_VERIFIER')\n",
+    )
+    expected_digest = opl.sha256_file(late_verifier)
+    late_verifier.write_text(
+        f"from pathlib import Path\nPath({str(late_sentinel)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    late_exit, _stdout_sha, _stdout_bytes, _stdout = opl.run_observability_verifier_argv(
+        [sys.executable, str(late_verifier)], str(proj),
+        expected_verifier_sha256=expected_digest, trusted_sha256=[expected_digest])
+    check(late_exit == 126 and not late_sentinel.exists(),
+          "a verifier swapped after trust selection is rehashed and refused at execution time")
+
+
+def test_observability_historical_contract_digest_invalidation():
+    reset()
+    proj = ROOT / "projects" / "observability-history"
+    proj.mkdir(parents=True)
+    work_id = "W-observability-history"
+    recommendation_id = "REC-observability-history"
+    opl = load_cli("observability_historical_contract")
+    evidence, receipt_path, _receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-history")
+    contract_root = ROOT / "contract-fixtures" / "history"
+    contract_root.mkdir(parents=True)
+    contract_path = _install_observability_test_contract(
+        opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    verifier_digest = opl.sha256_file(verifier)
+    check(proof.get("observability_executed_verifier_sha256") == verifier_digest
+          and proof.get("observability_post_verifier_sha256") == verifier_digest,
+          "the proof records and rechecks the exact verifier digest that executed")
+    check(opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
+          "a fully bound proof credits while its exact contract snapshot remains current")
+    contract_path.write_bytes(contract_path.read_bytes() + b" ")
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
+          "historical observability credit is invalidated when current contract bytes drift")
+
+
 def test_observability_pre_runtime_hold_carries_without_credit_or_repeat():
     """A Tier-A verifier can validate a negative claim but cannot launder caller `pass`."""
     reset()
@@ -5137,6 +5440,10 @@ def test_observability_runtime_receipt_completeness_binding_and_replay_guards():
         duplicate, opl.sha256_file(receipt_path), receipt, "runtime"
     )["bound"] is False, "duplicate contradictory observability markers fail closed")
 
+    receipt["contract_key"] = "rainman-thorp"
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
+    }), encoding="utf-8")
     logged, _ = run("work-log", [
         "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
@@ -5145,18 +5452,18 @@ def test_observability_runtime_receipt_completeness_binding_and_replay_guards():
         "--recommendation-id", recommendation_id,
     ])
     proof = next(record for record in logged["records"] if "verifier_strength" in record)
-    check(proof.get("canary_mutant_failed") is True and not opl.proof_is_verified(proof),
-          "a structurally complete runtime receipt stays uncredited without a trusted verifier root")
+    check(proof.get("exit_code") is None and not opl.proof_is_verified(proof),
+          "an unregistered project contract refuses before verifier execution")
     check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE == "TRUSTED_VERIFIER_NOT_CONFIGURED"
           and not opl.OBSERVABILITY_TRUSTED_VERIFIER_SHA256,
           "runtime observability verifier trust is explicitly unconfigured and fail closed")
-    check(set(proof.get("observability_artifact_canary_results", {}))
-          == set(opl.OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
-          and all(proof["observability_artifact_canary_results"].values()),
-          "every one of the seven receipt-bound artifacts independently trips the verifier")
-    check(proof.get("observability_artifact_restoration_sha256")
-          == proof.get("observability_artifact_sha256"),
-          "every mutation canary restores the exact pre-run artifact hash")
+    check(proof.get("observability_artifact_canary_results") == {},
+          "an unregistered verifier cannot reach any artifact canary subprocess")
+    check(any("observability_contract_not_registered" in error
+              for error in proof.get("observability_receipt_errors", [])),
+          "G2 names the missing per-project contract instead of Rainman enum errors")
+    check(proof.get("observability_contract_key") == "observability-runtime",
+          "receipt-supplied contract_key cannot select the Rainman contract")
     generic = {
         "pathway": "quality", "result": "pass", "verifier_strength": "executed",
         "exit_code": 0, "trivial_verifier": False, "canary_mutant_failed": None,
@@ -5180,19 +5487,18 @@ def test_observability_proof_rejects_verifier_that_ignores_one_bound_artifact():
         opl, proj, work_id, recommendation_id, "observability-ignored-artifact",
         ignore_field="log_artifact",
     )
-    logged, _ = run("work-log", [
-        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
-        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
-        "--project", str(proj),
-        "--verify-cmd", f"{sys.executable} {verifier} {receipt_path}",
-        "--recommendation-id", recommendation_id,
-    ])
-    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    contract_root = ROOT / "contract-fixtures" / "ignored-artifact"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
     results = proof.get("observability_artifact_canary_results", {})
     check(results.get("log_artifact") is False
           and all(value is True for field, value in results.items() if field != "log_artifact"),
           "one ignored receipt-bound artifact is detected by its independent mutation canary")
-    check(not opl.proof_is_verified(proof),
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
           "a verifier that ignores any one observability artifact cannot earn credit")
 
 
@@ -5240,16 +5546,14 @@ print("OBSERVABILITY_RECEIPT_SHA256=" + hashlib.sha256(receipt_path.read_bytes()
     receipt_path.write_text(json.dumps({
         "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
     }), encoding="utf-8")
-    import argparse
-    args = argparse.Namespace(
-        evidence=str(evidence), work_id=work_id, pathway="observability",
-        gate="observability-gate", kind="verify", result="pass", stale_after_days=30,
-        verified_by="", recommendation_id=recommendation_id,
-        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
-        proof_type="artifact", canary_target=None, project=str(proj),
-    )
-    proof, warning = opl.build_proof_record(args, projects_root=str(ROOT / "projects"))
-    check(not opl.proof_is_verified(proof),
+    contract_root = ROOT / "contract-fixtures" / "stateful-verifier"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
+    proof, warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
           "a schedule-aware invocation-counter verifier cannot earn runtime observability credit")
     check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE != "CONFIGURED_AND_VERIFIED",
           "black-box mutation behavior cannot substitute for a configured verifier trust root")
@@ -5275,6 +5579,9 @@ def test_observability_proof_revalidates_receipt_freshness_after_canaries():
         "status": "RUNTIME_OBSERVABILITY_RECEIPT",
         "observability_receipt": receipt,
     }), encoding="utf-8")
+    contract_root = ROOT / "contract-fixtures" / "expiry"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
 
     before_expiry = issued_at + opl.timedelta(seconds=30)
     after_expiry = issued_at + opl.timedelta(seconds=61)
@@ -5284,17 +5591,9 @@ def test_observability_proof_revalidates_receipt_freshness_after_canaries():
         return next(clock_values, after_expiry)
 
     opl.utc_now = controlled_utc_now
-    import argparse
-    args = argparse.Namespace(
-        evidence=str(evidence), work_id=work_id, pathway="observability",
-        gate="observability-gate", kind="verify", result="pass",
-        stale_after_days=30, verified_by="", recommendation_id=recommendation_id,
-        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
-        proof_type="artifact", canary_target=None, project=str(proj),
-    )
-    proof, warning = opl.build_proof_record(
-        args, projects_root=str(ROOT / "projects")
-    )
+    proof, warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
     canary_results = proof.get("observability_artifact_canary_results", {})
     check(set(canary_results) == set(opl.OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
           and all(canary_results.values()),
@@ -5311,7 +5610,8 @@ def test_observability_proof_revalidates_receipt_freshness_after_canaries():
           "post-canary receipt expiry fails semantic snapshot revalidation")
     check(proof.get("observability_credit_scope") == ""
           and proof.get("observability_outcome") == ""
-          and not opl.proof_is_verified(proof),
+          and not opl.proof_is_verified(
+              proof, observability_contract_root=contract_root),
           "an expired post-verifier receipt cannot earn observability credit")
     check(warning is not None and warning.get("id") == "proof-logged-unverified",
           "post-verifier receipt expiry produces a loud unverified finding")
@@ -5331,28 +5631,77 @@ def test_observability_proof_rejects_mid_verification_artifact_mutation():
     evidence, receipt_path, _receipt, metric, verifier = _observability_runtime_fixture(
         opl, proj, work_id, recommendation_id, "observability-mutation", mutate=True
     )
-    logged, _ = run("work-log", [
-        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
-        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
-        "--project", str(proj),
-        "--verify-cmd", f"{sys.executable} {verifier} {receipt_path}",
-        "--recommendation-id", recommendation_id,
-    ])
-    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    contract_root = ROOT / "contract-fixtures" / "artifact-mutation"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
     check(proof.get("canary_mutant_failed") is False
           and proof.get("observability_artifact_canary_errors"),
           "TOCTOU fixture fails the per-artifact restoration canary")
     check(proof.get("observability_snapshot_stable") is False
           and any("artifacts changed" in error for error in proof.get("observability_snapshot_errors", [])),
           "post-verifier hashes detect observability artifact mutation")
-    check(not opl.proof_is_verified(proof),
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
           "mutated observability evidence cannot receive pathway credit")
-    status, _ = run("work-status", ["--work-id", work_id])
-    obs_status = next(
-        entry["status"] for entry in status["summary"]["itinerary"]
-        if entry["pathway"] == "observability"
+    check(proof.get("observability_credit_scope") == "",
+          "TOCTOU failure leaves observability credit closed")
+
+
+def test_observability_proof_binds_contract_and_rejects_contract_toctou():
+    reset()
+    proj = ROOT / "projects" / "observability-contract-toctou"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "reject mutable observability contract",
+        "--tier", "production-secure",
+    ])
+    work_id = started["work_id"]
+    recommendation_id = "REC-observability-contract-toctou"
+    opl = load_cli("observability_contract_toctou")
+    evidence, receipt_path, receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-contract-toctou"
     )
-    check(obs_status == "required", "TOCTOU failure leaves observability coverage open")
+    contract_root = ROOT / "contract-fixtures" / "contract-toctou"
+    contract_root.mkdir(parents=True)
+    contract_path = contract_root / f"{proj.name}.json"
+    source = verifier.read_text(encoding="utf-8")
+    source = source.replace(
+        'print("OBSERVABILITY_DECISION=CREDIT")',
+        f'Path({str(contract_path)!r}).write_text('
+        f'Path({str(contract_path)!r}).read_text(encoding="utf-8") + " ", encoding="utf-8")\n'
+        'print("OBSERVABILITY_DECISION=CREDIT")',
+        1,
+    )
+    verifier.write_text(source, encoding="utf-8")
+    receipt["verifier_source_sha256"] = opl.sha256_file(verifier)
+    receipt["artifact_sha256"] = {
+        **receipt["artifact_sha256"], "verifier_artifact": opl.sha256_file(verifier),
+    }
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
+    }), encoding="utf-8")
+    contract_path = _install_observability_test_contract(
+        opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    check(proof.get("exit_code") == 0,
+          "contract TOCTOU fixture passes the pre-execution allowlist before mutation")
+    check(proof.get("observability_contract_key") == proj.name
+          and proof.get("observability_contract_path") == str(contract_path)
+          and proof.get("observability_contract_schema_version") == 1
+          and len(proof.get("observability_contract_sha256", "")) == 64,
+          "proof records the resolved contract key, path, schema, and pre-run SHA")
+    check(proof.get("observability_contract_post_sha256")
+          != proof.get("observability_contract_sha256")
+          and any("contract changed" in error
+                  for error in proof.get("observability_snapshot_errors", [])),
+          "post-verifier contract rehash detects TOCTOU mutation")
+    check(not opl.observability_bound_contract_is_current(proof, contract_root),
+          "a proof whose contract bytes changed during execution cannot credit")
 
 
 def test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts():
@@ -8513,10 +8862,13 @@ def main():
         test_release_proof_rejects_mid_verification_evidence_mutation,
         test_observability_pre_runtime_hold_carries_without_credit_or_repeat,
         test_observability_runtime_receipt_completeness_binding_and_replay_guards,
+        test_observability_untrusted_verifier_has_no_side_effects,
+        test_observability_historical_contract_digest_invalidation,
         test_observability_proof_rejects_verifier_that_ignores_one_bound_artifact,
         test_observability_proof_rejects_stateful_invocation_counter_verifier,
         test_observability_proof_revalidates_receipt_freshness_after_canaries,
         test_observability_proof_rejects_mid_verification_artifact_mutation,
+        test_observability_proof_binds_contract_and_rejects_contract_toctou,
         test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts,
         test_phase1_g1_verifier_rejects_ambiguous_receipts,
         test_audit_proof_integrity_uses_active_outcomes_and_reports_history,
@@ -8527,6 +8879,7 @@ def main():
         test_canary_run_guard_skips_trivial_and_slow_verifiers,
         test_proof_canary_observability_report,
         test_observability_contract_loader_fails_closed_and_gates_schema,
+        test_observability_contract_resolution_g2_and_identity_guards,
         test_cohens_kappa_inter_rater_agreement,
         test_fleiss_kappa_multi_rater_agreement,
         test_kappa_reliability_thresholds,
