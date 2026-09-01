@@ -1604,9 +1604,6 @@ OBSERVABILITY_RUNBOOK_FACT_KINDS = frozenset({
 OBSERVABILITY_RUNBOOK_EVIDENCE_INVENTORY = frozenset(OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS) - {
     "runbook_drill_artifact", "verifier_artifact",
 }
-OBSERVABILITY_DRILL_INCIDENT_FIELDS = frozenset({
-    "event_name", "asset", "mode", "risk_decision", "reason_code",
-})
 OBSERVABILITY_CONTRACT_ENUM_FLOORS = {
     "metric_names": 3,
     "event_names": 3,
@@ -1614,14 +1611,16 @@ OBSERVABILITY_CONTRACT_ENUM_FLOORS = {
     "correlation_hash_fields": 1,
     "correlation_timestamp_fields": 1,
     "correlation_sequence_fields": 1,
-    "allowed_assets": 1,
-    "allowed_modes": 1,
-    "allowed_risk_decisions": 1,
-    "allowed_reason_codes": 1,
     "runbook_question_ids": 3,
     "runbook_evidence_fields": 3,
     "runbook_dispositions": 1,
     "runbook_missing_evidence": 1,
+}
+OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS = {
+    "allowed_assets": "asset",
+    "allowed_modes": "mode",
+    "allowed_risk_decisions": "risk_decision",
+    "allowed_reason_codes": "reason_code",
 }
 
 
@@ -1733,6 +1732,45 @@ def validate_observability_contract(contract):
             errors.append(
                 f"observability contract {subset_key} must be a subset of correlation_fields"
             )
+    correlation_timestamps = set(
+        _observability_string_list(contract.get("correlation_timestamp_fields")))
+    timestamp_order = contract.get("correlation_timestamp_order")
+    if (timestamp_order is not None
+            and (not isinstance(timestamp_order, list)
+                 or not all(isinstance(field, str) for field in timestamp_order)
+                 or len(timestamp_order) != len(set(timestamp_order))
+                 or set(timestamp_order) != correlation_timestamps)):
+        errors.append(
+            "observability contract correlation_timestamp_order must order every timestamp field"
+        )
+    for legacy_key in OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS:
+        if legacy_key in contract:
+            errors.extend(_observability_contract_enum_errors(contract, legacy_key, 1))
+    correlation_enum_values = contract.get("correlation_enum_values", {})
+    if (not isinstance(correlation_enum_values, dict)
+            or not all(
+                isinstance(field, str) and field in correlation
+                and isinstance(values, list) and values
+                and all(isinstance(value, str) and value.strip() for value in values)
+                and len(values) == len(set(values))
+                for field, values in correlation_enum_values.items()
+            )):
+        errors.append(
+            "observability contract correlation_enum_values must map correlation fields to value lists"
+        )
+        correlation_enum_values = {}
+    else:
+        correlation_enum_values = dict(correlation_enum_values)
+    for legacy_key, field in OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS.items():
+        legacy_values = contract.get(legacy_key)
+        if legacy_key not in contract or not isinstance(legacy_values, list):
+            continue
+        if (field in correlation_enum_values
+                and set(correlation_enum_values[field]) != set(legacy_values)):
+            errors.append(
+                f"observability contract {legacy_key} conflicts with correlation_enum_values[{field}]"
+            )
+        correlation_enum_values.setdefault(field, legacy_values)
 
     question_ids = set(_observability_string_list(contract.get("runbook_question_ids")))
     answer_codes = contract.get("runbook_answer_codes")
@@ -1789,22 +1827,21 @@ def validate_observability_contract(contract):
 
     drill_incident = contract.get("drill_incident")
     if (not isinstance(drill_incident, dict)
-            or set(drill_incident) != OBSERVABILITY_DRILL_INCIDENT_FIELDS
-            or not all(
-                isinstance(drill_incident.get(field), str)
-                for field in OBSERVABILITY_DRILL_INCIDENT_FIELDS
-            )
+            or len(set(drill_incident) - {"event_name"}) < 3
+            or "event_name" not in drill_incident
+            or not set(drill_incident).issubset(correlation | {"event_name"})
+            or not all(isinstance(value, str) and value.strip()
+                       for value in drill_incident.values())
             or drill_incident.get("event_name") not in set(
                 _observability_string_list(contract.get("event_names")))
-            or drill_incident.get("asset") not in set(
-                _observability_string_list(contract.get("allowed_assets")))
-            or drill_incident.get("mode") not in set(
-                _observability_string_list(contract.get("allowed_modes")))
-            or drill_incident.get("risk_decision") not in set(
-                _observability_string_list(contract.get("allowed_risk_decisions")))
-            or drill_incident.get("reason_code") not in set(
-                _observability_string_list(contract.get("allowed_reason_codes")))):
-        errors.append("observability contract drill_incident must bind the five canonical incident fields")
+            or any(
+                field in correlation_enum_values
+                and value not in correlation_enum_values[field]
+                for field, value in drill_incident.items()
+            )):
+        errors.append(
+            "observability contract drill_incident must bind at least three contract correlation fields"
+        )
     if not isinstance(contract.get("drill_trace_name"), str) or not contract.get("drill_trace_name").strip():
         errors.append("observability contract requires a drill_trace_name")
     drill_alert = contract.get("drill_alert")
@@ -1893,6 +1930,38 @@ def _observability_contract_state(
         })
         for question_id, entry in (contract.get("runbook_answer_contract") or {}).items()
     }
+    correlation_enum_values = {
+        field: frozenset(members)
+        for field, members in (contract.get("correlation_enum_values") or {}).items()
+    }
+    for legacy_key, field in OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS.items():
+        if legacy_key in contract:
+            correlation_enum_values[field] = frozenset(contract.get(legacy_key) or [])
+    timestamp_order = tuple(contract.get("correlation_timestamp_order") or [])
+    if not timestamp_order:
+        # Compatibility for schema-v1 contracts extracted before the optional
+        # order existed. Derive a chain only when every contract-declared field
+        # has one unambiguous temporal role; otherwise retain no implicit order.
+        role_tokens = {
+            "event": 0,
+            "occur": 1,
+            "occurred": 1,
+            "observe": 2,
+            "observed": 2,
+        }
+        ranked = []
+        for field in contract.get("correlation_timestamp_fields") or []:
+            roles = {
+                role_tokens[token]
+                for token in re.split(r"[^a-z0-9]+", field.lower())
+                if token in role_tokens
+            }
+            if len(roles) != 1:
+                ranked = []
+                break
+            ranked.append((roles.pop(), field))
+        if ranked and len({rank for rank, _field in ranked}) == len(ranked):
+            timestamp_order = tuple(field for _rank, field in sorted(ranked))
     values = {
         "errors": tuple(errors),
         "path": str(path or ""),
@@ -1913,8 +1982,10 @@ def _observability_contract_state(
         "correlation_hash_fields": frozenset(contract.get("correlation_hash_fields") or []),
         "correlation_timestamp_fields": frozenset(
             contract.get("correlation_timestamp_fields") or []),
+        "correlation_timestamp_order": timestamp_order,
         "correlation_sequence_fields": frozenset(
             contract.get("correlation_sequence_fields") or []),
+        "correlation_enum_values": MappingProxyType(correlation_enum_values),
         "allowed_assets": frozenset(contract.get("allowed_assets") or []),
         "allowed_modes": frozenset(contract.get("allowed_modes") or []),
         "allowed_risk_decisions": frozenset(contract.get("allowed_risk_decisions") or []),
@@ -2205,13 +2276,8 @@ def _valid_observability_correlation_record(record, contract_state=None):
         elif key == "trace_id":
             if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
                 return False
-        elif key == "asset" and value not in state["allowed_assets"]:
-            return False
-        elif key == "mode" and value not in state["allowed_modes"]:
-            return False
-        elif key == "risk_decision" and value not in state["allowed_risk_decisions"]:
-            return False
-        elif key == "reason_code" and value not in state["allowed_reason_codes"]:
+        elif (key in state["correlation_enum_values"]
+              and value not in state["correlation_enum_values"][key]):
             return False
         elif not _nonempty_string(value):
             return False
@@ -2264,7 +2330,7 @@ def _valid_observability_drill_answer(answer, contract_state=None):
 
 def _validate_observability_drill_correlations(
         runbook, log_artifact, trace_artifact, alert_artifact, receipt, contract_state=None):
-    """Bind every frozen drill answer to one correlated synthetic incident record."""
+    """Bind contract-declared drill facts to one correlated incident record."""
     state = contract_state or _OBSERVABILITY_DEFAULT_STATE
     answers = {
         item.get("question_id"): item
@@ -2277,17 +2343,50 @@ def _validate_observability_drill_correlations(
             or not isinstance(records, list)):
         return ["runbook drill cannot be correlated to the structured incident record"]
 
-    authority = answers["CURRENT_AUTHORIZED_STAGE_AND_MODE"]["facts"]
-    identifiers = answers["DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS"]["facts"]
-    hashes = answers["STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES"]["facts"]
-    timestamps = answers["LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS"]["facts"]
-    disposition = answers["HUMAN_DISPOSITION_REQUIRED_NEXT"]["facts"]
+    facts, fact_kinds = {}, {}
+    conflicting_facts = False
+    for question_id, answer in answers.items():
+        field_kinds = state["runbook_answer_contract"][question_id]["fields"]
+        for field, value in answer["facts"].items():
+            if field in facts and facts[field] != value:
+                conflicting_facts = True
+            facts[field] = value
+            fact_kinds[field] = field_kinds[field]
     match_fields = {
-        **identifiers,
-        **hashes,
-        "mode": authority.get("mode"),
-        "market_event_ts": timestamps.get("market_timestamp"),
+        field: value for field, value in facts.items()
+        if field in state["correlation_fields"]
     }
+    # Schema-v1 contracts may use semantically equivalent runbook and log clock
+    # names. Preserve the join without pinning project vocabulary: an alias is
+    # accepted only when removing generic clock words leaves one identical,
+    # unique semantic stem on each side. Ambiguous or similar names fail closed.
+    timestamp_aliases = {}
+    timestamp_alias_ambiguous = False
+    generic_clock_tokens = {"at", "event", "time", "timestamp", "ts"}
+
+    def timestamp_stem(field):
+        return tuple(
+            token for token in re.split(r"[^a-z0-9]+", field.lower())
+            if token and token not in generic_clock_tokens
+        )
+
+    correlation_timestamps_by_stem = {}
+    for field in state["correlation_timestamp_fields"]:
+        stem = timestamp_stem(field)
+        if stem:
+            correlation_timestamps_by_stem.setdefault(stem, []).append(field)
+    for field, value in facts.items():
+        if fact_kinds.get(field) != "timestamp" or field in match_fields:
+            continue
+        candidates = correlation_timestamps_by_stem.get(timestamp_stem(field), [])
+        if len(candidates) == 1:
+            target = candidates[0]
+            if target in timestamp_aliases and timestamp_aliases[target] != value:
+                timestamp_alias_ambiguous = True
+            timestamp_aliases[target] = value
+        elif len(candidates) > 1:
+            timestamp_alias_ambiguous = True
+    match_fields.update(timestamp_aliases)
     correlated_records = [
         record
         for record in records
@@ -2297,10 +2396,12 @@ def _validate_observability_drill_correlations(
         and all(record.get(field) == value for field, value in state["drill_incident"].items())
         )
     ]
-    private_feed = parse_ts(timestamps.get("private_feed_timestamp"))
     observed_at = parse_ts(runbook.get("observed_at"))
     errors = []
-    if authority.get("authorized_stage") != receipt.get("authorized_stage") or not correlated_records:
+    if (conflicting_facts or timestamp_alias_ambiguous or not match_fields
+            or not correlated_records
+            or ("authorized_stage" in facts
+                and facts["authorized_stage"] != receipt.get("authorized_stage"))):
         errors.append("runbook drill facts must match one correlated structured incident record")
     incident_trace_ids = {record.get("trace_id") for record in correlated_records}
     spans = trace_artifact.get("spans") if isinstance(trace_artifact, dict) else None
@@ -2311,7 +2412,7 @@ def _validate_observability_drill_correlations(
                 and span.get("trace_id") in incident_trace_ids
                 for span in spans
             )):
-        errors.append("runbook drill requires a halt trace correlated to the incident record")
+        errors.append("runbook drill requires the contract trace correlated to the incident record")
     executions = alert_artifact.get("executions") if isinstance(alert_artifact, dict) else None
     if (not isinstance(executions, list)
             or not any(
@@ -2320,10 +2421,19 @@ def _validate_observability_drill_correlations(
                         for field, value in state["drill_alert"].items())
                 for execution in executions
             )):
-        errors.append("runbook drill requires the canonical fired stale-feed alert")
-    if not private_feed or not observed_at or private_feed > observed_at:
-        errors.append("runbook drill private-feed timestamp must precede its observation")
-    if disposition.get("human_disposition") != runbook.get("operator_disposition"):
+        errors.append("runbook drill requires the contract-declared fired alert")
+    fact_timestamps = [
+        parse_ts(value) for field, value in facts.items()
+        if fact_kinds.get(field) == "timestamp"
+    ]
+    if (not observed_at or not fact_timestamps
+            or any(value is None or value > observed_at for value in fact_timestamps)):
+        errors.append("runbook drill timestamps must precede its observation")
+    enum_facts = {
+        value for field, value in facts.items()
+        if fact_kinds.get(field) == "enum"
+    }
+    if runbook.get("operator_disposition") not in enum_facts:
         errors.append("runbook drill human disposition must match the operator disposition")
     return errors
 
@@ -2392,12 +2502,19 @@ def _validate_observability_json_artifact(
         )
         receipt_observed_at = parse_ts(data.get("observed_at"))
         if valid_records and receipt_observed_at:
-            valid_records = all(
-                parse_ts(item["observed_at"]) == receipt_observed_at
-                and parse_ts(item["market_event_ts"]) <= parse_ts(item["occurred_at"])
-                <= parse_ts(item["observed_at"])
-                for item in records
-            )
+            for item in records:
+                timestamps = {
+                    name: parse_ts(item.get(name))
+                    for name in state["correlation_timestamp_fields"]
+                }
+                order = state["correlation_timestamp_order"]
+                if (any(value is None or value > receipt_observed_at
+                        for value in timestamps.values())
+                        or (order and timestamps[order[-1]] != receipt_observed_at)
+                        or any(timestamps[earlier] > timestamps[later]
+                               for earlier, later in zip(order, order[1:]))):
+                    valid_records = False
+                    break
         if (not isinstance(fields, list) or len(fields) != len(field_set)
                 or field_set != state["correlation_fields"] or not valid_records):
             errors.append("log_artifact must contain correlated structured log records")

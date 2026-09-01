@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "artifact_type": "anti_gaming_canary_evidence",
+  "environment_id": "agents-specialist-fleet-focused-local-drill",
+  "runtime_digest": "263dab7dc7e1c7ec15ff4a123b5835fa8eaec06564ff2db474efed08265245f5",
+  "observed_at": "2026-09-01T21:18:41Z",
+  "canary_failed": true,
+  "results": {
+    "disabled_alert": "FAILED_AS_EXPECTED",
+    "missing_signal": "FAILED_AS_EXPECTED"
+  },
+  "fresh_fail_streak_exit_code": 3,
+  "fresh_fail_streak_stdout_sha256": "fe9e5d0f1a1a1a708e27e13272a7ee0c08a0c19968ff368707ce0b5a52d26fb6",
+  "mutation_canaries": "Pathway mutates and restores all seven bound artifacts during proof construction"
+}

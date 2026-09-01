@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "contract_type": "observability_evidence_contract",
+  "project_key": "agents",
+  "evidence_source": "specialist-fleet subagent performance instrument",
+  "metric_names": [
+    "specialist_evaluations_total",
+    "specialist_fail_streak",
+    "specialist_pass_rate_ratio"
+  ],
+  "metric_label_values": {
+    "specialist_evaluations_total": {
+      "fleet": [
+        "SPECIALIST_FLEET"
+      ]
+    },
+    "specialist_fail_streak": {
+      "fleet": [
+        "SPECIALIST_FLEET"
+      ],
+      "state": [
+        "CLEAN"
+      ]
+    },
+    "specialist_pass_rate_ratio": {
+      "fleet": [
+        "SPECIALIST_FLEET"
+      ]
+    }
+  },
+  "metric_domains": {
+    "specialist_evaluations_total": [
+      0,
+      null
+    ],
+    "specialist_fail_streak": [
+      0,
+      null
+    ],
+    "specialist_pass_rate_ratio": [
+      0,
+      1
+    ]
+  },
+  "event_names": [
+    "specialist.performance.alert_fired",
+    "specialist.performance.ledger_checked",
+    "specialist.trap.evaluated"
+  ],
+  "correlation_fields": [
+    "alert_id",
+    "alert_state",
+    "event_id",
+    "failure_mode",
+    "fleet",
+    "ledger_sha256",
+    "observed_at",
+    "occurred_at",
+    "operator_disposition",
+    "safe_action",
+    "sequence",
+    "specialist",
+    "trace_id"
+  ],
+  "correlation_hash_fields": [
+    "ledger_sha256"
+  ],
+  "correlation_timestamp_fields": [
+    "observed_at",
+    "occurred_at"
+  ],
+  "correlation_timestamp_order": [
+    "occurred_at",
+    "observed_at"
+  ],
+  "correlation_sequence_fields": [
+    "sequence"
+  ],
+  "correlation_enum_values": {
+    "alert_state": [
+      "FIRE_REVIEW"
+    ],
+    "failure_mode": [
+      "THREE_CONSECUTIVE_FAILURES"
+    ],
+    "fleet": [
+      "SPECIALIST_FLEET"
+    ],
+    "operator_disposition": [
+      "STOP_HIRING_REVISE_REREGISTER"
+    ],
+    "safe_action": [
+      "STOP_HIRING_REVISE_REREGISTER"
+    ]
+  },
+  "drill_incident": {
+    "event_name": "specialist.performance.alert_fired",
+    "alert_state": "FIRE_REVIEW",
+    "failure_mode": "THREE_CONSECUTIVE_FAILURES",
+    "fleet": "SPECIALIST_FLEET"
+  },
+  "drill_trace_name": "specialist.fail_streak.detected",
+  "drill_alert": {
+    "alert_id": "subagent-perf-fail-streak",
+    "condition": "three consecutive specialist failures",
+    "status": "FIRED",
+    "safe_action": "STOP_HIRING_REVISE_REREGISTER"
+  },
+  "runbook_question_ids": [
+    "CONFIRM_OBSERVATION_WINDOW",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION",
+    "IDENTIFY_DEGRADED_SPECIALIST",
+    "VERIFY_LEDGER_ALERT_AND_TRACE"
+  ],
+  "runbook_evidence_fields": [
+    "alert_artifact",
+    "canary_artifact",
+    "log_artifact",
+    "metric_artifact",
+    "trace_artifact"
+  ],
+  "runbook_dispositions": [
+    "STOP_HIRING_REVISE_REREGISTER"
+  ],
+  "runbook_answer_codes": {
+    "CONFIRM_OBSERVATION_WINDOW": "FRESH_OBSERVATION_CONFIRMED",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": "SAFE_DISPOSITION_CONFIRMED",
+    "IDENTIFY_DEGRADED_SPECIALIST": "DEGRADED_SPECIALIST_IDENTIFIED",
+    "VERIFY_LEDGER_ALERT_AND_TRACE": "CORRELATED_EVIDENCE_VERIFIED"
+  },
+  "runbook_enum_values": {
+    "failure_mode": [
+      "THREE_CONSECUTIVE_FAILURES"
+    ],
+    "operator_disposition": [
+      "STOP_HIRING_REVISE_REREGISTER"
+    ]
+  },
+  "runbook_missing_evidence": [
+    "LIVE_SCHEDULE_EXECUTION_RECEIPT"
+  ],
+  "runbook_answer_contract": {
+    "CONFIRM_OBSERVATION_WINDOW": {
+      "fields": {
+        "occurred_at": "timestamp",
+        "observed_at": "timestamp"
+      },
+      "evidence": [
+        "log_artifact",
+        "metric_artifact"
+      ]
+    },
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": {
+      "fields": {
+        "operator_disposition": "enum",
+        "safe_action": "identifier"
+      },
+      "evidence": [
+        "alert_artifact"
+      ]
+    },
+    "IDENTIFY_DEGRADED_SPECIALIST": {
+      "fields": {
+        "failure_mode": "enum",
+        "specialist": "identifier"
+      },
+      "evidence": [
+        "alert_artifact",
+        "log_artifact"
+      ]
+    },
+    "VERIFY_LEDGER_ALERT_AND_TRACE": {
+      "fields": {
+        "alert_id": "identifier",
+        "ledger_sha256": "sha256",
+        "trace_id": "identifier"
+      },
+      "evidence": [
+        "alert_artifact",
+        "log_artifact",
+        "trace_artifact"
+      ]
+    }
+  },
+  "trusted_verifier_sha256": [
+    "5ebc9584c1fc911465aa3261d49b0e82fee139ff723c85625e08d457e2f4bd3b"
+  ],
+  "source_verifier_sha256": "b9bb651d16d73d81742530aca7ab3c8c4ec7dbd6b7b8d3697acf20e9abca97d6"
+}

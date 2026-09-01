@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "artifact_type": "trace_evidence",
+  "environment_id": "agents-specialist-fleet-focused-local-drill",
+  "runtime_digest": "263dab7dc7e1c7ec15ff4a123b5835fa8eaec06564ff2db474efed08265245f5",
+  "observed_at": "2026-09-01T21:18:41Z",
+  "context_validated": true,
+  "spans": [
+    {
+      "trace_id": "263dab7dc7e1c7ec15ff4a123b5835fa",
+      "span_id": "8eaec06564ff2db4",
+      "name": "specialist.fail_streak.detected",
+      "source_transcript": "/Users/alexhale/Projects/agents/hermes/subagents/redactor/trap-run-2026-08-30T132555Z.md",
+      "source_transcript_sha256": "254acc797c00228cd7d3a0a19931d50ea05c71173b1b9894359d2beaab2e3926"
+    }
+  ],
+  "fresh_drill_specialist": "pathway-g3-drill",
+  "fresh_drill_exit_code": 3,
+  "drill_stdout_sha256": "fe9e5d0f1a1a1a708e27e13272a7ee0c08a0c19968ff368707ce0b5a52d26fb6"
+}

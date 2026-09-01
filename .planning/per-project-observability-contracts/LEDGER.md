@@ -53,11 +53,43 @@ Done against the shared work ID:
   Verification: frozen Phase 1 characterization 5/5 exact; Phase 1 AST
   fidelity 24/24; canonical suite 1343/1343. The corrected diff passed
   independent re-review with no remaining P0, P1, or P2 finding.
+- Phase 3 — the Agents specialist-fleet contract and focused G3 receipt are
+  complete locally. `contracts/observability/agents.json` defines three real
+  ledger metrics, thirteen log-correlation fields, the fail-streak trace and
+  alert, and four project-specific runbook questions without any Tradebot
+  compatibility names. The engine now correlates drill facts from each
+  contract's answer schema and validates contract-declared timestamp fields and
+  ordering.
+  A narrow engine-owned timestamp-alias rule preserves Rainman's existing
+  `market_timestamp` to `market_event_ts` join from the contract-declared field
+  names without changing the locked Phase 1 contract bytes; a mutation test
+  proves that changing only the market event timestamp is refused. The engine
+  no longer indexes Tradebot question IDs or requires `market_event_ts` for
+  other project contracts.
+  The focused receipt under `observability/` binds all seven artifact fields to
+  the real Agents ledger, watcher, trap transcript, historical alert, and a
+  fresh read-only three-failure drill. Its registered verifier digest is
+  `5ebc9584c1fc911465aa3261d49b0e82fee139ff723c85625e08d457e2f4bd3b`.
+  The verifier executes byte-identical copies of the real Agents report and
+  watcher scripts in a temporary repo, observes watcher exit 3, and proves the
+  watcher wrote the fired alert to the isolated ops-lead inbox without writing
+  the Agents checkout.
+  `verify_phase3_g3.py` proves runtime scope, `proof_is_verified=true`, seven
+  of seven artifact mutation canaries, a refused contract-violating receipt,
+  and an unchanged Agents checkout. Frozen characterization remains 5/5,
+  Phase 1 AST fidelity remains 24/24, and the canonical suite is 1356/1356.
+  This gate is intentionally not written into the shared proof ledger: the
+  active work item resolves `pathway-operating-layer`, while this receipt
+  resolves the `agents` contract. The prior Agents outcome remains closed with
+  its honest waiver, and the watcher remains manual, not scheduled. No ledger
+  proof was manufactured or retroactively migrated.
 
-Next: Phase 3 (agents contract, G3 = observability proof), then Phase 4 (docs).
+Next: Phase 4 (docs). The central outcome's own observability credit remains
+open until it has evidence under its own project contract; G3 itself is the
+approved focused Agents-scoped contract gate.
 The extracted Phase 1 contract and the separate approval-authority repair are
-already preserved in distinct commits. Phase 2 lands in the same local commit
-as this ledger update.
+already preserved in distinct commits. Phase 2 is preserved in `ac0b004`; this
+Phase 3 gate remains a separate central slice.
 
 Decision at G1: Phase 1 preserves `trusted_verifier_sha256` in the contract
 verbatim because extraction fidelity is the goal. Moving the trust root is a

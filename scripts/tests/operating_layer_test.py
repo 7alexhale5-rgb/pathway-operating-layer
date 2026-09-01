@@ -252,13 +252,21 @@ def test_observability_contract_loader_fails_closed_and_gates_schema():
 
     mutated = json.loads(json.dumps(contract))
     mutated["drill_incident"] = {"unrelated": None}
-    check(any("five canonical incident fields" in error for error in gate(mutated)),
+    check(any("three contract correlation fields" in error for error in gate(mutated)),
           "a nullable unrelated field cannot erase the drill predicate")
     for field, malformed in (("event_name", []), ("asset", {})):
         mutated = json.loads(json.dumps(contract))
         mutated["drill_incident"][field] = malformed
-        check(any("five canonical incident fields" in error for error in gate(mutated)),
+        check(any("three contract correlation fields" in error for error in gate(mutated)),
               f"an unhashable nested drill {field} is refused without crashing")
+    mutated = json.loads(json.dumps(contract))
+    mutated["drill_incident"] = {
+        "event_name": contract["drill_incident"]["event_name"],
+        "asset": contract["drill_incident"]["asset"],
+        "mode": contract["drill_incident"]["mode"],
+    }
+    check(any("three contract correlation fields" in error for error in gate(mutated)),
+          "event_name plus only two correlation fields cannot satisfy the drill floor")
     mutated = json.loads(json.dumps(contract)); mutated["drill_alert"]["status"] = "OPEN"
     check(any("drill_alert" in error for error in gate(mutated)),
           "FIRED remains an engine-required alert invariant")
@@ -462,6 +470,123 @@ def test_observability_contract_resolution_g2_and_identity_guards():
           "unknown observability work IDs cannot trigger verifier side effects")
     check(before_unknown_commands == after_unknown_work_log == after_unknown_proof_add,
           "unknown observability work IDs cannot mutate any run, proof, measurement, or carry-forward ledger")
+
+
+def test_agents_observability_contract_uses_generic_drill_envelope():
+    reset()
+    opl = load_cli("agents_observability_contract")
+    contract_path = REPO / "contracts" / "observability" / "agents.json"
+    contract, errors, contract_sha256 = opl.load_observability_contract_snapshot(contract_path)
+    check(not errors and len(contract_sha256) == 64,
+          "the shipped Agents observability contract passes the schema gate")
+    verifier = (
+        REPO / ".planning" / "per-project-observability-contracts"
+        / "observability" / "verify_agents_runtime_receipt.py"
+    )
+    check(opl.sha256_file(verifier) in set(contract.get("trusted_verifier_sha256") or []),
+          "the Agents contract registers the exact focused runtime verifier digest")
+    legacy_questions = {
+        "CURRENT_AUTHORIZED_STAGE_AND_MODE",
+        "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS",
+        "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES",
+        "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS",
+        "HUMAN_DISPOSITION_REQUIRED_NEXT",
+    }
+    check(not legacy_questions.intersection(contract["runbook_question_ids"])
+          and "market_event_ts" not in contract["correlation_fields"],
+          "the Agents contract has no Tradebot question or market timestamp compatibility names")
+    malformed_order = json.loads(json.dumps(contract))
+    malformed_order["correlation_timestamp_order"] = ["occurred_at"]
+    check(any("correlation_timestamp_order" in error
+              for error in opl.validate_observability_contract(malformed_order)),
+          "a timestamp order omitting a contract clock is refused")
+
+    state = opl._observability_contract_state(
+        contract, path=str(contract_path), key="agents", digest=contract_sha256,
+        project_key="agents")
+    check(state["correlation_timestamp_order"] == ("occurred_at", "observed_at"),
+          "the Agents contract, not the engine, declares its timestamp order")
+    evidence_dir = verifier.parent
+    envelope = json.loads((evidence_dir / "OBSERVABILITY.json").read_text(encoding="utf-8"))
+    receipt = envelope["observability_receipt"]
+    expected = {
+        "work_id": receipt["work_id"],
+        "recommendation_id": receipt["recommendation_id"],
+        "project": "agents",
+        "target_project": "/Users/alexhale/Projects/agents",
+    }
+    observed_at = opl.parse_ts(receipt["issued_at"])
+    receipt_errors = opl.validate_observability_runtime_receipt(
+        receipt, evidence_dir, expected, now=observed_at, contract_state=state)
+    check(not receipt_errors,
+          f"the complete Agents receipt validates without Tradebot hardcodes ({receipt_errors})")
+
+    violating = json.loads(json.dumps(receipt))
+    violating["metric_names"][0] = "undeclared_specialist_metric"
+    check(any("exact canonical metric_names" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  violating, evidence_dir, expected, now=observed_at,
+                  contract_state=state)),
+          "a receipt violating the Agents metric contract is refused")
+
+    runbook = json.loads(
+        (evidence_dir / receipt["runbook_drill_artifact"]).read_text(encoding="utf-8"))
+    log = json.loads(
+        (evidence_dir / receipt["log_artifact"]).read_text(encoding="utf-8"))
+    trace = json.loads(
+        (evidence_dir / receipt["trace_artifact"]).read_text(encoding="utf-8"))
+    alert = json.loads(
+        (evidence_dir / receipt["alert_artifact"]).read_text(encoding="utf-8"))
+    check(not opl._validate_observability_drill_correlations(
+              runbook, log, trace, alert, receipt, state),
+          "generic drill correlation accepts the contract-declared Agents incident")
+    tampered_log = json.loads(json.dumps(log))
+    tampered_log["records"][0]["failure_mode"] = "TWO_FAILURES_ONLY"
+    check(bool(opl._validate_observability_drill_correlations(
+              runbook, tampered_log, trace, alert, receipt, state)),
+          "generic drill correlation refuses a non-contract Agents failure mode")
+
+    (_rainman_evidence, rainman_receipt_path, rainman_receipt_data,
+     _rainman_metric, _rainman_verifier) = _observability_runtime_fixture(
+        opl, ROOT / "projects" / "rainman-alias-fixture",
+        "W-rainman-alias-fixture", "REC-rainman-alias-fixture",
+        "rainman-alias-fixture",
+    )
+    rainman_state = opl._OBSERVABILITY_DEFAULT_STATE
+    rainman_base = rainman_receipt_path.parent
+    rainman_runbook_data = json.loads(
+        (rainman_base / rainman_receipt_data["runbook_drill_artifact"]).read_text(
+            encoding="utf-8"))
+    rainman_log_data = json.loads(
+        (rainman_base / rainman_receipt_data["log_artifact"]).read_text(encoding="utf-8"))
+    rainman_trace_data = json.loads(
+        (rainman_base / rainman_receipt_data["trace_artifact"]).read_text(encoding="utf-8"))
+    rainman_alert_data = json.loads(
+        (rainman_base / rainman_receipt_data["alert_artifact"]).read_text(encoding="utf-8"))
+    check(not opl._validate_observability_drill_correlations(
+              rainman_runbook_data, rainman_log_data, rainman_trace_data,
+              rainman_alert_data, rainman_receipt_data, rainman_state),
+          "contract-derived timestamp alias preserves Rainman market correlation")
+    rainman_log_data["records"][0]["market_event_ts"] = (
+        opl.parse_ts(rainman_log_data["records"][0]["market_event_ts"])
+        - opl.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    check(bool(opl._validate_observability_drill_correlations(
+              rainman_runbook_data, rainman_log_data, rainman_trace_data,
+              rainman_alert_data, rainman_receipt_data, rainman_state)),
+          "Rainman market-timestamp mutation cannot bypass the generic alias join")
+
+    future_log = json.loads(json.dumps(log))
+    future_log["records"][0]["occurred_at"] = "2026-09-01T21:18:42Z"
+    future_log_path = write(
+        "out/operator-artifacts/agents-g3-future-log.json",
+        json.dumps(future_log) + "\n",
+    )
+    check(any("correlated structured log records" in error
+              for error in opl._validate_observability_json_artifact(
+                  "log_artifact", future_log_path, receipt,
+                  now=observed_at, contract_state=state)),
+          "generic timestamp ordering refuses occurrence after observation without market_event_ts")
 
 
 def _unregistered_test_names(namespace, tests):
@@ -8880,6 +9005,7 @@ def main():
         test_proof_canary_observability_report,
         test_observability_contract_loader_fails_closed_and_gates_schema,
         test_observability_contract_resolution_g2_and_identity_guards,
+        test_agents_observability_contract_uses_generic_drill_envelope,
         test_cohens_kappa_inter_rater_agreement,
         test_fleiss_kappa_multi_rater_agreement,
         test_kappa_reliability_thresholds,
