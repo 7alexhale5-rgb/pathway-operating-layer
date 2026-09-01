@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "contract_type": "observability_evidence_contract",
+  "project_key": "prettyfly/os",
+  "evidence_source": "sanitized Sentry Preview publisher monitor drill",
+  "metric_names": [
+    "pfos.fleet_cockpit.publisher_monitor_checkins_total",
+    "pfos.fleet_cockpit.publisher_signals_total",
+    "pfos.fleet_cockpit.publisher_snapshot_age_seconds"
+  ],
+  "metric_label_values": {
+    "pfos.fleet_cockpit.publisher_monitor_checkins_total": {
+      "reason": [
+        "contract_rejected",
+        "dedup_unavailable",
+        "fresh_idempotent",
+        "idempotency_conflict",
+        "insert_rate_limited",
+        "persisted",
+        "request_body_rejected",
+        "stale_idempotent",
+        "stale_snapshot",
+        "write_failed"
+      ],
+      "status": [
+        "error",
+        "ok"
+      ]
+    },
+    "pfos.fleet_cockpit.publisher_signals_total": {
+      "reason": [
+        "contract_rejected",
+        "dedup_unavailable",
+        "fresh_idempotent",
+        "idempotency_conflict",
+        "insert_rate_limited",
+        "persisted",
+        "request_body_rejected",
+        "stale_idempotent",
+        "stale_snapshot",
+        "write_failed"
+      ],
+      "status": [
+        "error",
+        "ok"
+      ]
+    },
+    "pfos.fleet_cockpit.publisher_snapshot_age_seconds": {
+      "reason": [
+        "contract_rejected",
+        "dedup_unavailable",
+        "fresh_idempotent",
+        "idempotency_conflict",
+        "insert_rate_limited",
+        "persisted",
+        "request_body_rejected",
+        "stale_idempotent",
+        "stale_snapshot",
+        "write_failed"
+      ],
+      "status": [
+        "error",
+        "ok"
+      ]
+    }
+  },
+  "metric_domains": {
+    "pfos.fleet_cockpit.publisher_monitor_checkins_total": [
+      0,
+      null
+    ],
+    "pfos.fleet_cockpit.publisher_signals_total": [
+      0,
+      null
+    ],
+    "pfos.fleet_cockpit.publisher_snapshot_age_seconds": [
+      0,
+      null
+    ]
+  },
+  "event_names": [
+    "pfos.fleet_cockpit.publisher.checkin_error",
+    "pfos.fleet_cockpit.publisher.checkin_ok",
+    "pfos.fleet_cockpit.publisher.checkin_suppressed"
+  ],
+  "correlation_fields": [
+    "asset",
+    "deployment_digest",
+    "environment_id",
+    "event_id",
+    "mode",
+    "monitor_id",
+    "observed_at",
+    "occurred_at",
+    "reason_code",
+    "risk_decision",
+    "sequence",
+    "snapshot_generated_at",
+    "span_id",
+    "trace_id"
+  ],
+  "correlation_hash_fields": [
+    "deployment_digest"
+  ],
+  "correlation_timestamp_fields": [
+    "snapshot_generated_at",
+    "occurred_at",
+    "observed_at"
+  ],
+  "correlation_timestamp_order": [
+    "snapshot_generated_at",
+    "occurred_at",
+    "observed_at"
+  ],
+  "correlation_sequence_fields": [
+    "sequence"
+  ],
+  "correlation_enum_values": {
+    "asset": [
+      "FLEET_COCKPIT"
+    ],
+    "environment_id": [
+      "pfos-preview"
+    ],
+    "mode": [
+      "PROPOSAL_ONLY"
+    ],
+    "monitor_id": [
+      "pfos-fleet-cockpit-snapshot-publisher"
+    ],
+    "reason_code": [
+      "CONTRACT_REJECTED",
+      "DEDUP_UNAVAILABLE",
+      "FRESH_IDEMPOTENT",
+      "IDEMPOTENCY_CONFLICT",
+      "INSERT_RATE_LIMITED",
+      "PERSISTED",
+      "REQUEST_BODY_REJECTED",
+      "STALE_IDEMPOTENT",
+      "STALE_SNAPSHOT",
+      "WRITE_FAILED"
+    ],
+    "risk_decision": [
+      "ALLOW",
+      "DENY"
+    ]
+  },
+  "drill_incident": {
+    "event_name": "pfos.fleet_cockpit.publisher.checkin_error",
+    "asset": "FLEET_COCKPIT",
+    "mode": "PROPOSAL_ONLY",
+    "monitor_id": "pfos-fleet-cockpit-snapshot-publisher",
+    "reason_code": "STALE_IDEMPOTENT",
+    "risk_decision": "DENY"
+  },
+  "drill_trace_name": "pfos.fleet_cockpit.publisher.checkin",
+  "drill_alert": {
+    "alert_id": "pfos-fleet-cockpit-snapshot-publisher",
+    "condition": "stale or missed publisher check-in",
+    "status": "FIRED",
+    "safe_action": "KEEP_FLEET_STALE_PAUSE_PUBLISHER_REVOKE_TOKEN"
+  },
+  "runbook_question_ids": [
+    "CONFIRM_OBSERVATION_WINDOW",
+    "CONFIRM_SAFE_RECOVERY",
+    "CONFIRM_STALE_PUBLISHER_INCIDENT",
+    "VERIFY_PROVIDER_CORRELATION"
+  ],
+  "runbook_evidence_fields": [
+    "alert_artifact",
+    "canary_artifact",
+    "log_artifact",
+    "metric_artifact",
+    "trace_artifact"
+  ],
+  "runbook_dispositions": [
+    "KEEP_FLEET_STALE_PAUSE_PUBLISHER_REVOKE_TOKEN"
+  ],
+  "runbook_answer_codes": {
+    "CONFIRM_OBSERVATION_WINDOW": "FRESH_OBSERVATION_CONFIRMED",
+    "CONFIRM_SAFE_RECOVERY": "SAFE_RECOVERY_CONFIRMED",
+    "CONFIRM_STALE_PUBLISHER_INCIDENT": "STALE_PUBLISHER_INCIDENT_CONFIRMED",
+    "VERIFY_PROVIDER_CORRELATION": "PROVIDER_CORRELATION_VERIFIED"
+  },
+  "runbook_enum_values": {
+    "operator_disposition": [
+      "KEEP_FLEET_STALE_PAUSE_PUBLISHER_REVOKE_TOKEN"
+    ],
+    "reason_code": [
+      "STALE_IDEMPOTENT"
+    ],
+    "risk_decision": [
+      "DENY"
+    ]
+  },
+  "runbook_missing_evidence": [
+    "EXTERNAL_NOTIFICATION_RECEIPT"
+  ],
+  "runbook_answer_contract": {
+    "CONFIRM_OBSERVATION_WINDOW": {
+      "fields": {
+        "occurred_at": "timestamp",
+        "observed_at": "timestamp",
+        "snapshot_generated_at": "timestamp"
+      },
+      "evidence": [
+        "log_artifact",
+        "metric_artifact"
+      ]
+    },
+    "CONFIRM_SAFE_RECOVERY": {
+      "fields": {
+        "operator_disposition": "enum",
+        "safe_action": "identifier"
+      },
+      "evidence": [
+        "alert_artifact",
+        "canary_artifact"
+      ]
+    },
+    "CONFIRM_STALE_PUBLISHER_INCIDENT": {
+      "fields": {
+        "monitor_id": "identifier",
+        "reason_code": "enum",
+        "risk_decision": "enum"
+      },
+      "evidence": [
+        "alert_artifact",
+        "log_artifact"
+      ]
+    },
+    "VERIFY_PROVIDER_CORRELATION": {
+      "fields": {
+        "deployment_digest": "sha256",
+        "monitor_id": "identifier",
+        "span_id": "identifier",
+        "trace_id": "identifier"
+      },
+      "evidence": [
+        "alert_artifact",
+        "log_artifact",
+        "trace_artifact"
+      ]
+    }
+  },
+  "trusted_verifier_sha256": [
+    "5e3121dd58e2e29cf5477228de781f607786a5932468615e0d8157c747cb79f4"
+  ]
+}
