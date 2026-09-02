@@ -84,11 +84,10 @@
     "pfos.fleet_cockpit.publisher.checkin_suppressed"
   ],
   "correlation_fields": [
-    "asset",
     "deployment_digest",
     "environment_id",
     "event_id",
-    "mode",
+    "monitor_check_in_id",
     "monitor_id",
     "observed_at",
     "occurred_at",
@@ -107,23 +106,12 @@
     "occurred_at",
     "observed_at"
   ],
-  "correlation_timestamp_order": [
-    "snapshot_generated_at",
-    "occurred_at",
-    "observed_at"
-  ],
   "correlation_sequence_fields": [
     "sequence"
   ],
   "correlation_enum_values": {
-    "asset": [
-      "FLEET_COCKPIT"
-    ],
     "environment_id": [
       "pfos-preview"
-    ],
-    "mode": [
-      "PROPOSAL_ONLY"
     ],
     "monitor_id": [
       "pfos-fleet-cockpit-snapshot-publisher"
@@ -147,8 +135,6 @@
   },
   "drill_incident": {
     "event_name": "pfos.fleet_cockpit.publisher.checkin_error",
-    "asset": "FLEET_COCKPIT",
-    "mode": "PROPOSAL_ONLY",
     "monitor_id": "pfos-fleet-cockpit-snapshot-publisher",
     "reason_code": "STALE_IDEMPOTENT",
     "risk_decision": "DENY"
@@ -244,6 +230,6 @@
     }
   },
   "trusted_verifier_sha256": [
-    "5e3121dd58e2e29cf5477228de781f607786a5932468615e0d8157c747cb79f4"
+    "05ea508ed93d5f12442f868e783ad4fcd507621cc53a84868ca0e945035add31"
   ]
 }
