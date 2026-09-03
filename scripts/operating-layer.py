@@ -9859,7 +9859,16 @@ def project_local_findings(project_path, max_files=40, max_records=200):
     Returns (findings_list, source_count). Each finding carries an explicit
     `pathway` when the source declared one, so it routes deterministically.
     """
-    root = Path(project_path).expanduser()
+    # A bare project NAME must resolve the same way work-start does; Path("koho") from a cwd that
+    # happens to contain a koho/ folder scanned the wrong tree and reported STATE.md missing when
+    # it existed (found 2026-09-03 on the koho outcome).
+    raw = str(project_path or "").strip()
+    if raw and os.sep not in raw and not raw.startswith("."):
+        # bare name: the projects-root join, never a same-named folder under the cwd
+        joined = Path(DEFAULT_PROJECTS_ROOT).expanduser() / raw
+        root = joined if joined.is_dir() else Path(resolve_project_dir(raw) or raw).expanduser()
+    else:
+        root = Path(resolve_project_dir(raw) or raw).expanduser()
     planning = root / ".planning"
     findings = []
     source_count = 0
