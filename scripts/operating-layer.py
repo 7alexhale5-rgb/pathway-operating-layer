@@ -5666,7 +5666,12 @@ def resolve_project_dir(raw, projects_root=None):
     if not raw:
         return ""
     p = Path(raw).expanduser()
-    if p.exists():
+    # A bare NAME is a project name, never a cwd-relative path: `--project koho` run from
+    # ~/Projects/koho found the empty stray folder ~/Projects/koho/koho and reported STATE.md
+    # missing when it existed (found 2026-09-03; a downstream patch could not catch it because
+    # this resolver had already committed to the wrong directory). Paths keep the old rule.
+    bare = os.sep not in raw and not raw.startswith(".")
+    if not bare and p.exists():
         return str(p.resolve())
     candidate = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser() / raw
     if candidate.exists():
@@ -5689,6 +5694,8 @@ def resolve_project_dir(raw, projects_root=None):
         ]
         if len(hits) == 1:
             return str(hits[0].resolve())
+    if bare and p.exists():
+        return str(p.resolve())
     return str(p)
 
 
@@ -9859,16 +9866,7 @@ def project_local_findings(project_path, max_files=40, max_records=200):
     Returns (findings_list, source_count). Each finding carries an explicit
     `pathway` when the source declared one, so it routes deterministically.
     """
-    # A bare project NAME must resolve the same way work-start does; Path("koho") from a cwd that
-    # happens to contain a koho/ folder scanned the wrong tree and reported STATE.md missing when
-    # it existed (found 2026-09-03 on the koho outcome).
-    raw = str(project_path or "").strip()
-    if raw and os.sep not in raw and not raw.startswith("."):
-        # bare name: the projects-root join, never a same-named folder under the cwd
-        joined = Path(DEFAULT_PROJECTS_ROOT).expanduser() / raw
-        root = joined if joined.is_dir() else Path(resolve_project_dir(raw) or raw).expanduser()
-    else:
-        root = Path(resolve_project_dir(raw) or raw).expanduser()
+    root = Path(resolve_project_dir(project_path) or project_path).expanduser()
     planning = root / ".planning"
     findings = []
     source_count = 0

@@ -6404,6 +6404,25 @@ def test_resolve_project_dir_nesting_and_unverified_proof_loudness():
         mod.resolve_project_dir("shadowed", projects_root=str(projects)) == "shadowed",
         "meta directories (_archive) never satisfy the nested search",
     )
+    # 2026-09-03 regression: from a cwd holding a same-named folder, the bare name still
+    # resolves to the projects root (Path("koho").exists() must not win over the join).
+    import os as _os
+    (projects / "koho" / "koho" / ".planning").mkdir(parents=True)
+    _cwd = _os.getcwd()
+    try:
+        _os.chdir(projects / "koho")
+        check(
+            mod.resolve_project_dir("koho", projects_root=str(projects))
+            == str((projects / "koho").resolve()),
+            "bare name from a cwd with a same-named subfolder resolves to the projects root",
+        )
+        check(
+            mod.resolve_project_dir("./koho", projects_root=str(projects))
+            == str((projects / "koho" / "koho").resolve()),
+            "an explicit relative path still resolves relative to the cwd",
+        )
+    finally:
+        _os.chdir(_cwd)
 
     import argparse
     ev = write("out/proof-evidence.md", "# evidence\n")
