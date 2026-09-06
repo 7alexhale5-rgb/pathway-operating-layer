@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "contract_type": "observability_evidence_contract",
+  "project_key": "sportsbook-edge",
+  "evidence_source": "sportsbook-edge NFL local runtime: the operational age gauges scraped over the real Prometheus endpoint, the worker telemetry health check that consumes them, and the drill that fires and clears both alerts",
+  "metric_names": [
+    "nfl_backup_age_seconds",
+    "nfl_wal_archive_age_seconds",
+    "nfl_readiness"
+  ],
+  "metric_label_values": {
+    "nfl_backup_age_seconds": {
+      "signal": [
+        "NFL-BACKUP-001"
+      ],
+      "status": [
+        "FIRED",
+        "CLEAR"
+      ]
+    },
+    "nfl_wal_archive_age_seconds": {
+      "signal": [
+        "NFL-WAL-001"
+      ],
+      "status": [
+        "FIRED",
+        "CLEAR"
+      ]
+    },
+    "nfl_readiness": {
+      "signal": [
+        "NFL-READY-001"
+      ],
+      "status": [
+        "FIRED",
+        "CLEAR"
+      ]
+    }
+  },
+  "metric_domains": {
+    "nfl_backup_age_seconds": [
+      0,
+      null
+    ],
+    "nfl_wal_archive_age_seconds": [
+      0,
+      null
+    ],
+    "nfl_readiness": [
+      0,
+      1
+    ]
+  },
+  "event_names": [
+    "nfl.backup.age_exceeds_rpo",
+    "nfl.telemetry.target_unreachable",
+    "nfl.observability.measured"
+  ],
+  "correlation_fields": [
+    "check_digest",
+    "component",
+    "environment_class",
+    "event_id",
+    "mode",
+    "observed_at",
+    "occurred_at",
+    "reason_code",
+    "risk_decision",
+    "runtime_digest",
+    "sequence",
+    "suite_run_id",
+    "trace_id"
+  ],
+  "correlation_hash_fields": [
+    "check_digest",
+    "runtime_digest"
+  ],
+  "correlation_timestamp_fields": [
+    "observed_at",
+    "occurred_at"
+  ],
+  "correlation_timestamp_order": [
+    "occurred_at",
+    "observed_at"
+  ],
+  "correlation_sequence_fields": [
+    "sequence"
+  ],
+  "correlation_enum_values": {
+    "component": [
+      "NFL_OPERATIONS_METRICS",
+      "NFL_WORKER_TELEMETRY"
+    ],
+    "environment_class": [
+      "LOCAL"
+    ],
+    "mode": [
+      "SAFE_TEST"
+    ],
+    "reason_code": [
+      "BACKUP_AGE_EXCEEDS_RPO",
+      "WORKER_TELEMETRY_UNREACHABLE",
+      "OBSERVABILITY_DRILL_MEASURED"
+    ],
+    "risk_decision": [
+      "BLOCK",
+      "ALLOW"
+    ]
+  },
+  "drill_incident": {
+    "event_name": "nfl.backup.age_exceeds_rpo",
+    "component": "NFL_OPERATIONS_METRICS",
+    "environment_class": "LOCAL",
+    "mode": "SAFE_TEST",
+    "reason_code": "BACKUP_AGE_EXCEEDS_RPO",
+    "risk_decision": "BLOCK"
+  },
+  "drill_trace_name": "worker:backup",
+  "drill_alert": {
+    "alert_id": "NFL-BACKUP-001",
+    "condition": "backup receipt age exceeds the approved 900 second RPO on the local runtime",
+    "status": "FIRED",
+    "safe_action": "KEEP_LOCAL_NO_PROMOTE"
+  },
+  "runbook_question_ids": [
+    "CONFIRM_BACKUP_AGE_SIGNAL",
+    "CONFIRM_LOCAL_RUNTIME_PROOF",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION",
+    "CONFIRM_TRACE_AND_CHECK_BINDING"
+  ],
+  "runbook_evidence_fields": [
+    "alert_artifact",
+    "canary_artifact",
+    "log_artifact",
+    "metric_artifact",
+    "trace_artifact"
+  ],
+  "runbook_dispositions": [
+    "KEEP_LOCAL_NO_PROMOTE"
+  ],
+  "runbook_answer_codes": {
+    "CONFIRM_BACKUP_AGE_SIGNAL": "BACKUP_AGE_SIGNAL_CONFIRMED",
+    "CONFIRM_LOCAL_RUNTIME_PROOF": "LOCAL_RUNTIME_PROOF_CONFIRMED",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": "SAFE_LOCAL_DISPOSITION_CONFIRMED",
+    "CONFIRM_TRACE_AND_CHECK_BINDING": "TRACE_AND_CHECK_BINDING_CONFIRMED"
+  },
+  "runbook_enum_values": {
+    "operator_disposition": [
+      "KEEP_LOCAL_NO_PROMOTE"
+    ],
+    "reason_code": [
+      "BACKUP_AGE_EXCEEDS_RPO",
+      "WORKER_TELEMETRY_UNREACHABLE",
+      "OBSERVABILITY_DRILL_MEASURED"
+    ],
+    "risk_decision": [
+      "BLOCK",
+      "ALLOW"
+    ]
+  },
+  "runbook_missing_evidence": [
+    "HOSTED_ALERT_DESTINATION_RECEIPT"
+  ],
+  "runbook_answer_contract": {
+    "CONFIRM_BACKUP_AGE_SIGNAL": {
+      "fields": {
+        "component": "identifier",
+        "reason_code": "enum",
+        "risk_decision": "enum"
+      },
+      "evidence": [
+        "alert_artifact",
+        "log_artifact"
+      ]
+    },
+    "CONFIRM_LOCAL_RUNTIME_PROOF": {
+      "fields": {
+        "observed_at": "timestamp",
+        "runtime_digest": "sha256",
+        "suite_run_id": "identifier"
+      },
+      "evidence": [
+        "log_artifact",
+        "metric_artifact"
+      ]
+    },
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": {
+      "fields": {
+        "operator_disposition": "enum",
+        "safe_action": "identifier",
+        "authorized_stage": "stage"
+      },
+      "evidence": [
+        "alert_artifact",
+        "canary_artifact"
+      ]
+    },
+    "CONFIRM_TRACE_AND_CHECK_BINDING": {
+      "fields": {
+        "trace_id": "identifier",
+        "check_digest": "sha256"
+      },
+      "evidence": [
+        "log_artifact",
+        "trace_artifact"
+      ]
+    }
+  },
+  "trusted_verifier_sha256": [
+    "f66d2a097532db137729cabfbc02eca74350a4160312c50cca8caf1927e444f7"
+  ]
+}
