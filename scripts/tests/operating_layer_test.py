@@ -2396,19 +2396,29 @@ def test_pathway_metric_reuses_generic_verifier_binding():
     }])
 
     parse_calls = 0
+    credit_calls = 0
     original_parse = opl.parse_generic_verifier_command
+    original_credit = opl.proof_credits_pathway
 
     def counting_parse(*call_args, **call_kwargs):
         nonlocal parse_calls
         parse_calls += 1
         return original_parse(*call_args, **call_kwargs)
 
+    def counting_credit(*call_args, **call_kwargs):
+        nonlocal credit_calls
+        credit_calls += 1
+        return original_credit(*call_args, **call_kwargs)
+
     opl.parse_generic_verifier_command = counting_parse
+    opl.proof_credits_pathway = counting_credit
     metric = opl.compute_pathway_metric(paths)
     check(metric["proved"] == len(recommendations),
           "the verifier-binding cache preserves the proved recommendation count")
     check(parse_calls == 1,
           "pathway-metric parses one shared generic verifier binding once per computation")
+    check(credit_calls == len(recommendations),
+          "pathway-metric validates only the matching proof for each recommendation")
 
     parse_calls = 0
     freshness_cache = {}

@@ -11487,9 +11487,6 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
     def proved(rec):
         rec_ts = parse_ts(rec.get("timestamp"))
         for proof in proofs:
-            if not proof_credits_pathway(
-                    proof, approval_events, verifier_binding_cache):
-                continue  # keystone: attested (free-text) proofs never raise the autonomy proof rate
             proof_rec = proof.get("recommendation_id")
             if proof_rec:
                 if proof_rec != rec.get("recommendation_id"):
@@ -11506,7 +11503,11 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
             if rec_ts and proof_ts:
                 delta = (proof_ts - rec_ts).total_seconds()
                 if 0 <= delta <= window_days * 86400:
-                    return True
+                    # Match first: unrelated proofs cannot credit this recommendation.
+                    # Keep the same verification and release-approval predicate.
+                    if proof_credits_pathway(
+                            proof, approval_events, verifier_binding_cache):
+                        return True
         return False
 
     by_pathway = {}

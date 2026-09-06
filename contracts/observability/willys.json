@@ -1,0 +1,201 @@
+{
+  "contract_type": "observability_evidence_contract",
+  "correlation_enum_values": {
+    "component": [
+      "sql-shim"
+    ],
+    "environment_class": [
+      "local"
+    ],
+    "mode": [
+      "LOCAL_SAMPLE"
+    ],
+    "reason_code": [
+      "NONE",
+      "CLIENT_REJECTED",
+      "SQL_SHIM_SERVER_ERROR"
+    ],
+    "risk_decision": [
+      "ALLOW",
+      "DENY"
+    ]
+  },
+  "correlation_fields": [
+    "component",
+    "environment_class",
+    "environment_id",
+    "event_id",
+    "mode",
+    "observed_at",
+    "occurred_at",
+    "reason_code",
+    "risk_decision",
+    "runtime_digest",
+    "sequence",
+    "suite_run_id",
+    "trace_id",
+    "span_id",
+    "request_id",
+    "alert_id"
+  ],
+  "correlation_hash_fields": [
+    "runtime_digest"
+  ],
+  "correlation_sequence_fields": [
+    "sequence"
+  ],
+  "correlation_timestamp_fields": [
+    "occurred_at",
+    "observed_at"
+  ],
+  "correlation_timestamp_order": [
+    "occurred_at",
+    "observed_at"
+  ],
+  "drill_alert": {
+    "alert_id": "sql-shim-server-error",
+    "condition": "a local SQL shim request returns HTTP 500",
+    "safe_action": "KEEP_LOCAL_NO_PROMOTE",
+    "status": "FIRED"
+  },
+  "drill_incident": {
+    "component": "sql-shim",
+    "environment_class": "local",
+    "event_name": "willys.shim.failure_alert",
+    "mode": "LOCAL_SAMPLE",
+    "reason_code": "SQL_SHIM_SERVER_ERROR",
+    "risk_decision": "DENY"
+  },
+  "drill_trace_name": "willys.shim.request",
+  "event_names": [
+    "willys.shim.failure_alert",
+    "willys.shim.recovered",
+    "willys.shim.request_completed",
+    "willys.shim.request_failed",
+    "willys.shim.request_span"
+  ],
+  "evidence_source": "Willys OS local sample SQL shim: real private database outage, local alert and recovery",
+  "metric_domains": {
+    "willys_shim_alerts_total": [
+      0,
+      null
+    ],
+    "willys_shim_failures_total": [
+      0,
+      null
+    ],
+    "willys_shim_requests_total": [
+      0,
+      null
+    ]
+  },
+  "metric_label_values": {
+    "willys_shim_alerts_total": {
+      "environment_class": [
+        "local"
+      ]
+    },
+    "willys_shim_failures_total": {
+      "environment_class": [
+        "local"
+      ]
+    },
+    "willys_shim_requests_total": {
+      "environment_class": [
+        "local"
+      ]
+    }
+  },
+  "metric_names": [
+    "willys_shim_requests_total",
+    "willys_shim_failures_total",
+    "willys_shim_alerts_total"
+  ],
+  "project_key": "willys",
+  "runbook_answer_codes": {
+    "CONFIRM_LOCAL_FAILURE_SIGNAL": "LOCAL_FAILURE_SIGNAL_CONFIRMED",
+    "CONFIRM_LOCAL_RUNTIME_PROOF": "LOCAL_RUNTIME_PROOF_CONFIRMED",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": "SAFE_LOCAL_DISPOSITION_CONFIRMED",
+    "CONFIRM_TRACE_AND_REQUEST_BINDING": "TRACE_AND_REQUEST_BINDING_CONFIRMED"
+  },
+  "runbook_answer_contract": {
+    "CONFIRM_LOCAL_FAILURE_SIGNAL": {
+      "evidence": [
+        "alert_artifact",
+        "log_artifact"
+      ],
+      "fields": {
+        "component": "identifier",
+        "reason_code": "enum",
+        "risk_decision": "enum"
+      }
+    },
+    "CONFIRM_LOCAL_RUNTIME_PROOF": {
+      "evidence": [
+        "log_artifact",
+        "metric_artifact"
+      ],
+      "fields": {
+        "observed_at": "timestamp",
+        "runtime_digest": "sha256",
+        "suite_run_id": "identifier"
+      }
+    },
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": {
+      "evidence": [
+        "alert_artifact",
+        "canary_artifact"
+      ],
+      "fields": {
+        "authorized_stage": "stage",
+        "operator_disposition": "enum",
+        "safe_action": "identifier"
+      }
+    },
+    "CONFIRM_TRACE_AND_REQUEST_BINDING": {
+      "evidence": [
+        "log_artifact",
+        "trace_artifact"
+      ],
+      "fields": {
+        "event_id": "identifier",
+        "request_id": "identifier",
+        "trace_id": "identifier"
+      }
+    }
+  },
+  "runbook_dispositions": [
+    "KEEP_LOCAL_NO_PROMOTE"
+  ],
+  "runbook_enum_values": {
+    "operator_disposition": [
+      "KEEP_LOCAL_NO_PROMOTE"
+    ],
+    "reason_code": [
+      "SQL_SHIM_SERVER_ERROR"
+    ],
+    "risk_decision": [
+      "DENY"
+    ]
+  },
+  "runbook_evidence_fields": [
+    "alert_artifact",
+    "canary_artifact",
+    "log_artifact",
+    "metric_artifact",
+    "trace_artifact"
+  ],
+  "runbook_missing_evidence": [
+    "PRODUCTION_RUNTIME_RECEIPT"
+  ],
+  "runbook_question_ids": [
+    "CONFIRM_LOCAL_FAILURE_SIGNAL",
+    "CONFIRM_LOCAL_RUNTIME_PROOF",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION",
+    "CONFIRM_TRACE_AND_REQUEST_BINDING"
+  ],
+  "schema_version": 1,
+  "trusted_verifier_sha256": [
+    "bb160bd1c8cb14e684d4acfaccec9966326960ae60230617c75a85d83d4fd2d4"
+  ]
+}
