@@ -31,6 +31,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import development_protocol
+
 
 # Portable defaults — derived from $HOME (and overridable by env), never a hardcoded username, so
 # the tool runs for anyone who clones it. Every default is also overridable by a CLI flag.
@@ -3483,6 +3486,7 @@ class Paths:
         self.pathway_pilot_latest_path = self.operator_intel / "pathway-pilot-latest.json"
         self.learning_candidates_path = self.operator_intel / "learning-candidates.ndjson"
         self.evaluations_path = self.operator_intel / "pathway-evaluations.ndjson"
+        self.development_protocol_path = self.operator_intel / "development-protocol.json"
         self.portfolio_next_path = self.operator_intel / "portfolio-next.json"
         self.rule_map_path = self.operator_intel / "rule-map.json"
         self.cockpit_path = self.operator_intel / "cockpit.json"
@@ -6814,7 +6818,7 @@ def scan_intel(args, paths, write_outputs=True):
     counts = Counter()
 
     ingest_logs = [
-        paths.claude_home / "hooks" / "ingest.log",
+        paths.claude_home / "logs" / "hook-ingest.log",
         paths.codex_home / "hooks" / "ingest.log",
     ]
     ingest_groups = {}
@@ -8860,6 +8864,9 @@ def run_work_start(args, paths):
         itinerary=itinerary,
         closeout_readiness="not_ready",
     )
+    if getattr(args, "development_protocol", False):
+        development_protocol.start(paths.development_protocol_path, work_id, project_path, args.goal)
+        update_work_item(paths, work_id, development_protocol_required=True)
     dashboard = build_daily_dashboard(paths)
     return {"records": [item], "findings": [], "work_id": work_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
 
@@ -9614,6 +9621,40 @@ def run_work_close(args, paths):
         }
     summary = work_status_summary(paths, args.work_id)
     findings = []
+    protocol_ready, protocol_status = development_protocol.enforce_close(
+        paths.development_protocol_path, args.work_id
+    )
+    if (summary.get("work_item") or {}).get("development_protocol_required") and not protocol_status.get("exists"):
+        protocol_ready = False
+    if not protocol_ready:
+        findings.append(
+            finding(
+                "work-close-protocol-incomplete",
+                "development-protocol",
+                "warn",
+                f"Development protocol checklist is incomplete for {args.work_id}.",
+                [
+                    line_evidence(
+                        paths.development_protocol_path,
+                        source=", ".join(protocol_status.get("open", [])),
+                    )
+                ],
+                "Complete each required protocol step with an evidence file and passing verifier.",
+                "static",
+                "high",
+            )
+        )
+        dashboard = build_daily_dashboard(paths)
+        return {
+            "records": [summary, protocol_status],
+            "findings": findings,
+            "closed": False,
+            "work_id": args.work_id,
+            "report": None,
+            "html": None,
+            "dashboard": str(paths.daily_dashboard_path),
+            "daily": dashboard,
+        }
     if summary["closeout_readiness"] != "ready":
         findings.append(finding(
             "work-close-not-ready",
@@ -13299,7 +13340,8 @@ def build_parser():
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
         "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily", "approval-issue", "approval-invalidate",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
-        "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate", "all"
+        "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate",
+        "protocol-start", "protocol-status", "protocol-step", "all"
     ])
     parser.add_argument("--claude-home", default=str(DEFAULT_CLAUDE_HOME))
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME))
@@ -13349,6 +13391,9 @@ def build_parser():
     parser.add_argument("--release-receipt", help="approval-issue: exact release receipt JSON the single-use production approval binds to.")
     parser.add_argument("--ticket-id", help="approval-invalidate: exact AT- ticket to revoke append-only.")
     parser.add_argument("--consumer", help="approval-issue: exact root-bound consumer for a live release ticket.")
+    parser.add_argument("--step", help="development protocol step id.")
+    parser.add_argument("--development-protocol", action="store_true")
+    parser.add_argument("--instrument", action="append", default=[], help="Hash a prompt, rubric, scorer, or verifier dependency.")
     return parser
 
 
@@ -13426,9 +13471,62 @@ def main(argv=None):
         result = run_tier_calibrate(args, paths)
     elif args.subcommand == "pathway-evaluate":
         result = run_pathway_evaluate(args, paths)
+    elif args.subcommand == "protocol-start":
+        if not args.work_id or not args.project or not args.goal:
+            result = {
+                "ok": False,
+                "error": "protocol-start requires --work-id, --project, and --goal",
+            }
+        else:
+            try:
+                exists = any(
+                    item.get("work_id") == args.work_id
+                    for item in read_ndjson(paths.work_items_path)
+                )
+                if not exists:
+                    result = {
+                        "ok": False,
+                        "error": "protocol-start requires an existing pathway work item; run work-start first",
+                    }
+                else:
+                    protocol = development_protocol.start(
+                        paths.development_protocol_path,
+                        args.work_id,
+                        args.project,
+                        args.goal,
+                    )
+                    update_work_item(paths, args.work_id, development_protocol_required=True)
+                    result = {
+                        "ok": True,
+                        "protocol": protocol,
+                        "work_id": args.work_id,
+                    }
+            except (OSError, ValueError, TypeError) as exc:
+                result = {"ok": False, "error": str(exc)}
+    elif args.subcommand == "protocol-status":
+        try:
+            result = development_protocol.status(paths.development_protocol_path, args.work_id or "")
+        except (OSError, ValueError, TypeError) as exc:
+            result = {"ok": False, "error": str(exc)}
+    elif args.subcommand == "protocol-step":
+        try:
+            result = development_protocol.step(
+                paths.development_protocol_path,
+                args.work_id or "",
+                args.step or "",
+                (args.result or "").replace("not-applicable", "na"),
+                args.evidence or "",
+                args.verify_cmd or "",
+                args.reason or "",
+                args.instrument,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            result = {"ok": False, "error": str(exc)}
     else:
         result = run_all(args, paths)
     print_result(result, args.json)
+    if args.subcommand.startswith("protocol-") and result.get("ok") is False:
+        return 1
     if args.subcommand in APPROVAL_MUTATION_SUBCOMMANDS:
         records = result.get("records") if isinstance(result, dict) else None
         if result.get("findings") or not isinstance(records, list) or not records:

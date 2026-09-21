@@ -690,7 +690,7 @@ def append_ndjson(path, rows):
 def test_intel_detection_and_clean():
     reset()
     write(
-        "claude/hooks/ingest.log",
+        "claude/logs/hook-ingest.log",
         "\n".join([
             "2026-06-27T10:00:00Z [track] stop: ingest http=500 cwd=/tmp/app session=s1 password=hunter2",
             "2026-06-27T10:01:00Z [track] stop: ingest http=400 invalid_payload cwd=/tmp/app session=s2",
@@ -826,7 +826,7 @@ def test_agent_cards_scope_excludes_helper_and_legacy_records():
 
 def test_all_smoke_outputs_parse_and_redact():
     reset()
-    write("claude/hooks/ingest.log", "2026-06-27T10:00:00Z stop: ingest http=400 api_key=abc123\n")
+    write("claude/logs/hook-ingest.log", "2026-06-27T10:00:00Z stop: ingest http=400 api_key=abc123\n")
     write("claude/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
     write("codex/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
     write("projects/app/README.md", "# App\n")
@@ -861,7 +861,7 @@ def test_improve_and_compare_control_loop():
     data, proc = run("all")
     check(proc.returncode == 0 and data, "control loop first all exits 0")
 
-    write("claude/hooks/ingest.log", "2026-06-27T10:05:00Z stop: ingest http=500 cwd=/tmp/app session=s4\n")
+    write("claude/logs/hook-ingest.log", "2026-06-27T10:05:00Z stop: ingest http=500 cwd=/tmp/app session=s4\n")
     data, proc = run("all")
     check(proc.returncode == 0 and data, "control loop second all exits 0")
 
@@ -1518,6 +1518,9 @@ def test_selected_work_scoring_regression_kills_aggregate_mutant():
             replacement_counts.append(mutant_source.count(original))
             mutant_source = mutant_source.replace(original, replacement)
         mutant_cli.write_text(mutant_source, encoding="utf-8")
+        # operating-layer.py imports its sibling development_protocol at module load, so a mutant
+        # copied alone cannot start and dies before any assertion can kill it.
+        shutil.copy2(CLI.parent / "development_protocol.py", mutant_scripts / "development_protocol.py")
 
         namespace = runpy.run_path(str(mutant_tests), run_name="selected_work_aggregate_mutant")
         mutant_test = namespace["test_pathway_next_scores_only_selected_active_work"]

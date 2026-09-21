@@ -185,7 +185,9 @@ re-recommend, do not present a menu.
    - **production-secure** — untrusted actors, compliance (+ research · security · techdebt).
      The goal's own words also auto-pull `design` (UI), `research`, or `data`. If the user didn't say,
      infer from the goal and state your pick in one line — don't interrogate.
-3. Run: `python3 ~/.claude/scripts/operating-layer.py work-start --project <abs-path> --goal "<goal>" --tier <tier>`
+3. Run: `python3 ~/.claude/scripts/operating-layer.py work-start --project <abs-path> --goal "<goal>" --tier <tier>`.
+   For a full development cycle, immediately enroll the same work ID with
+   `python3 ~/.claude/scripts/operating-layer.py protocol-start --work-id <work-id> --project <abs-path> --goal "<goal>"`.
 4. Immediately run ASK with the `work-start` result's `--work-id` pinned. Show the **seeded itinerary** in plain English — "this outcome
    needs N pathways: govern, data, … — I walk them in order, and it can't close until each is proved
    on a real artifact or explicitly marked not-applicable with a reason."
