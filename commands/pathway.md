@@ -1,7 +1,6 @@
 ---
 name: pathway
 description: Ask a project what engineering pathway to run next, track the work against one shared ID, or start a measured multi-project pathway pilot. Wraps operating-layer pathway-next + the work envelope so you never type the CLI. Loop mode runs the whole determine → execute → prove → advance cycle continuously, with autonomy earned by the proof metric.
-argument-hint: "<project> [ go | done | <goal> ] [--max] | pilot <projects> <goal>   —   usually just the project; add --max for the full hypercritical chain; I hand you the exact next command to paste"
 ---
 
 # Pathway — next-best move for a project
@@ -247,7 +246,7 @@ fail-closes to Tier 1 in code, so the field is always current).
 techdebt, design`.
 
 **Never auto, any tier:** `/ship`, `work-close`, prod-flag flips, external sends — pause and ask.
-(The `docs` pathway is Tier-2 safe: its skill is `doc-coauthoring`, which authors without committing.)
+(The `docs` pathway is Tier-2 safe: its skill is `anthropic-skills:doc-coauthoring` (a plugin skill, not under `~/.claude/skills`), which authors without committing.)
 
 **One iteration:**
 
