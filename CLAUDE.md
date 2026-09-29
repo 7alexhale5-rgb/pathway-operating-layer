@@ -4,6 +4,23 @@ Canonical source for the pathway operating layer. Symlinked into `~/.claude`
 (see README). **Never `git init ~/.claude`** — it holds secrets. Edit files here;
 the symlinks make changes live immediately.
 
+## Where to go
+
+This repo follows ICM (Jake Van Clief's folder method): this file routes, each room's
+`CONTEXT.md` holds its contract.
+
+| Task                                                     | Go to         | Read                                           | Skills |
+| -------------------------------------------------------- | ------------- | ---------------------------------------------- | ------ |
+| Change the CLI, its ledger writes or its own test suite  | `scripts/`    | [scripts/CONTEXT.md](scripts/CONTEXT.md)       | none   |
+| Working research, proof-integrity or scanner-scope notes | `docs/`       | [docs/CONTEXT.md](docs/CONTEXT.md)             | none   |
+| Look up a stable design doc or proof gate                | `references/` | [references/CONTEXT.md](references/CONTEXT.md) | none   |
+| Run or extend the staleness/integrity test suite         | `tests/`      | [tests/CONTEXT.md](tests/CONTEXT.md)           | none   |
+
+`contracts/`, `hooks/`, `security/`, `skills/`, `commands/` stay where their
+registrations expect them (the approval-issue guard, the `/pathway` skill and slash
+command, the observability contract) — `scripts/CONTEXT.md` points to each. Root files
+stay put: `README.md`, `LICENSE`, `install.sh`.
+
 ## Rules
 
 - After editing any file, run the suite: `python3 scripts/tests/operating_layer_test.py`. It must stay green before commit.
