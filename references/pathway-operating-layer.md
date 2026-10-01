@@ -74,7 +74,11 @@ research-stack v3 takes focus tags (`/research-stack --focus seo,security`). `RE
 in `operating-layer.py` mirrors the canonical manifest `research-stack/focus/tags.json` — change
 the manifest first, then the mirror (the suite checks every mapped pathway is in
 `PATHWAY_CANON_ORDER`, every overlay in `RISK_OVERLAYS`, and that the mirror matches a sibling
-`research-stack` checkout when one exists).
+`research-stack` checkout when one exists). The map holds 12 tags in manifest order: `seo`,
+`content`, `market`, `ui-ux`, `a11y`, `perf`, `security`, `devtools`, `ai-agents`, `data-infra`,
+`comms`, `legal`. `comms` (voice, SMS and dialers; addendum "Telephony and messaging plan",
+added 2026-10-01) maps to `data` and `security` plus the `privacy-evidence` overlay, which it
+shares with `legal`.
 
 - **Derivation.** `research_focus_for(pathways, overlays, tier)` works from the work item's
   itinerary, risk overlays and tier. Overlays are the strong signal: every tag whose overlays
@@ -87,6 +91,8 @@ the manifest first, then the mirror (the suite checks every mapped pathway is in
   stack gain the derived flag. For a live-tier npm-CVE item with `supply-chain`:
   `/research-stack --deep --focus security,devtools`. A UI slice with `ui-proof` gives
   `--focus ui-ux,a11y`; an agent-automation item with `llm-agent-eval` gives `--focus ai-agents`.
+  An item with `privacy-evidence` derives `comms,legal`; one whose only distinctive pathway is
+  `security` derives `security,ai-agents,comms`.
   `PATHWAY_DOCTRINE` stays static.
 - **Verifier.** `research-v1` still requires `question` and `sources`. A dossier whose YAML
   frontmatter declares `focus: [a, b]` (or `focus: a, b`) must also carry a heading or bold

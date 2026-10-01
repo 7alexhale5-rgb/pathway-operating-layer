@@ -331,6 +331,8 @@ RESEARCH_FOCUS_MAP = {
     "ai-agents": {"pathways": ["quality", "security", "observability"], "overlays": ["llm-agent-eval"],
                   "addendum": "Model and eval evidence"},
     "data-infra": {"pathways": ["data"], "overlays": [], "addendum": "Data and infra trade-offs"},
+    "comms": {"pathways": ["data", "security"], "overlays": ["privacy-evidence"],
+              "addendum": "Telephony and messaging plan"},
     "legal": {"pathways": ["govern"], "overlays": ["privacy-evidence"], "addendum": "Legal authority table"},
 }
 RESEARCH_FOCUS_MAX_TAGS = 4

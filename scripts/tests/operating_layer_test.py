@@ -7190,10 +7190,10 @@ def test_design_gate_is_derived_from_repo_not_goal_wording():
 def test_research_focus_map_derivation_and_addendum_verifier():
     opl = load_cli("research_focus")
     focus_map = opl.RESEARCH_FOCUS_MAP
-    check(len(focus_map) == 11 and all(
+    check(len(focus_map) == 12 and all(
         set(spec) == {"pathways", "overlays", "addendum"} and spec["addendum"]
         for spec in focus_map.values()),
-        "RESEARCH_FOCUS_MAP mirrors tags.json: 11 tags, each with pathways/overlays/addendum")
+        "RESEARCH_FOCUS_MAP mirrors tags.json: 12 tags, each with pathways/overlays/addendum")
     bad_pathways = sorted({p for spec in focus_map.values() for p in spec["pathways"]
                            if p not in opl.PATHWAY_CANON_ORDER})
     bad_overlays = sorted({o for spec in focus_map.values() for o in spec["overlays"]
@@ -7223,7 +7223,7 @@ def test_research_focus_map_derivation_and_addendum_verifier():
     check(agent == ["ai-agents"],
           f"agent automation (llm-agent-eval) derives ai-agents; overlay-required pathways add nothing (got {agent})")
     gated = opl.research_focus_for(itinerary("security"), [], "live")
-    check(gated == ["security", "ai-agents"],
+    check(gated == ["security", "ai-agents", "comms"],
           f"a distinctive (non-tier, non-overlay) pathway derives its tags (got {gated})")
     check(opl.research_focus_for(itinerary(), [], "live") == [],
           "tier-default pathways and research alone derive no focus tag")
