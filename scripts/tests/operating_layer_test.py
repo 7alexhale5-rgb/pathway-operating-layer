@@ -7209,20 +7209,27 @@ def test_research_focus_map_derivation_and_addendum_verifier():
             == focus_map[name] for name, t in tags.items()),
             "RESEARCH_FOCUS_MAP matches research-stack/focus/tags.json")
 
-    sec = opl.research_focus_for([{"pathway": "research"}, {"pathway": "security"}],
-                                 [{"id": "supply-chain"}])
-    check("security" in sec and "devtools" in sec and sec[0] == "security",
-          f"security + supply-chain derives security first and devtools (got {sec})")
-    ui = opl.research_focus_for([], ["ui-proof"])
-    check(ui == ["ui-ux", "a11y"], f"ui-proof alone derives ui-ux, a11y (got {ui})")
-    check(opl.research_focus_for(["research"], []) == [],
-          "the generic research pathway alone triggers no focus tag")
-    wide = opl.research_focus_for(["design", "quality", "security", "observability", "release", "docs"],
-                                  ["ui-proof", "supply-chain", "llm-agent-eval"])
-    check(len(wide) == 4, f"derived focus is capped at 4 tags (got {wide})")
-    prod = opl.research_focus_for(opl.PATHWAY_TIERS["production-secure"], [{"id": "supply-chain"}])
-    check(prod[:2] == ["security", "devtools"],
-          f"overlay matches outweigh tier-default pathways on a broad itinerary (got {prod})")
+    live = list(opl.PATHWAY_TIERS["live"])
+
+    def itinerary(*extra):
+        return [{"pathway": p} for p in live + ["research", *extra]]
+
+    sec = opl.research_focus_for(itinerary("security", "techdebt"), [{"id": "supply-chain"}], "live")
+    check(sec == ["security", "devtools"],
+          f"npm-CVE item (live + supply-chain) derives exactly security,devtools (got {sec})")
+    ui = opl.research_focus_for(itinerary("design"), [{"id": "ui-proof"}], "live")
+    check(ui == ["ui-ux", "a11y"], f"ui slice (live + ui-proof, design gated in) derives ui-ux,a11y (got {ui})")
+    agent = opl.research_focus_for(itinerary("security"), [{"id": "llm-agent-eval"}], "live")
+    check(agent == ["ai-agents"],
+          f"agent automation (llm-agent-eval) derives ai-agents; overlay-required pathways add nothing (got {agent})")
+    gated = opl.research_focus_for(itinerary("security"), [], "live")
+    check(gated == ["security", "ai-agents"],
+          f"a distinctive (non-tier, non-overlay) pathway derives its tags (got {gated})")
+    check(opl.research_focus_for(itinerary(), [], "live") == [],
+          "tier-default pathways and research alone derive no focus tag")
+    wide = opl.research_focus_for(itinerary(), ["ui-proof", "supply-chain", "llm-agent-eval", "privacy-evidence"], "live")
+    check(wide == ["ui-ux", "a11y", "security", "devtools"],
+          f"derived focus is capped at 4 tags in tags.json order (got {wide})")
     card = opl.karpathy_card("research", "proj", "", focus_tags=sec)
     check(card["skill"] == f"/research-stack --deep --focus {','.join(sec)}"
           and card["execution_stack"][0].startswith(f"/research-stack --deep --focus {','.join(sec)}")

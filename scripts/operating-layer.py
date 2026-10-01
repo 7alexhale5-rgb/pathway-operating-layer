@@ -334,16 +334,17 @@ RESEARCH_FOCUS_MAP = {
     "legal": {"pathways": ["govern"], "overlays": ["privacy-evidence"], "addendum": "Legal authority table"},
 }
 RESEARCH_FOCUS_MAX_TAGS = 4
-RESEARCH_FOCUS_OVERLAY_WEIGHT = 2
 
 
-def research_focus_for(pathways, overlays):
-    """Derive research-stack focus tags from a work item's itinerary pathways and overlays.
+def research_focus_for(pathways, overlays, tier=None):
+    """Derive research-stack focus tags from a work item's itinerary, overlays and tier.
 
     Accepts pathway names or itinerary entries ({"pathway": ...}) and overlay ids or overlay
-    dicts ({"id": ...}). The generic "research" pathway never triggers a tag on its own (every
-    itinerary carries it). Ordered by weighted match count desc (overlay matches count double),
-    then RESEARCH_FOCUS_MAP order; capped at RESEARCH_FOCUS_MAX_TAGS.
+    dicts ({"id": ...}). Overlays are the strong signal: every tag whose overlays intersect the
+    item's overlays is derived. A pathway counts only when it is distinctive: in the itinerary
+    but not a default of `tier` (PATHWAY_TIERS), not required by one of the item's overlays
+    (the overlay already speaks for it), and not the generic "research". Ordered by match count
+    desc, then RESEARCH_FOCUS_MAP order; capped at RESEARCH_FOCUS_MAX_TAGS.
     """
     def _names(items, key):
         out = set()
@@ -353,15 +354,15 @@ def research_focus_for(pathways, overlays):
                 out.add(name)
         return out
 
-    present_pathways = _names(pathways, "pathway") - {"research"}
     present_overlays = _names(overlays, "id")
+    overlay_pathways = {p for oid in present_overlays
+                        for p in RISK_OVERLAYS.get(oid, {}).get("required_pathways", [])}
+    distinctive = (_names(pathways, "pathway") - set(PATHWAY_TIERS.get(tier, []))
+                   - overlay_pathways - {"research"})
     scored = []
     for index, (tag, spec) in enumerate(RESEARCH_FOCUS_MAP.items()):
-        # An overlay is a specific risk signal; a pathway often arrives as a tier default.
-        # Weight overlay matches double so e.g. supply-chain keeps security/devtools in the
-        # capped set on a broad production itinerary.
-        matches = (len(present_pathways.intersection(spec["pathways"]))
-                   + RESEARCH_FOCUS_OVERLAY_WEIGHT * len(present_overlays.intersection(spec["overlays"])))
+        matches = (len(distinctive.intersection(spec["pathways"]))
+                   + len(present_overlays.intersection(spec["overlays"])))
         if matches:
             scored.append((-matches, index, tag))
     scored.sort()
@@ -9122,7 +9123,7 @@ def compute_pathway_next(args, paths):
             or list((outcome_profile or {}).get("required_pathways", []) or [])
         )
         card = karpathy_card(recommended["pathway"], project_name, goal_for_contract, latest_carry_forward,
-                             focus_tags=research_focus_for(focus_pathways, risk_overlays))
+                             focus_tags=research_focus_for(focus_pathways, risk_overlays, contract_tier))
     trust = load_pathway_trust_summary(paths)
     has_context = bool(scoped_findings or selected_item)
     # Confidence must reflect the ACTUALLY recommended pathway and the field it competes

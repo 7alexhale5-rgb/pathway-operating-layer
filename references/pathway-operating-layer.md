@@ -76,13 +76,18 @@ the manifest first, then the mirror (the suite checks every mapped pathway is in
 `PATHWAY_CANON_ORDER`, every overlay in `RISK_OVERLAYS`, and that the mirror matches a sibling
 `research-stack` checkout when one exists).
 
-- **Derivation.** `research_focus_for(pathways, overlays)` picks the tags whose pathways or overlays
-  intersect the work item's itinerary and risk overlays. The generic `research` pathway never
-  triggers a tag. Overlay matches count double (an overlay is a specific risk signal, a pathway is
-  often a tier default). Ordered by score, then manifest order; capped at 4.
+- **Derivation.** `research_focus_for(pathways, overlays, tier)` works from the work item's
+  itinerary, risk overlays and tier. Overlays are the strong signal: every tag whose overlays
+  intersect the item's overlays is derived. A pathway counts only when it is distinctive: in the
+  itinerary but not a default of `PATHWAY_TIERS[tier]`, not required by one of the item's overlays
+  (the overlay already speaks for it), and not the generic `research`. That leaves pathways pulled
+  in by a keyword gate or the outcome profile. Ordered by match count, then manifest order; capped
+  at 4. No derived tag means no `--focus`.
 - **Render time.** When `pathway-next` recommends research, the card's skill and best-execution
-  stack gain the derived flag — e.g. `/research-stack --deep --focus security,devtools,ai-agents,seo`
-  for a production-secure itinerary with `supply-chain`. `PATHWAY_DOCTRINE` stays static.
+  stack gain the derived flag. For a live-tier npm-CVE item with `supply-chain`:
+  `/research-stack --deep --focus security,devtools`. A UI slice with `ui-proof` gives
+  `--focus ui-ux,a11y`; an agent-automation item with `llm-agent-eval` gives `--focus ai-agents`.
+  `PATHWAY_DOCTRINE` stays static.
 - **Verifier.** `research-v1` still requires `question` and `sources`. A dossier whose YAML
   frontmatter declares `focus: [a, b]` (or `focus: a, b`) must also carry a heading or bold
   lead-in starting with each tag's addendum (case-insensitive, e.g. `## Threat and advisory table`).
