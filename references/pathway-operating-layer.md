@@ -68,6 +68,30 @@ Risk overlays: `tenant-authz`, `privacy-evidence`, `production-mutation`, `rollb
 inject mandatory gates. Do not mark one N/A without a structured reason and real evidence —
 an overlay dismissed on assertion is an overlay that was never applied.
 
+## Research focus tags
+
+research-stack v3 takes focus tags (`/research-stack --focus seo,security`). `RESEARCH_FOCUS_MAP`
+in `operating-layer.py` mirrors the canonical manifest `research-stack/focus/tags.json` — change
+the manifest first, then the mirror (the suite checks every mapped pathway is in
+`PATHWAY_CANON_ORDER`, every overlay in `RISK_OVERLAYS`, and that the mirror matches a sibling
+`research-stack` checkout when one exists).
+
+- **Derivation.** `research_focus_for(pathways, overlays)` picks the tags whose pathways or overlays
+  intersect the work item's itinerary and risk overlays. The generic `research` pathway never
+  triggers a tag. Overlay matches count double (an overlay is a specific risk signal, a pathway is
+  often a tier default). Ordered by score, then manifest order; capped at 4.
+- **Render time.** When `pathway-next` recommends research, the card's skill and best-execution
+  stack gain the derived flag — e.g. `/research-stack --deep --focus security,devtools,ai-agents,seo`
+  for a production-secure itinerary with `supply-chain`. `PATHWAY_DOCTRINE` stays static.
+- **Verifier.** `research-v1` still requires `question` and `sources`. A dossier whose YAML
+  frontmatter declares `focus: [a, b]` (or `focus: a, b`) must also carry a heading or bold
+  lead-in starting with each tag's addendum (case-insensitive, e.g. `## Threat and advisory table`).
+  An unknown tag fails verification with a message naming the known tags.
+- **Coverage gaps → findings.** research-stack should emit each "Coverage gaps" line as a finding
+  with id `rs-<tag>-<slug>` (e.g. `rs-security-no-kev-check`) in its `--json` pool. The existing
+  `rs-` prefix routes it to research through `ingest-review` / `latest-findings.json`; no new
+  ingestion path is needed.
+
 ## The two hard rules
 
 **Proof.** A real artifact, an executed `--verify-cmd`, and the result read back. Defined

@@ -7187,6 +7187,73 @@ def test_design_gate_is_derived_from_repo_not_goal_wording():
 
 
 
+def test_research_focus_map_derivation_and_addendum_verifier():
+    opl = load_cli("research_focus")
+    focus_map = opl.RESEARCH_FOCUS_MAP
+    check(len(focus_map) == 11 and all(
+        set(spec) == {"pathways", "overlays", "addendum"} and spec["addendum"]
+        for spec in focus_map.values()),
+        "RESEARCH_FOCUS_MAP mirrors tags.json: 11 tags, each with pathways/overlays/addendum")
+    bad_pathways = sorted({p for spec in focus_map.values() for p in spec["pathways"]
+                           if p not in opl.PATHWAY_CANON_ORDER})
+    bad_overlays = sorted({o for spec in focus_map.values() for o in spec["overlays"]
+                           if o not in opl.RISK_OVERLAYS})
+    check(not bad_pathways, f"every focus pathway is in PATHWAY_CANON_ORDER (bad: {bad_pathways})")
+    check(not bad_overlays, f"every focus overlay is in RISK_OVERLAYS (bad: {bad_overlays})")
+    # Sibling checkout of the source of truth, when present (skipped in a standalone clone).
+    manifest = REPO.parent / "research-stack" / "focus" / "tags.json"
+    if manifest.exists():
+        tags = json.loads(manifest.read_text(encoding="utf-8"))["tags"]
+        check(list(tags) == list(focus_map) and all(
+            {"pathways": t["pathways"], "overlays": t["overlays"], "addendum": t["addendum"]}
+            == focus_map[name] for name, t in tags.items()),
+            "RESEARCH_FOCUS_MAP matches research-stack/focus/tags.json")
+
+    sec = opl.research_focus_for([{"pathway": "research"}, {"pathway": "security"}],
+                                 [{"id": "supply-chain"}])
+    check("security" in sec and "devtools" in sec and sec[0] == "security",
+          f"security + supply-chain derives security first and devtools (got {sec})")
+    ui = opl.research_focus_for([], ["ui-proof"])
+    check(ui == ["ui-ux", "a11y"], f"ui-proof alone derives ui-ux, a11y (got {ui})")
+    check(opl.research_focus_for(["research"], []) == [],
+          "the generic research pathway alone triggers no focus tag")
+    wide = opl.research_focus_for(["design", "quality", "security", "observability", "release", "docs"],
+                                  ["ui-proof", "supply-chain", "llm-agent-eval"])
+    check(len(wide) == 4, f"derived focus is capped at 4 tags (got {wide})")
+    prod = opl.research_focus_for(opl.PATHWAY_TIERS["production-secure"], [{"id": "supply-chain"}])
+    check(prod[:2] == ["security", "devtools"],
+          f"overlay matches outweigh tier-default pathways on a broad itinerary (got {prod})")
+    card = opl.karpathy_card("research", "proj", "", focus_tags=sec)
+    check(card["skill"] == f"/research-stack --deep --focus {','.join(sec)}"
+          and card["execution_stack"][0].startswith(f"/research-stack --deep --focus {','.join(sec)}")
+          and opl.PATHWAY_DOCTRINE["research"]["skill"] == "/research-stack --deep",
+          f"research card renders --focus at render time, doctrine unchanged (got {card['skill']})")
+    check(opl.karpathy_card("security", "proj", "", focus_tags=sec)["research_focus"] == [],
+          "focus tags only attach to the research card")
+
+    baton = "\n".join([
+        "## Summary\n- checked", "## What Changed\n- changed", "## More Relevant\n- relevant",
+        "## Less Relevant\n- deferred", "## Next Pathway Must Use\n- use this",
+        "## Do Not Do Yet\n- no mutation", "## Open Decisions\n- none", "## Active Risk Overlays\n- rollback",
+    ])
+    body = "question\nsources\n" + baton
+    good = ("---\nfocus: [security, devtools]\n---\n" + body
+            + "\n## Threat and advisory table\n| CVE |\n**Library decision matrix:** pick x\n")
+    check(opl.check_verifier_template("research", good)["valid"],
+          "focused dossier with every addendum heading passes the research template")
+    missing = opl.check_verifier_template("research", "---\nfocus: security, devtools\n---\n" + body
+                                          + "\n## Threat and advisory table\n")
+    check(not missing["valid"] and any("devtools" in m and "Library decision matrix" in m
+                                       for m in missing["missing"]),
+          "focused dossier missing an addendum section is rejected with the tag named")
+    unknown = opl.check_verifier_template("research", "---\nfocus: [astrology]\n---\n" + body)
+    check(not unknown["valid"] and any("unknown research focus tag 'astrology'" in m
+                                       for m in unknown["missing"]),
+          "unknown focus tag is a verification failure with a clear message")
+    check(opl.check_verifier_template("research", body)["valid"],
+          "an unfocused dossier keeps the plain research template")
+
+
 def main():
     tests = [
         test_design_findings_route_to_design_pathway,
@@ -7271,6 +7338,7 @@ def main():
         test_observability_proof_revalidates_receipt_freshness_after_canaries,
         test_observability_proof_rejects_mid_verification_artifact_mutation,
         test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts,
+        test_research_focus_map_derivation_and_addendum_verifier,
         test_audit_proof_integrity_uses_active_outcomes_and_reports_history,
         test_canary_mutant_is_symlink_safe,
         test_canary_explicit_target_rejects_outside_and_unchanged_files,
