@@ -26,7 +26,7 @@
 
 ## Outputs
 
-- `operating-layer.py --help` runs; `operating_layer_test.py` → `137/137 checks passed`
+- `operating-layer.py --help` runs; `operating_layer_test.py` → `1192/1192 checks passed`
   (or current count) before commit.
 
 ## Human check

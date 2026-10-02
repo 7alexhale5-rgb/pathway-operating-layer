@@ -68,6 +68,38 @@ Risk overlays: `tenant-authz`, `privacy-evidence`, `production-mutation`, `rollb
 inject mandatory gates. Do not mark one N/A without a structured reason and real evidence —
 an overlay dismissed on assertion is an overlay that was never applied.
 
+## Research focus tags
+
+research-stack v3 takes focus tags (`/research-stack --focus seo,security`). `RESEARCH_FOCUS_MAP`
+and `RESEARCH_FOCUS_BUNDLES` in `operating-layer.py` mirror the canonical manifest
+`research-stack/focus/tags.json` (tags, pathways, overlays, addenda and bundles). Change the
+manifest first, then the mirror; the suite checks the mirror against a sibling `research-stack`
+checkout when one exists and that every mapped pathway and overlay is real. This doc does not list
+the tags: read the map or the manifest.
+
+- **Derivation.** `research_focus_for(pathways, overlays, tier)` works from the work item's
+  itinerary, risk overlays and tier. Overlays are the strong signal: every tag whose overlays
+  intersect the item's overlays is derived. A pathway counts only when it is distinctive: in the
+  itinerary but not a default of `PATHWAY_TIERS[tier]`, not required by one of the item's overlays
+  (the overlay already speaks for it), not the generic `research`, and not waived (`na`). Ordered
+  by match count, then manifest order; capped at 4. `research_focus_split` also returns the tags
+  the cap dropped.
+- **Render time.** Derived tags are a suggestion, never a flag: research-stack treats an explicit
+  `--focus` as the operator's choice and skips its scope gate. When `pathway-next` recommends
+  research, the card's skill and best-execution stack gain a note, e.g.
+  `/research-stack --deep (suggested focus: security, devtools)`. The card keeps `research_focus`
+  and `research_focus_dropped` (shown in the note as "dropped by the 4-tag cap"). No derived tag
+  means no note. `PATHWAY_DOCTRINE` stays static.
+- **Verifier.** `research-v1` still requires `question` and `sources`. A dossier whose YAML
+  frontmatter declares `focus:` (inline `[a, b]` / `a, b`, or a block list; `#` prefixes and
+  bundle names are accepted and expanded, as in research-stack's `validate_report.py`) must also
+  carry a heading or bold lead-in starting with each tag's addendum (case-insensitive). An
+  unknown tag fails verification with a message naming the known tags.
+- **Coverage gaps → findings (proposal, not built).** The intended flow is research-stack
+  emitting each "Coverage gaps" line as a finding with id `rs-<tag>-<slug>` in a `--json` pool,
+  which the existing `rs-` prefix would route to research through `ingest-review`. research-stack
+  has no `--json` flag yet, so nothing emits these today.
+
 ## The two hard rules
 
 **Proof.** A real artifact, an executed `--verify-cmd`, and the result read back. Defined

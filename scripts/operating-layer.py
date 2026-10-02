@@ -314,6 +314,92 @@ RISK_OVERLAYS = {
     },
 }
 
+# Research-stack v3 focus tags (`/research-stack --focus seo,security`). Source of truth:
+# research-stack/focus/tags.json — change it there first, then mirror here. Each tag lists the
+# pathways/overlays that make it relevant and the `addendum` section heading a focused dossier
+# must contain. Order is tags.json order (the tie-break for derived focus). The suite asserts
+# every pathway is in PATHWAY_CANON_ORDER and every overlay is in RISK_OVERLAYS.
+RESEARCH_FOCUS_MAP = {
+    "seo": {"pathways": ["design", "release", "docs"], "overlays": [], "addendum": "SEO scorecard"},
+    "content": {"pathways": ["docs", "release"], "overlays": [], "addendum": "Content and creative angles"},
+    "market": {"pathways": ["research", "govern"], "overlays": [], "addendum": "Vendor and competitor matrix"},
+    "ui-ux": {"pathways": ["design"], "overlays": ["ui-proof"], "addendum": "Pattern references"},
+    "a11y": {"pathways": ["design", "quality"], "overlays": ["ui-proof"], "addendum": "Accessibility checklist"},
+    "perf": {"pathways": ["quality", "observability"], "overlays": [], "addendum": "Performance budget"},
+    "security": {"pathways": ["security"], "overlays": ["supply-chain"], "addendum": "Threat and advisory table"},
+    "devtools": {"pathways": ["research", "techdebt"], "overlays": ["supply-chain"], "addendum": "Library decision matrix"},
+    "ai-agents": {"pathways": ["quality", "security", "observability"], "overlays": ["llm-agent-eval"],
+                  "addendum": "Model and eval evidence"},
+    "data-infra": {"pathways": ["data"], "overlays": [], "addendum": "Data and infra trade-offs"},
+    "comms": {"pathways": ["data", "security"], "overlays": ["privacy-evidence"],
+              "addendum": "Telephony and messaging plan"},
+    "legal": {"pathways": ["govern"], "overlays": ["privacy-evidence"], "addendum": "Legal authority table"},
+}
+RESEARCH_FOCUS_MAX_TAGS = 4
+# Mirror of tags.json `bundles` (a bundle name in a dossier's `focus:` expands to its members).
+RESEARCH_FOCUS_BUNDLES = {
+    "launch": ["seo", "perf", "a11y", "content"],
+    "ship-audit": ["security", "perf", "a11y"],
+    "competitive": ["market", "seo", "content"],
+    "build-pick": ["devtools", "security"],
+}
+
+
+def research_focus_for(pathways, overlays, tier=None):
+    """Kept focus tags only; see research_focus_split for the tags the cap dropped."""
+    return research_focus_split(pathways, overlays, tier)[0]
+
+
+def research_focus_split(pathways, overlays, tier=None):
+    """Derive research-stack focus tags from a work item's itinerary, overlays and tier.
+
+    Accepts pathway names or itinerary entries ({"pathway": ...}) and overlay ids or overlay
+    dicts ({"id": ...}). Overlays are the strong signal: every tag whose overlays intersect the
+    item's overlays is derived. A pathway counts only when it is distinctive: in the itinerary
+    but not a default of `tier` (PATHWAY_TIERS), not required by one of the item's overlays
+    (the overlay already speaks for it), and not the generic "research". Ordered by match count
+    desc, then RESEARCH_FOCUS_MAP order; capped at RESEARCH_FOCUS_MAX_TAGS. Itinerary entries
+    with status `na` (waived pathways) are skipped. Returns (kept, dropped_by_the_cap).
+    """
+    def _names(items, key):
+        out = set()
+        for item in items or []:
+            if isinstance(item, dict) and item.get("status") == "na":
+                continue
+            name = item.get(key) if isinstance(item, dict) else item
+            if isinstance(name, str) and name:
+                out.add(name)
+        return out
+
+    present_overlays = _names(overlays, "id")
+    overlay_pathways = {p for oid in present_overlays
+                        for p in RISK_OVERLAYS.get(oid, {}).get("required_pathways", [])}
+    distinctive = (_names(pathways, "pathway") - set(PATHWAY_TIERS.get(tier, []))
+                   - overlay_pathways - {"research"})
+    scored = []
+    for index, (tag, spec) in enumerate(RESEARCH_FOCUS_MAP.items()):
+        matches = (len(distinctive.intersection(spec["pathways"]))
+                   + len(present_overlays.intersection(spec["overlays"])))
+        if matches:
+            scored.append((-matches, index, tag))
+    scored.sort()
+    ordered = [tag for _, _, tag in scored]
+    return ordered[:RESEARCH_FOCUS_MAX_TAGS], ordered[RESEARCH_FOCUS_MAX_TAGS:]
+
+
+def research_skill_with_focus(skill, focus_tags, dropped=None):
+    """Suggest focus tags beside a /research-stack invocation; never injects `--focus`.
+
+    research-stack treats an explicit --focus as the operator's choice and skips its scope gate,
+    so derived tags are only shown: "/research-stack --deep (suggested focus: a, b)".
+    """
+    if not focus_tags or "/research-stack" not in (skill or ""):
+        return skill
+    note = f"suggested focus: {', '.join(focus_tags)}"
+    if dropped:
+        note += f"; dropped by the {RESEARCH_FOCUS_MAX_TAGS}-tag cap: {', '.join(dropped)}"
+    return f"{skill} ({note})"
+
 
 def pathway_sort_key(pathway):
     return PATHWAY_CANON_ORDER.index(pathway) if pathway in PATHWAY_CANON_ORDER else 99
@@ -3470,6 +3556,79 @@ def verifier_template_for(pathway):
     }
 
 
+def research_declared_focus(text):
+    """Return the tags in a dossier's YAML frontmatter `focus:` key (`[a, b]` or `a, b`).
+
+    Returns None when there is no frontmatter or no focus key, so unfocused dossiers keep the
+    plain research template.
+    """
+    lines = (text or "").lstrip("\ufeff").lstrip().splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    body = []
+    for line in lines[1:]:
+        if line.strip() in ("---", "..."):
+            break
+        body.append(line)
+
+    def clean(tag):
+        return tag.strip().strip("'\"").lstrip("#").strip().lower()
+
+    for i, line in enumerate(body):
+        m = re.match(r"^focus\s*:\s*(.*?)\s*$", line)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        parts = raw.split(",") if raw else []
+        if not raw:  # YAML block list on the following indented/dash lines
+            for nxt in body[i + 1:]:
+                item = re.match(r"^\s*-\s*(.*?)\s*$", nxt)
+                if not item:
+                    if nxt.strip():
+                        break
+                    continue
+                parts.append(item.group(1))
+        expanded = []
+        for tag in (clean(t) for t in parts):
+            for member in RESEARCH_FOCUS_BUNDLES.get(tag, [tag]):
+                if member and member not in expanded:
+                    expanded.append(member)
+        return expanded
+    return None
+
+
+def research_focus_addendum_gaps(text):
+    """Missing-proof messages for a focused research dossier (empty when unfocused or complete).
+
+    Each declared tag must have a markdown heading or bold lead-in starting with its addendum
+    (case-insensitive); an unknown tag is itself a failure.
+    """
+    declared = research_declared_focus(text)
+    if not declared:
+        return []
+    leads = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        heading = re.match(r"^#{1,6}\s+(.+)$", stripped)
+        bold = re.match(r"^(?:[-*]\s+)?(?:\*\*|__)(.+?)(?:\*\*|__|$)", stripped)
+        if heading:
+            leads.append(heading.group(1).strip().lower())
+        elif bold:
+            leads.append(bold.group(1).strip().lower())
+    gaps = []
+    for tag in declared:
+        spec = RESEARCH_FOCUS_MAP.get(tag)
+        if not spec:
+            gaps.append(f"unknown research focus tag '{tag}' (known: {', '.join(RESEARCH_FOCUS_MAP)})")
+            continue
+        addendum = spec["addendum"].lower()
+        if not any(lead.startswith(addendum) for lead in leads):
+            gaps.append(f"focus '{tag}' requires a section starting with '{spec['addendum']}'")
+    return gaps
+
+
 def check_verifier_template(pathway, evidence_text):
     """Report whether an artifact has the pathway's minimum proof shape.
 
@@ -3484,6 +3643,8 @@ def check_verifier_template(pathway, evidence_text):
     missing = [term for term in template["required_artifact_terms"] if term not in normalized]
     sections = extract_carry_forward_sections(text)
     missing += [field for field in CARRY_FORWARD_LIST_FIELDS if field not in sections]
+    if pathway == "research":
+        missing += research_focus_addendum_gaps(text)
     return {
         "valid": not missing,
         "template_id": template["id"],
@@ -8311,8 +8472,10 @@ def score_pathways(paths, project_path, project_name, scoped_findings, active_su
     return ranked
 
 
-def karpathy_card(pathway, project_name, goal, carry_forward=None):
+def karpathy_card(pathway, project_name, goal, carry_forward=None, focus_tags=None, focus_dropped=None):
     doctrine = PATHWAY_DOCTRINE.get(pathway, {})
+    focus_tags = list(focus_tags or []) if pathway == "research" else []
+    focus_dropped = list(focus_dropped or []) if focus_tags else []
     card = {
         "pathway": pathway,
         "title": doctrine.get("title", pathway),
@@ -8320,8 +8483,11 @@ def karpathy_card(pathway, project_name, goal, carry_forward=None):
         "verifier_good": doctrine.get("good", ""),
         "real_artifact": doctrine.get("artifact", ""),
         "one_percent_move": doctrine.get("move", ""),
-        "skill": doctrine.get("skill", ""),
-        "execution_stack": list(PATHWAY_EXECUTION.get(pathway, {}).get("stack", [])),
+        "skill": research_skill_with_focus(doctrine.get("skill", ""), focus_tags, focus_dropped),
+        "research_focus": focus_tags,
+        "research_focus_dropped": focus_dropped,
+        "execution_stack": [research_skill_with_focus(step, focus_tags, focus_dropped)
+                            for step in PATHWAY_EXECUTION.get(pathway, {}).get("stack", [])],
         "execution_tools": list(PATHWAY_EXECUTION.get(pathway, {}).get("tools", [])),
         "verifier_template": verifier_template_for(pathway),
         "goal": goal or f"Advance {project_name} via the {pathway} pathway",
@@ -8998,7 +9164,13 @@ def compute_pathway_next(args, paths):
             "open_decisions": list(latest_carry_forward.get("open_decisions", []) or []),
         }
     else:
-        card = karpathy_card(recommended["pathway"], project_name, goal_for_contract, latest_carry_forward)
+        focus_pathways = (
+            [e.get("pathway") for e in (active_summary or {}).get("itinerary", []) or []]
+            or list((outcome_profile or {}).get("required_pathways", []) or [])
+        )
+        focus_kept, focus_dropped = research_focus_split(focus_pathways, risk_overlays, contract_tier)
+        card = karpathy_card(recommended["pathway"], project_name, goal_for_contract, latest_carry_forward,
+                             focus_tags=focus_kept, focus_dropped=focus_dropped)
     trust = load_pathway_trust_summary(paths)
     has_context = bool(scoped_findings or selected_item)
     # Confidence must reflect the ACTUALLY recommended pathway and the field it competes

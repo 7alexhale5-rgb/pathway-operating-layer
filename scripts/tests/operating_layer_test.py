@@ -7187,6 +7187,119 @@ def test_design_gate_is_derived_from_repo_not_goal_wording():
 
 
 
+def test_research_focus_map_derivation_and_addendum_verifier():
+    opl = load_cli("research_focus")
+    focus_map = opl.RESEARCH_FOCUS_MAP
+    check(len(focus_map) == 12 and all(
+        set(spec) == {"pathways", "overlays", "addendum"} and spec["addendum"]
+        for spec in focus_map.values()),
+        "RESEARCH_FOCUS_MAP mirrors tags.json: 12 tags, each with pathways/overlays/addendum")
+    bad_pathways = sorted({p for spec in focus_map.values() for p in spec["pathways"]
+                           if p not in opl.PATHWAY_CANON_ORDER})
+    bad_overlays = sorted({o for spec in focus_map.values() for o in spec["overlays"]
+                           if o not in opl.RISK_OVERLAYS})
+    check(not bad_pathways, f"every focus pathway is in PATHWAY_CANON_ORDER (bad: {bad_pathways})")
+    check(not bad_overlays, f"every focus overlay is in RISK_OVERLAYS (bad: {bad_overlays})")
+    # Sibling checkout of the source of truth, when present (skipped in a standalone clone).
+    manifest = REPO.parent / "research-stack" / "focus" / "tags.json"
+    if manifest.exists():
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        tags = data["tags"]
+        check(list(tags) == list(focus_map) and all(
+            {"pathways": t["pathways"], "overlays": t["overlays"], "addendum": t["addendum"]}
+            == focus_map[name] for name, t in tags.items())
+            and data.get("bundles", {}) == opl.RESEARCH_FOCUS_BUNDLES,
+            "RESEARCH_FOCUS_MAP and RESEARCH_FOCUS_BUNDLES match research-stack/focus/tags.json")
+    else:
+        check(bool(opl.RESEARCH_FOCUS_BUNDLES),
+              "skipped: no sibling research-stack checkout (bundle mirror is non-empty)")
+    check(all(t in focus_map for tags_ in opl.RESEARCH_FOCUS_BUNDLES.values() for t in tags_),
+          "every bundle member is a mapped focus tag")
+
+    live = list(opl.PATHWAY_TIERS["live"])
+
+    def itinerary(*extra):
+        return [{"pathway": p} for p in live + ["research", *extra]]
+
+    sec = opl.research_focus_for(itinerary("security", "techdebt"), [{"id": "supply-chain"}], "live")
+    check(sec == ["security", "devtools"],
+          f"npm-CVE item (live + supply-chain) derives exactly security,devtools (got {sec})")
+    ui = opl.research_focus_for(itinerary("design"), [{"id": "ui-proof"}], "live")
+    check(ui == ["ui-ux", "a11y"], f"ui slice (live + ui-proof, design gated in) derives ui-ux,a11y (got {ui})")
+    agent = opl.research_focus_for(itinerary("security"), [{"id": "llm-agent-eval"}], "live")
+    check(agent == ["ai-agents"],
+          f"agent automation (llm-agent-eval) derives ai-agents; overlay-required pathways add nothing (got {agent})")
+    gated = opl.research_focus_for(itinerary("security"), [], "live")
+    check(gated == ["security", "ai-agents", "comms"],
+          f"a distinctive (non-tier, non-overlay) pathway derives its tags (got {gated})")
+    check(opl.research_focus_for(itinerary(), [], "live") == [],
+          "tier-default pathways and research alone derive no focus tag")
+    wide = opl.research_focus_for(itinerary(), ["ui-proof", "supply-chain", "llm-agent-eval", "privacy-evidence"], "live")
+    check(wide == ["ui-ux", "a11y", "security", "devtools"],
+          f"derived focus is capped at 4 tags in tags.json order (got {wide})")
+    kept, dropped = opl.research_focus_split(
+        itinerary(), ["ui-proof", "supply-chain", "llm-agent-eval", "privacy-evidence"], "live")
+    check(kept == wide and dropped == ["ai-agents", "comms", "legal"],
+          f"cap of 4 records the dropped tags (RF-4) (got {kept} / {dropped})")
+    na_itin = itinerary("design") + [{"pathway": "security", "status": "na"}]
+    check(opl.research_focus_for(na_itin, [], "live") == opl.research_focus_for(itinerary("design"), [], "live")
+          and "security" not in opl.research_focus_for(
+              [{"pathway": "security", "status": "na"}], [], "live"),
+          "RF-7: a pathway waived as na derives no focus")
+    card = opl.karpathy_card("research", "proj", "", focus_tags=sec)
+    check(card["skill"] == "/research-stack --deep (suggested focus: security, devtools)"
+          and "--focus" not in card["skill"]
+          and all("--focus" not in step for step in card["execution_stack"])
+          and card["execution_stack"][0].endswith("(suggested focus: security, devtools)")
+          and card["execution_stack"][0].startswith("/research-stack --deep")
+          and card["research_focus"] == sec
+          and opl.PATHWAY_DOCTRINE["research"]["skill"] == "/research-stack --deep",
+          f"RF-1/RF-8: research card suggests focus, never injects --focus (got {card['skill']})")
+    dcard = opl.karpathy_card("research", "proj", "", focus_tags=kept, focus_dropped=dropped)
+    check(dcard["research_focus_dropped"] == dropped and "ai-agents, comms, legal" in dcard["skill"],
+          f"RF-4: the card shows the tags the cap dropped (got {dcard['skill']})")
+    check(opl.karpathy_card("research", "proj", "")["skill"] == "/research-stack --deep",
+          "no derived focus leaves the research skill unchanged")
+    check(opl.karpathy_card("security", "proj", "", focus_tags=sec)["research_focus"] == [],
+          "focus tags only attach to the research card")
+
+    baton = "\n".join([
+        "## Summary\n- checked", "## What Changed\n- changed", "## More Relevant\n- relevant",
+        "## Less Relevant\n- deferred", "## Next Pathway Must Use\n- use this",
+        "## Do Not Do Yet\n- no mutation", "## Open Decisions\n- none", "## Active Risk Overlays\n- rollback",
+    ])
+    body = "question\nsources\n" + baton
+    good = ("---\nfocus: [security, devtools]\n---\n" + body
+            + "\n## Threat and advisory table\n| CVE |\n**Library decision matrix:** pick x\n")
+    check(opl.check_verifier_template("research", good)["valid"],
+          "focused dossier with every addendum heading passes the research template")
+    missing = opl.check_verifier_template("research", "---\nfocus: security, devtools\n---\n" + body
+                                          + "\n## Threat and advisory table\n")
+    check(not missing["valid"] and any("devtools" in m and "Library decision matrix" in m
+                                       for m in missing["missing"]),
+          "focused dossier missing an addendum section is rejected with the tag named")
+    unknown = opl.check_verifier_template("research", "---\nfocus: [astrology]\n---\n" + body)
+    check(not unknown["valid"] and any("unknown research focus tag 'astrology'" in m
+                                       for m in unknown["missing"]),
+          "unknown focus tag is a verification failure with a clear message")
+    check(opl.check_verifier_template("research", body)["valid"],
+          "an unfocused dossier keeps the plain research template")
+    check(opl.research_declared_focus("---\nfocus: ['#Security', \"#devtools\"]\n---\n") == ["security", "devtools"],
+          "RF-2: a leading # is stripped per tag")
+    check(opl.research_declared_focus("---\nfocus: [build-pick]\n---\n") == ["devtools", "security"],
+          "RF-2: a bundle expands to its member tags")
+    bundled = ("---\nfocus: [build-pick]\n---\n" + body
+               + "\n## Library decision matrix\n## Threat and advisory table\n")
+    check(opl.check_verifier_template("research", bundled)["valid"],
+          "RF-2: a bundle-focused dossier with each member addendum passes")
+    check(opl.research_declared_focus("---\nfocus:\n  - security\n  - '#devtools'\ndepth: deep\n---\n")
+          == ["security", "devtools"], "RF-6: a YAML block list after an empty focus: is read")
+    check(opl.research_declared_focus("\n\n---\nfocus: [seo]\n---\n") == ["seo"],
+          "RF-6: blank lines before the opening --- are tolerated")
+    check(opl.research_declared_focus("---\ntitle: x\n---\n") is None,
+          "no focus key still returns None")
+
+
 def main():
     tests = [
         test_design_findings_route_to_design_pathway,
@@ -7271,6 +7384,7 @@ def main():
         test_observability_proof_revalidates_receipt_freshness_after_canaries,
         test_observability_proof_rejects_mid_verification_artifact_mutation,
         test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts,
+        test_research_focus_map_derivation_and_addendum_verifier,
         test_audit_proof_integrity_uses_active_outcomes_and_reports_history,
         test_canary_mutant_is_symlink_safe,
         test_canary_explicit_target_rejects_outside_and_unchanged_files,

@@ -9,6 +9,7 @@ It connects the existing rooms below; source and tooling paths stay where they a
 - [Stable design docs and proof gates](references/CONTEXT.md)
 - [The CLI and its own tests](scripts/CONTEXT.md)
 - [Top-level integrity tests](tests/CONTEXT.md)
+- [Present state, feature artifacts and handoffs](.planning/CONTEXT.md)
 
 ## Start or resume work
 
