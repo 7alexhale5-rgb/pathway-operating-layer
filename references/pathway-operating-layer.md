@@ -71,37 +71,34 @@ an overlay dismissed on assertion is an overlay that was never applied.
 ## Research focus tags
 
 research-stack v3 takes focus tags (`/research-stack --focus seo,security`). `RESEARCH_FOCUS_MAP`
-in `operating-layer.py` mirrors the canonical manifest `research-stack/focus/tags.json` — change
-the manifest first, then the mirror (the suite checks every mapped pathway is in
-`PATHWAY_CANON_ORDER`, every overlay in `RISK_OVERLAYS`, and that the mirror matches a sibling
-`research-stack` checkout when one exists). The map holds 12 tags in manifest order: `seo`,
-`content`, `market`, `ui-ux`, `a11y`, `perf`, `security`, `devtools`, `ai-agents`, `data-infra`,
-`comms`, `legal`. `comms` (voice, SMS and dialers; addendum "Telephony and messaging plan",
-added 2026-10-01) maps to `data` and `security` plus the `privacy-evidence` overlay, which it
-shares with `legal`.
+and `RESEARCH_FOCUS_BUNDLES` in `operating-layer.py` mirror the canonical manifest
+`research-stack/focus/tags.json` (tags, pathways, overlays, addenda and bundles). Change the
+manifest first, then the mirror; the suite checks the mirror against a sibling `research-stack`
+checkout when one exists and that every mapped pathway and overlay is real. This doc does not list
+the tags: read the map or the manifest.
 
 - **Derivation.** `research_focus_for(pathways, overlays, tier)` works from the work item's
   itinerary, risk overlays and tier. Overlays are the strong signal: every tag whose overlays
   intersect the item's overlays is derived. A pathway counts only when it is distinctive: in the
   itinerary but not a default of `PATHWAY_TIERS[tier]`, not required by one of the item's overlays
-  (the overlay already speaks for it), and not the generic `research`. That leaves pathways pulled
-  in by a keyword gate or the outcome profile. Ordered by match count, then manifest order; capped
-  at 4. No derived tag means no `--focus`.
-- **Render time.** When `pathway-next` recommends research, the card's skill and best-execution
-  stack gain the derived flag. For a live-tier npm-CVE item with `supply-chain`:
-  `/research-stack --deep --focus security,devtools`. A UI slice with `ui-proof` gives
-  `--focus ui-ux,a11y`; an agent-automation item with `llm-agent-eval` gives `--focus ai-agents`.
-  An item with `privacy-evidence` derives `comms,legal`; one whose only distinctive pathway is
-  `security` derives `security,ai-agents,comms`.
-  `PATHWAY_DOCTRINE` stays static.
+  (the overlay already speaks for it), not the generic `research`, and not waived (`na`). Ordered
+  by match count, then manifest order; capped at 4. `research_focus_split` also returns the tags
+  the cap dropped.
+- **Render time.** Derived tags are a suggestion, never a flag: research-stack treats an explicit
+  `--focus` as the operator's choice and skips its scope gate. When `pathway-next` recommends
+  research, the card's skill and best-execution stack gain a note, e.g.
+  `/research-stack --deep (suggested focus: security, devtools)`. The card keeps `research_focus`
+  and `research_focus_dropped` (shown in the note as "dropped by the 4-tag cap"). No derived tag
+  means no note. `PATHWAY_DOCTRINE` stays static.
 - **Verifier.** `research-v1` still requires `question` and `sources`. A dossier whose YAML
-  frontmatter declares `focus: [a, b]` (or `focus: a, b`) must also carry a heading or bold
-  lead-in starting with each tag's addendum (case-insensitive, e.g. `## Threat and advisory table`).
-  An unknown tag fails verification with a message naming the known tags.
-- **Coverage gaps → findings.** research-stack should emit each "Coverage gaps" line as a finding
-  with id `rs-<tag>-<slug>` (e.g. `rs-security-no-kev-check`) in its `--json` pool. The existing
-  `rs-` prefix routes it to research through `ingest-review` / `latest-findings.json`; no new
-  ingestion path is needed.
+  frontmatter declares `focus:` (inline `[a, b]` / `a, b`, or a block list; `#` prefixes and
+  bundle names are accepted and expanded, as in research-stack's `validate_report.py`) must also
+  carry a heading or bold lead-in starting with each tag's addendum (case-insensitive). An
+  unknown tag fails verification with a message naming the known tags.
+- **Coverage gaps → findings (proposal, not built).** The intended flow is research-stack
+  emitting each "Coverage gaps" line as a finding with id `rs-<tag>-<slug>` in a `--json` pool,
+  which the existing `rs-` prefix would route to research through `ingest-review`. research-stack
+  has no `--json` flag yet, so nothing emits these today.
 
 ## The two hard rules
 

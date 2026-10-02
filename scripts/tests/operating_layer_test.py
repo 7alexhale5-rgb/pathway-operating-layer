@@ -7203,11 +7203,18 @@ def test_research_focus_map_derivation_and_addendum_verifier():
     # Sibling checkout of the source of truth, when present (skipped in a standalone clone).
     manifest = REPO.parent / "research-stack" / "focus" / "tags.json"
     if manifest.exists():
-        tags = json.loads(manifest.read_text(encoding="utf-8"))["tags"]
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        tags = data["tags"]
         check(list(tags) == list(focus_map) and all(
             {"pathways": t["pathways"], "overlays": t["overlays"], "addendum": t["addendum"]}
-            == focus_map[name] for name, t in tags.items()),
-            "RESEARCH_FOCUS_MAP matches research-stack/focus/tags.json")
+            == focus_map[name] for name, t in tags.items())
+            and data.get("bundles", {}) == opl.RESEARCH_FOCUS_BUNDLES,
+            "RESEARCH_FOCUS_MAP and RESEARCH_FOCUS_BUNDLES match research-stack/focus/tags.json")
+    else:
+        check(bool(opl.RESEARCH_FOCUS_BUNDLES),
+              "skipped: no sibling research-stack checkout (bundle mirror is non-empty)")
+    check(all(t in focus_map for tags_ in opl.RESEARCH_FOCUS_BUNDLES.values() for t in tags_),
+          "every bundle member is a mapped focus tag")
 
     live = list(opl.PATHWAY_TIERS["live"])
 
@@ -7230,11 +7237,29 @@ def test_research_focus_map_derivation_and_addendum_verifier():
     wide = opl.research_focus_for(itinerary(), ["ui-proof", "supply-chain", "llm-agent-eval", "privacy-evidence"], "live")
     check(wide == ["ui-ux", "a11y", "security", "devtools"],
           f"derived focus is capped at 4 tags in tags.json order (got {wide})")
+    kept, dropped = opl.research_focus_split(
+        itinerary(), ["ui-proof", "supply-chain", "llm-agent-eval", "privacy-evidence"], "live")
+    check(kept == wide and dropped == ["ai-agents", "comms", "legal"],
+          f"cap of 4 records the dropped tags (RF-4) (got {kept} / {dropped})")
+    na_itin = itinerary("design") + [{"pathway": "security", "status": "na"}]
+    check(opl.research_focus_for(na_itin, [], "live") == opl.research_focus_for(itinerary("design"), [], "live")
+          and "security" not in opl.research_focus_for(
+              [{"pathway": "security", "status": "na"}], [], "live"),
+          "RF-7: a pathway waived as na derives no focus")
     card = opl.karpathy_card("research", "proj", "", focus_tags=sec)
-    check(card["skill"] == f"/research-stack --deep --focus {','.join(sec)}"
-          and card["execution_stack"][0].startswith(f"/research-stack --deep --focus {','.join(sec)}")
+    check(card["skill"] == "/research-stack --deep (suggested focus: security, devtools)"
+          and "--focus" not in card["skill"]
+          and all("--focus" not in step for step in card["execution_stack"])
+          and card["execution_stack"][0].endswith("(suggested focus: security, devtools)")
+          and card["execution_stack"][0].startswith("/research-stack --deep")
+          and card["research_focus"] == sec
           and opl.PATHWAY_DOCTRINE["research"]["skill"] == "/research-stack --deep",
-          f"research card renders --focus at render time, doctrine unchanged (got {card['skill']})")
+          f"RF-1/RF-8: research card suggests focus, never injects --focus (got {card['skill']})")
+    dcard = opl.karpathy_card("research", "proj", "", focus_tags=kept, focus_dropped=dropped)
+    check(dcard["research_focus_dropped"] == dropped and "ai-agents, comms, legal" in dcard["skill"],
+          f"RF-4: the card shows the tags the cap dropped (got {dcard['skill']})")
+    check(opl.karpathy_card("research", "proj", "")["skill"] == "/research-stack --deep",
+          "no derived focus leaves the research skill unchanged")
     check(opl.karpathy_card("security", "proj", "", focus_tags=sec)["research_focus"] == [],
           "focus tags only attach to the research card")
 
@@ -7259,6 +7284,20 @@ def test_research_focus_map_derivation_and_addendum_verifier():
           "unknown focus tag is a verification failure with a clear message")
     check(opl.check_verifier_template("research", body)["valid"],
           "an unfocused dossier keeps the plain research template")
+    check(opl.research_declared_focus("---\nfocus: ['#Security', \"#devtools\"]\n---\n") == ["security", "devtools"],
+          "RF-2: a leading # is stripped per tag")
+    check(opl.research_declared_focus("---\nfocus: [build-pick]\n---\n") == ["devtools", "security"],
+          "RF-2: a bundle expands to its member tags")
+    bundled = ("---\nfocus: [build-pick]\n---\n" + body
+               + "\n## Library decision matrix\n## Threat and advisory table\n")
+    check(opl.check_verifier_template("research", bundled)["valid"],
+          "RF-2: a bundle-focused dossier with each member addendum passes")
+    check(opl.research_declared_focus("---\nfocus:\n  - security\n  - '#devtools'\ndepth: deep\n---\n")
+          == ["security", "devtools"], "RF-6: a YAML block list after an empty focus: is read")
+    check(opl.research_declared_focus("\n\n---\nfocus: [seo]\n---\n") == ["seo"],
+          "RF-6: blank lines before the opening --- are tolerated")
+    check(opl.research_declared_focus("---\ntitle: x\n---\n") is None,
+          "no focus key still returns None")
 
 
 def main():

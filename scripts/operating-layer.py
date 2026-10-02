@@ -336,9 +336,21 @@ RESEARCH_FOCUS_MAP = {
     "legal": {"pathways": ["govern"], "overlays": ["privacy-evidence"], "addendum": "Legal authority table"},
 }
 RESEARCH_FOCUS_MAX_TAGS = 4
+# Mirror of tags.json `bundles` (a bundle name in a dossier's `focus:` expands to its members).
+RESEARCH_FOCUS_BUNDLES = {
+    "launch": ["seo", "perf", "a11y", "content"],
+    "ship-audit": ["security", "perf", "a11y"],
+    "competitive": ["market", "seo", "content"],
+    "build-pick": ["devtools", "security"],
+}
 
 
 def research_focus_for(pathways, overlays, tier=None):
+    """Kept focus tags only; see research_focus_split for the tags the cap dropped."""
+    return research_focus_split(pathways, overlays, tier)[0]
+
+
+def research_focus_split(pathways, overlays, tier=None):
     """Derive research-stack focus tags from a work item's itinerary, overlays and tier.
 
     Accepts pathway names or itinerary entries ({"pathway": ...}) and overlay ids or overlay
@@ -346,11 +358,14 @@ def research_focus_for(pathways, overlays, tier=None):
     item's overlays is derived. A pathway counts only when it is distinctive: in the itinerary
     but not a default of `tier` (PATHWAY_TIERS), not required by one of the item's overlays
     (the overlay already speaks for it), and not the generic "research". Ordered by match count
-    desc, then RESEARCH_FOCUS_MAP order; capped at RESEARCH_FOCUS_MAX_TAGS.
+    desc, then RESEARCH_FOCUS_MAP order; capped at RESEARCH_FOCUS_MAX_TAGS. Itinerary entries
+    with status `na` (waived pathways) are skipped. Returns (kept, dropped_by_the_cap).
     """
     def _names(items, key):
         out = set()
         for item in items or []:
+            if isinstance(item, dict) and item.get("status") == "na":
+                continue
             name = item.get(key) if isinstance(item, dict) else item
             if isinstance(name, str) and name:
                 out.add(name)
@@ -368,17 +383,22 @@ def research_focus_for(pathways, overlays, tier=None):
         if matches:
             scored.append((-matches, index, tag))
     scored.sort()
-    return [tag for _, _, tag in scored[:RESEARCH_FOCUS_MAX_TAGS]]
+    ordered = [tag for _, _, tag in scored]
+    return ordered[:RESEARCH_FOCUS_MAX_TAGS], ordered[RESEARCH_FOCUS_MAX_TAGS:]
 
 
-def research_skill_with_focus(skill, focus_tags):
-    """Append ` --focus a,b` to a /research-stack invocation; unchanged when no tags."""
-    if not focus_tags or "/research-stack" not in (skill or "") or "--focus" in skill:
+def research_skill_with_focus(skill, focus_tags, dropped=None):
+    """Suggest focus tags beside a /research-stack invocation; never injects `--focus`.
+
+    research-stack treats an explicit --focus as the operator's choice and skips its scope gate,
+    so derived tags are only shown: "/research-stack --deep (suggested focus: a, b)".
+    """
+    if not focus_tags or "/research-stack" not in (skill or ""):
         return skill
-    focus = ",".join(focus_tags)
-    # Insert right after the invocation's flags so "/research-stack --deep (primary)" becomes
-    # "/research-stack --deep --focus a,b (primary)".
-    return re.sub(r"(/research-stack(?:\s+--[\w-]+)*)", lambda m: f"{m.group(1)} --focus {focus}", skill, count=1)
+    note = f"suggested focus: {', '.join(focus_tags)}"
+    if dropped:
+        note += f"; dropped by the {RESEARCH_FOCUS_MAX_TAGS}-tag cap: {', '.join(dropped)}"
+    return f"{skill} ({note})"
 
 
 def pathway_sort_key(pathway):
@@ -3542,18 +3562,40 @@ def research_declared_focus(text):
     Returns None when there is no frontmatter or no focus key, so unfocused dossiers keep the
     plain research template.
     """
-    lines = (text or "").lstrip("﻿").splitlines()
+    lines = (text or "").lstrip("\ufeff").lstrip().splitlines()
     if not lines or lines[0].strip() != "---":
         return None
+    body = []
     for line in lines[1:]:
         if line.strip() in ("---", "..."):
             break
+        body.append(line)
+
+    def clean(tag):
+        return tag.strip().strip("'\"").lstrip("#").strip().lower()
+
+    for i, line in enumerate(body):
         m = re.match(r"^focus\s*:\s*(.*?)\s*$", line)
-        if m:
-            raw = m.group(1).strip()
-            if raw.startswith("[") and raw.endswith("]"):
-                raw = raw[1:-1]
-            return [t.strip().strip("'\"").lower() for t in raw.split(",") if t.strip().strip("'\"")]
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        parts = raw.split(",") if raw else []
+        if not raw:  # YAML block list on the following indented/dash lines
+            for nxt in body[i + 1:]:
+                item = re.match(r"^\s*-\s*(.*?)\s*$", nxt)
+                if not item:
+                    if nxt.strip():
+                        break
+                    continue
+                parts.append(item.group(1))
+        expanded = []
+        for tag in (clean(t) for t in parts):
+            for member in RESEARCH_FOCUS_BUNDLES.get(tag, [tag]):
+                if member and member not in expanded:
+                    expanded.append(member)
+        return expanded
     return None
 
 
@@ -8430,9 +8472,10 @@ def score_pathways(paths, project_path, project_name, scoped_findings, active_su
     return ranked
 
 
-def karpathy_card(pathway, project_name, goal, carry_forward=None, focus_tags=None):
+def karpathy_card(pathway, project_name, goal, carry_forward=None, focus_tags=None, focus_dropped=None):
     doctrine = PATHWAY_DOCTRINE.get(pathway, {})
     focus_tags = list(focus_tags or []) if pathway == "research" else []
+    focus_dropped = list(focus_dropped or []) if focus_tags else []
     card = {
         "pathway": pathway,
         "title": doctrine.get("title", pathway),
@@ -8440,9 +8483,10 @@ def karpathy_card(pathway, project_name, goal, carry_forward=None, focus_tags=No
         "verifier_good": doctrine.get("good", ""),
         "real_artifact": doctrine.get("artifact", ""),
         "one_percent_move": doctrine.get("move", ""),
-        "skill": research_skill_with_focus(doctrine.get("skill", ""), focus_tags),
+        "skill": research_skill_with_focus(doctrine.get("skill", ""), focus_tags, focus_dropped),
         "research_focus": focus_tags,
-        "execution_stack": [research_skill_with_focus(step, focus_tags)
+        "research_focus_dropped": focus_dropped,
+        "execution_stack": [research_skill_with_focus(step, focus_tags, focus_dropped)
                             for step in PATHWAY_EXECUTION.get(pathway, {}).get("stack", [])],
         "execution_tools": list(PATHWAY_EXECUTION.get(pathway, {}).get("tools", [])),
         "verifier_template": verifier_template_for(pathway),
@@ -9124,8 +9168,9 @@ def compute_pathway_next(args, paths):
             [e.get("pathway") for e in (active_summary or {}).get("itinerary", []) or []]
             or list((outcome_profile or {}).get("required_pathways", []) or [])
         )
+        focus_kept, focus_dropped = research_focus_split(focus_pathways, risk_overlays, contract_tier)
         card = karpathy_card(recommended["pathway"], project_name, goal_for_contract, latest_carry_forward,
-                             focus_tags=research_focus_for(focus_pathways, risk_overlays, contract_tier))
+                             focus_tags=focus_kept, focus_dropped=focus_dropped)
     trust = load_pathway_trust_summary(paths)
     has_context = bool(scoped_findings or selected_item)
     # Confidence must reflect the ACTUALLY recommended pathway and the field it competes
