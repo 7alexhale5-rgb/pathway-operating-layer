@@ -9165,7 +9165,7 @@ def compute_pathway_next(args, paths):
         }
     else:
         focus_pathways = (
-            [e.get("pathway") for e in (active_summary or {}).get("itinerary", []) or []]
+            list((active_summary or {}).get("itinerary", []) or [])  # entries, so waived (na) steps are skipped
             or list((outcome_profile or {}).get("required_pathways", []) or [])
         )
         focus_kept, focus_dropped = research_focus_split(focus_pathways, risk_overlays, contract_tier)
