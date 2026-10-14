@@ -1,3 +1,6 @@
+
+> **STALE: 29 commit(s) landed in `pathway-operating-layer` since this was last verified 58d ago (as read from `origin/main`). Do NOT assert its present-tense status; verify first, then rewrite this file and delete this line.**
+
 # Pathway Operating Layer - Present State
 
 Updated: 2026-08-17
