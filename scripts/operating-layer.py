@@ -9511,6 +9511,8 @@ def run_work_log(args, paths):
         "evidence_path": evidence_path,
         "status": args.result or "recorded",
         "source": "operating-layer work-log",
+        # Retain the original artifact even when the proof pointer is later updated.
+        "artifact_sha256": sha256_file(evidence_path) if evidence_path else "",
     }
     measurement = {
         "measurement_id": measurement_id(run_id, args.gate or args.kind),

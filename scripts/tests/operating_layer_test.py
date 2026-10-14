@@ -6850,16 +6850,24 @@ def test_approval_issue_guard_repeatable_verifier():
     def verify(runs="4"):
         command = list(verifier_cmd)
         command[command.index("--runs") + 1] = runs
+        # This is a cancellation budget for sequential child processes, not
+        # the performance verdict. The verifier still rejects p95 >= 50ms.
+        # Each of 33 behavior fixtures and each timing sample has a 5s bound.
+        cancellation_budget = 30 + (33 + int(runs)) * 5
         return subprocess.run(
-            command, capture_output=True, text=True, timeout=30,
+            command, capture_output=True, text=True, timeout=cancellation_budget,
         )
 
     def verify_source(source, runs="1"):
         command = list(verifier_cmd)
         command[command.index("--repo-hook") + 1] = str(source)
         command[command.index("--runs") + 1] = runs
+        # This is a cancellation budget for sequential child processes, not
+        # the performance verdict. The verifier still rejects p95 >= 50ms.
+        # Each of 33 behavior fixtures and each timing sample has a 5s bound.
+        cancellation_budget = 30 + (33 + int(runs)) * 5
         return subprocess.run(
-            command, capture_output=True, text=True, timeout=30,
+            command, capture_output=True, text=True, timeout=cancellation_budget,
         )
 
     def point_installed_links(source):
@@ -6879,7 +6887,7 @@ def test_approval_issue_guard_repeatable_verifier():
     passed = verify(runs="120")
     summary = verifier_json(passed)
     check(passed.returncode == 0,
-          f"repeatable approval guard verifier passes its complete fixture ({passed.stderr.strip()})")
+          f"repeatable approval guard verifier passes its complete fixture ({passed.stdout.strip()}; {passed.stderr.strip()})")
     check(summary.get("status") == "pass", "approval guard verifier returns a JSON pass status")
     check(summary.get("run_count") == 120, "approval guard verifier honors its run-count override")
     check(summary.get("settings_checked") == 3,
