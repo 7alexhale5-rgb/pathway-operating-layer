@@ -17,6 +17,7 @@ import shutil
 import stat
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -319,6 +320,23 @@ class StrictLedgerTests(AuthorityFixture):
                 self.identity,
             )
         self.assertEqual(before, self.config.authority_ledger.read_bytes())
+
+    def test_short_append_rolls_back_to_the_last_complete_ledger(self):
+        self.issue()
+        before = self.config.authority_ledger.read_bytes()
+        real_write = authority.os.write
+
+        def short_write(descriptor, payload):
+            return real_write(descriptor, payload[: max(1, len(payload) // 2)])
+
+        with mock.patch.object(authority.os, "write", side_effect=short_write):
+            with self.assertRaisesRegex(authority.AuthorityError, "Authority append"):
+                self.dispatch(
+                    "issue", "--subject-json", json.dumps(self.release_subject("f")),
+                    "--consumer", "P-ffffffffffff", "--reason", "reviewed",
+                )
+        self.assertEqual(before, self.config.authority_ledger.read_bytes())
+        self.assertEqual(len(self.records()), 2)
 
 
 class BootstrapTests(AuthorityFixture):

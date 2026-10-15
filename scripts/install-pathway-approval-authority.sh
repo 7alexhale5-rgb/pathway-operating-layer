@@ -12,8 +12,8 @@
 #   /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/scripts/install-pathway-approval-authority.sh /private/var/root/pathway-approval-bootstrap/install.sh
 #   /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/security/pathway-approval /private/var/root/pathway-approval-bootstrap/pathway-approval
 #   /usr/bin/printf '%s  %s\n' '<INSTALLER_SHA256>' '/private/var/root/pathway-approval-bootstrap/install.sh' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-#   /usr/bin/printf '%s  %s\n' '34df494a986a2b56e056190b507e6117fae70a979135418517b311f116e3e323' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-#   /usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 '<INSTALLER_SHA256>' --expected-helper-sha256 '34df494a986a2b56e056190b507e6117fae70a979135418517b311f116e3e323'
+#   /usr/bin/printf '%s  %s\n' '191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
+#   /usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 '<INSTALLER_SHA256>' --expected-helper-sha256 '191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6'
 #
 # No project-owned code executes as root before both staged hashes match. The
 # staged directory is preserved as a root-owned audit artifact. Steady-state OS
@@ -28,7 +28,7 @@ export PATH
 STAGE_DIR="/private/var/root/pathway-approval-bootstrap"
 STAGED_INSTALLER="$STAGE_DIR/install.sh"
 STAGED_HELPER="$STAGE_DIR/pathway-approval"
-PINNED_HELPER_SHA256="34df494a986a2b56e056190b507e6117fae70a979135418517b311f116e3e323"
+PINNED_HELPER_SHA256="191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6"
 INSTALL_DIR="/usr/local/libexec"
 INSTALL_HELPER="$INSTALL_DIR/pathway-approval"
 AUTHORITY_DIR="/Library/Application Support/Pathway"

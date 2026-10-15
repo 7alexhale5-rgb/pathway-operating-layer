@@ -20,7 +20,7 @@
     "runbook_version": "specialist-fleet-watch-v1",
     "issued_at": "2026-09-01T21:18:41Z",
     "expires_at": "2026-09-02T09:18:41Z",
-    "verifier_source_sha256": "5ebc9584c1fc911465aa3261d49b0e82fee139ff723c85625e08d457e2f4bd3b",
+    "verifier_source_sha256": "9aeeba57895902f839416eee64a2fe764084ad2601df60dedf1e41c939c00a61",
     "runtime_present": true,
     "telemetry_present": true,
     "alerts_wired": true,
@@ -65,7 +65,7 @@
       "alert_artifact": "c025b6020661c8d0d7d0ecbdf9063e6f05a028e78005f41f7beeda7e705a27b0",
       "runbook_drill_artifact": "5abad4225f79fdef7a4f3043160d4df598d6ec77d26a62ba27d7cd0b72d53cd1",
       "canary_artifact": "a732e2179d023a70879abaf3b8e4eaf19311bb8ed4951570f86e7bcc1baf5d77",
-      "verifier_artifact": "5ebc9584c1fc911465aa3261d49b0e82fee139ff723c85625e08d457e2f4bd3b"
+      "verifier_artifact": "9aeeba57895902f839416eee64a2fe764084ad2601df60dedf1e41c939c00a61"
     }
   }
 }

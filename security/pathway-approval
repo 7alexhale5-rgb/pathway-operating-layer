@@ -567,6 +567,9 @@ def _authority_transaction(config, operation, *, create=False):
             os.lseek(descriptor, 0, os.SEEK_END)
             count = os.write(descriptor, payload)
             if count != len(payload):
+                # Never leave a partial record behind: restore the last complete ledger.
+                os.ftruncate(descriptor, len(raw))
+                os.fsync(descriptor)
                 raise AuthorityError("append-failed", "Authority append did not complete in one write.")
             os.fsync(descriptor)
         result["ledger_sha256"] = _sha256_bytes(raw + payload)

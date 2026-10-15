@@ -120,6 +120,56 @@ def run_report(ledger=None):
     )
 
 
+CANARY_FAILED = "FAILED_AS_EXPECTED"
+CANARY_PASSED = "PASSED_UNEXPECTEDLY"
+
+
+def alert_delivered(execution, root, marker):
+    """True only when the watcher fired AND the alert file reached the ops inbox."""
+    inbox = root / "_inbox" / "ops-lead"
+    alerts = list(inbox.glob("*-subagent-perf-alert.md")) if inbox.is_dir() else []
+    text = alerts[0].read_text(encoding="utf-8") if len(alerts) == 1 else ""
+    return (execution.returncode == 3
+            and "subagent-perf-watch: ALERT rc=3" in execution.stdout
+            and len(alerts) == 1
+            and "source: scripts/subagent-perf-watch.sh" in text
+            and "severity: FIRE-REVIEW fail-streak" in text
+            and marker in text)
+
+
+def run_isolated_watch(perf, watch, ledger_text, parent, *, block_inbox=False):
+    """Run byte-identical copies of the watcher in a fresh temporary repo."""
+    root = Path(tempfile.mkdtemp(prefix="g3-watch-", dir=str(parent)))
+    ledger = root / "_meta" / "subagent-performance.ndjson"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(ledger_text, encoding="utf-8")
+    scripts = root / "scripts"
+    scripts.mkdir()
+    shutil.copyfile(perf, scripts / perf.name)
+    shutil.copyfile(watch, scripts / watch.name)
+    if block_inbox:
+        (root / "_inbox").mkdir()
+        (root / "_inbox" / "ops-lead").write_text("delivery disabled\n", encoding="utf-8")
+    execution = subprocess.run(
+        ["bash", str(scripts / watch.name), "--ledger", str(ledger)],
+        cwd=root, capture_output=True, text=True, timeout=20, check=False,
+    )
+    return root, execution
+
+
+def negative_canaries(perf, watch, clean_ledger_text, drill_ledger_text, parent, marker):
+    """Execute both anti-gaming canaries; a canary passes only if the alert check fails."""
+    root, execution = run_isolated_watch(perf, watch, clean_ledger_text, parent)
+    inbox = root / "_inbox" / "ops-lead"
+    quiet = execution.returncode == 0 and not (inbox.is_dir() and any(inbox.iterdir()))
+    missing_signal = CANARY_FAILED if quiet else CANARY_PASSED
+    root, execution = run_isolated_watch(
+        perf, watch, drill_ledger_text, parent, block_inbox=True)
+    disabled_alert = (CANARY_PASSED if alert_delivered(execution, root, marker)
+                      else CANARY_FAILED)
+    return {"disabled_alert": disabled_alert, "missing_signal": missing_signal}
+
+
 def main():
     require(len(sys.argv) == 2, "usage: verify_agents_runtime_receipt.py RECEIPT.json")
     receipt_path = Path(sys.argv[1]).expanduser().resolve()
@@ -221,6 +271,9 @@ def main():
                 and "severity: FIRE-REVIEW fail-streak" in isolated_alert_text
                 and "pathway-g3-drill" in isolated_alert_text,
                 "byte-identical isolated watcher did not write the fired alert")
+        canary_results = negative_canaries(
+            PERF, WATCH, LEDGER.read_text(encoding="utf-8"),
+            drill_ledger.read_text(encoding="utf-8"), isolated_root, "pathway-g3-drill")
 
     execution = (alert.get("executions") or [{}])[0]
     require(alert.get("alerts_wired") is True and execution.get("status") == "FIRED",
@@ -240,10 +293,12 @@ def main():
     require(runbook.get("drill_executed") is True
             and runbook.get("prohibited_actions_taken") == [],
             "runbook drill is incomplete or claims unsafe actions")
-    require(canary.get("results") == {
-        "disabled_alert": "FAILED_AS_EXPECTED",
-        "missing_signal": "FAILED_AS_EXPECTED",
-    }, "anti-gaming canary evidence is incomplete")
+    require(canary_results == {
+        "disabled_alert": CANARY_FAILED,
+        "missing_signal": CANARY_FAILED,
+    }, f"executed anti-gaming canaries did not fail closed: {canary_results}")
+    require(canary.get("results") == canary_results,
+            "canary evidence does not match the executed canaries")
 
     after = {name: digest(path) for name, path in SOURCE_FILES.items()}
     require(after == before, "the verifier observed an Agents source mutation")

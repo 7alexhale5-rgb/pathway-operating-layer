@@ -472,6 +472,63 @@ def test_observability_contract_resolution_g2_and_identity_guards():
           "unknown observability work IDs cannot mutate any run, proof, measurement, or carry-forward ledger")
 
 
+_G3_FAKE_PERF = """import sys
+ledger = open(sys.argv[sys.argv.index('--ledger') + 1], encoding='utf-8').read()
+if ledger.count('pathway-g3-drill') >= 3:
+    print('pathway-g3-drill FIRE-REVIEW')
+    sys.exit(3)
+print('clean')
+"""
+
+_G3_FAKE_WATCH = """#!/bin/bash
+set -u
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+INBOX="$REPO/_inbox/ops-lead"
+REPORT="$(python3 "$REPO/scripts/subagent-perf.py" report --ledger "$2" 2>&1)"
+RC=$?
+__GUARD__
+mkdir -p "$INBOX"
+ALERT="$INBOX/t-$$-subagent-perf-alert.md"
+{ echo "source: scripts/subagent-perf-watch.sh"; echo "severity: FIRE-REVIEW fail-streak"; echo "$REPORT"; } > "$ALERT"
+echo "subagent-perf-watch: ALERT rc=$RC -> $ALERT"
+exit $RC
+"""
+
+
+def test_agents_g3_verifier_executes_negative_canaries():
+    reset()
+    import importlib.util
+    path = (REPO / ".planning" / "per-project-observability-contracts"
+            / "observability" / "verify_agents_runtime_receipt.py")
+    spec = importlib.util.spec_from_file_location("agents_g3_verifier", path)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    check(hasattr(verifier, "negative_canaries"),
+          "the focused Agents verifier executes its own negative canaries")
+    if not hasattr(verifier, "negative_canaries"):
+        return
+    work = ROOT / "agents-g3-canaries"
+    work.mkdir(parents=True, exist_ok=True)
+    perf = work / "subagent-perf.py"
+    perf.write_text(_G3_FAKE_PERF, encoding="utf-8")
+    clean = '{"subagent":"a","result":"pass"}\n'
+    drill = clean + '{"subagent":"pathway-g3-drill","result":"fail"}\n' * 3
+    expected = {"disabled_alert": "FAILED_AS_EXPECTED", "missing_signal": "FAILED_AS_EXPECTED"}
+    for name, guard, want in (
+        ("honest", 'if [ $RC -eq 0 ]; then echo "subagent-perf-watch: clean (rc 0)"; exit 0; fi',
+         expected),
+        ("always-alerts", ":", {"disabled_alert": "FAILED_AS_EXPECTED",
+                                "missing_signal": "PASSED_UNEXPECTEDLY"}),
+    ):
+        folder = work / name
+        folder.mkdir(exist_ok=True)
+        watch = folder / "subagent-perf-watch.sh"
+        watch.write_text(_G3_FAKE_WATCH.replace("__GUARD__", guard), encoding="utf-8")
+        results = verifier.negative_canaries(perf, watch, clean, drill, folder, "pathway-g3-drill")
+        check(results == want,
+              f"G3 negative canaries are executed, not self-attested ({name}: {results})")
+
+
 def test_agents_observability_contract_uses_generic_drill_envelope():
     reset()
     opl = load_cli("agents_observability_contract")
@@ -9164,6 +9221,7 @@ def main():
         test_observability_contract_loader_fails_closed_and_gates_schema,
         test_observability_contract_resolution_g2_and_identity_guards,
         test_agents_observability_contract_uses_generic_drill_envelope,
+        test_agents_g3_verifier_executes_negative_canaries,
         test_cohens_kappa_inter_rater_agreement,
         test_fleiss_kappa_multi_rater_agreement,
         test_kappa_reliability_thresholds,

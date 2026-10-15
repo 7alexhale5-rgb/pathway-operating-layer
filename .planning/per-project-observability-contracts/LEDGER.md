@@ -69,7 +69,8 @@ Done against the shared work ID:
   The focused receipt under `observability/` binds all seven artifact fields to
   the real Agents ledger, watcher, trap transcript, historical alert, and a
   fresh read-only three-failure drill. Its registered verifier digest is
-  `5ebc9584c1fc911465aa3261d49b0e82fee139ff723c85625e08d457e2f4bd3b`.
+  `9aeeba57895902f839416eee64a2fe764084ad2601df60dedf1e41c939c00a61` (re-registered
+  2026-10-14; was `5ebc9584…` before the canaries became executed).
   The verifier executes byte-identical copies of the real Agents report and
   watcher scripts in a temporary repo, observes watcher exit 3, and proves the
   watcher wrote the fired alert to the isolated ops-lead inbox without writing
@@ -88,8 +89,14 @@ Done against the shared work ID:
   per-project contract". The canary-verifier memory's "unreachable by design"
   paragraph now describes per-project contracts. The agents BACKLOG entry on the
   single-project engine is marked superseded (edited in the agents checkout, left
-  uncommitted there). Branch merged with origin/main; suite 1386/1386.
+  uncommitted there). Branch merged with origin/main; suite 1389/1389 after review fixes.
   The plan's docs-pathway proof was not logged to the shared ledger this session.
+
+- Review 2026-10-14 (grok run 20261014-194400-79a0): the G3 canary was
+  self-attested; the verifier now executes the missing-signal and
+  disabled-alert canaries against byte-identical watcher copies and requires
+  the artifact to match. The approval helper now rolls a short append back to
+  the last complete ledger; installer and ceremony digests regenerated.
 
 Next: log the docs pathway proof against this work ID. The central outcome's own observability credit remains
 open until it has evidence under its own project contract; G3 itself is the

@@ -63,14 +63,18 @@ The six exact tickets above remain the proven chat-override subset; the other
 23 are also denied live authority because independent human authentication was
 not established for the mutable-era ledger.
 
+Digests below were regenerated 2026-10-14 after the short-write rollback fix in
+the helper. They are void once either file changes; recompute with
+`shasum -a 256` on the staged files and compare before running the ceremony.
+
 ```bash
 /usr/bin/sudo -k
 /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 0700 /private/var/root/pathway-approval-bootstrap
 /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/scripts/install-pathway-approval-authority.sh /private/var/root/pathway-approval-bootstrap/install.sh
 /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/security/pathway-approval /private/var/root/pathway-approval-bootstrap/pathway-approval
-/usr/bin/printf '%s  %s\n' 'f22b618ba40f105411f5c22a819babd49f52597bbe8ef82ef629f135f45e1a6f' '/private/var/root/pathway-approval-bootstrap/install.sh' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-/usr/bin/printf '%s  %s\n' '34df494a986a2b56e056190b507e6117fae70a979135418517b311f116e3e323' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-/usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 'f22b618ba40f105411f5c22a819babd49f52597bbe8ef82ef629f135f45e1a6f' --expected-helper-sha256 '34df494a986a2b56e056190b507e6117fae70a979135418517b311f116e3e323'
+/usr/bin/printf '%s  %s\n' 'ed888d422e22d4f7e2c51a6a0b813ad26f9a19ff13796d173a4fd16c71a78e00' '/private/var/root/pathway-approval-bootstrap/install.sh' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
+/usr/bin/printf '%s  %s\n' '191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
+/usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 'ed888d422e22d4f7e2c51a6a0b813ad26f9a19ff13796d173a4fd16c71a78e00' --expected-helper-sha256 '191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6'
 ```
 
 The installer embeds this exact bootstrap request:
