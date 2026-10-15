@@ -15,6 +15,7 @@ This repo follows ICM (Jake Van Clief's folder method): this file routes, each r
 | Working research, proof-integrity or scanner-scope notes | `docs/`       | [docs/CONTEXT.md](docs/CONTEXT.md)             | none   |
 | Look up a stable design doc or proof gate                | `references/` | [references/CONTEXT.md](references/CONTEXT.md) | none   |
 | Run or extend the staleness/integrity test suite         | `tests/`      | [tests/CONTEXT.md](tests/CONTEXT.md)           | none   |
+| Read or update present state, feature artifacts, handoffs | `.planning/` | [.planning/CONTEXT.md](.planning/CONTEXT.md)   | `/pathway`, `/research-stack` |
 
 `contracts/`, `hooks/`, `security/`, `skills/`, `commands/` stay where their
 registrations expect them (the approval-issue guard, the `/pathway` skill and slash
@@ -32,7 +33,7 @@ stay put: `README.md`, `LICENSE`, `install.sh`.
 ## Verify
 
 - `python3 scripts/operating-layer.py --help`
-- `python3 scripts/tests/operating_layer_test.py` → `137/137 checks passed`
+- `python3 scripts/tests/operating_layer_test.py` → `1192/1192 checks passed`
 
 ## Design
 
