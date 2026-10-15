@@ -231,6 +231,30 @@ Proof is the load-bearing idea, so the engine is strict about it:
 This is what makes `proved` mean *a verification actually passed*, and what stops autonomy
 from being farmed by self-attestation.
 
+### Observability proof uses a per-project contract
+
+Observability credit needs runtime evidence, and what that evidence looks like differs by
+project. Each project names its own evidence in a contract file under
+`contracts/observability/<project-key>.json` (for example `agents.json`,
+`rainman-thorp.json`, `prettyfly/os.json`). A contract lists the metrics, events,
+correlation fields, drill trace and alert, runbook questions, and the trusted verifier
+SHA-256 for that project.
+
+- **The engine picks the contract, never the receipt.** The key is the work item's
+  canonical path under the projects root, owner family included (`prettyfly/os`). Missing,
+  mismatched, traversing or symlinked identities are refused, and a work ID with no
+  contract fails with `observability_contract_not_registered` before any run starts.
+- **A contract describes the evidence; it cannot lower the bar.** Receipt shape, SHA-256
+  binding, canary mutation, restoration checks and the verifier-trust check stay in the
+  engine. The verifier's bytes are checked against the contract's trusted digest before it
+  runs, and the contract's SHA-256 is recorded in the proof and rechecked afterwards.
+- **No contract, no credit.** The loader fails closed (64 KB cap, schema and cardinality
+  floors). A project without a contract keeps observability open, honestly, until it has one.
+
+Add a contract by writing the JSON for the project's real signals, then proving one
+receipt against it. The fixtures and gates are in `scripts/tests/operating_layer_test.py`
+(`test_observability_contract_*`).
+
 ## Status & limitations
 
 This is honest about where it stands:

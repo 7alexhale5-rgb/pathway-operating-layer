@@ -1,5 +1,5 @@
 ---
-timestamp: 2026-08-30
+timestamp: 2026-10-14
 work_id: W-20260830-pathway-operating-layer-per-project-observabilit-e65d28
 ---
 
@@ -84,7 +84,14 @@ Done against the shared work ID:
   its honest waiver, and the watcher remains manual, not scheduled. No ledger
   proof was manufactured or retroactively migrated.
 
-Next: Phase 4 (docs). The central outcome's own observability credit remains
+- Phase 4 — docs done 2026-10-14. README gains "Observability proof uses a
+  per-project contract". The canary-verifier memory's "unreachable by design"
+  paragraph now describes per-project contracts. The agents BACKLOG entry on the
+  single-project engine is marked superseded (edited in the agents checkout, left
+  uncommitted there). Branch merged with origin/main; suite 1386/1386.
+  The plan's docs-pathway proof was not logged to the shared ledger this session.
+
+Next: log the docs pathway proof against this work ID. The central outcome's own observability credit remains
 open until it has evidence under its own project contract; G3 itself is the
 approved focused Agents-scoped contract gate.
 The extracted Phase 1 contract and the separate approval-authority repair are
