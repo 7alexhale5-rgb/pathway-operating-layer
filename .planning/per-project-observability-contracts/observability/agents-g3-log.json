@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "artifact_type": "structured_log_evidence",
+  "environment_id": "agents-specialist-fleet-focused-local-drill",
+  "runtime_digest": "263dab7dc7e1c7ec15ff4a123b5835fa8eaec06564ff2db474efed08265245f5",
+  "observed_at": "2026-09-01T21:18:41Z",
+  "correlation_fields": [
+    "alert_id",
+    "alert_state",
+    "event_id",
+    "failure_mode",
+    "fleet",
+    "ledger_sha256",
+    "observed_at",
+    "occurred_at",
+    "operator_disposition",
+    "safe_action",
+    "sequence",
+    "specialist",
+    "trace_id"
+  ],
+  "records": [
+    {
+      "event_name": "specialist.performance.alert_fired",
+      "alert_id": "subagent-perf-fail-streak",
+      "alert_state": "FIRE_REVIEW",
+      "event_id": "g3-alert-20260901T211841Z",
+      "failure_mode": "THREE_CONSECUTIVE_FAILURES",
+      "fleet": "SPECIALIST_FLEET",
+      "ledger_sha256": "fcac942ef741d2d51dbe0661a2580422c4cb0aa54919b9d461522abba445d946",
+      "observed_at": "2026-09-01T21:18:41Z",
+      "occurred_at": "2026-09-01T21:18:41Z",
+      "operator_disposition": "STOP_HIRING_REVISE_REREGISTER",
+      "safe_action": "STOP_HIRING_REVISE_REREGISTER",
+      "sequence": 25,
+      "specialist": "pathway-g3-drill",
+      "trace_id": "263dab7dc7e1c7ec15ff4a123b5835fa"
+    }
+  ]
+}

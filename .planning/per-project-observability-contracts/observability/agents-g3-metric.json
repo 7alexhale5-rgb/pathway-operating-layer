@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "artifact_type": "metric_evidence",
+  "environment_id": "agents-specialist-fleet-focused-local-drill",
+  "runtime_digest": "263dab7dc7e1c7ec15ff4a123b5835fa8eaec06564ff2db474efed08265245f5",
+  "observed_at": "2026-09-01T21:18:41Z",
+  "metric_names": [
+    "specialist_evaluations_total",
+    "specialist_fail_streak",
+    "specialist_pass_rate_ratio"
+  ],
+  "samples": [
+    {
+      "name": "specialist_evaluations_total",
+      "value": 22,
+      "labels": {
+        "fleet": "SPECIALIST_FLEET"
+      }
+    },
+    {
+      "name": "specialist_fail_streak",
+      "value": 0,
+      "labels": {
+        "fleet": "SPECIALIST_FLEET",
+        "state": "CLEAN"
+      }
+    },
+    {
+      "name": "specialist_pass_rate_ratio",
+      "value": 0.8181818181818182,
+      "labels": {
+        "fleet": "SPECIALIST_FLEET"
+      }
+    }
+  ],
+  "live_report_rc": 0,
+  "live_report_sha256": "2dd63ef1beaf89331caa40a38579f227924a0471ba906548b472ad118b8a05d9",
+  "source_sha256": {
+    "ledger": "fcac942ef741d2d51dbe0661a2580422c4cb0aa54919b9d461522abba445d946",
+    "perf": "6d553bc1a0bde7e9ca6fbe5524143c342da198310508a43f93036a241ffce4ec",
+    "watch": "3211b06efc64a11f3fb4d7ee061be9d90e87bd5873b86314bc6f2c0b2ee3db6c",
+    "upstream_verifier": "b9bb651d16d73d81742530aca7ab3c8c4ec7dbd6b7b8d3697acf20e9abca97d6",
+    "historical_receipt": "9600fa16c2a942dbb02b175e61d3f97e3f396daa2fe63e99f0ab92b24b8e7a6b",
+    "historical_alert": "ac8b20b08ce2a4bcc7b96ebb6fa7ab855ed8f664e531f3454bb066cdd3f78c70",
+    "trap_transcript": "254acc797c00228cd7d3a0a19931d50ea05c71173b1b9894359d2beaab2e3926"
+  }
+}

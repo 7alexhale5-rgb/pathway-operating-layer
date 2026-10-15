@@ -1,7 +1,6 @@
 ---
 name: pathway
 description: Ask a project what engineering pathway to run next, track the work against one shared ID, or start a measured multi-project pathway pilot. Wraps operating-layer pathway-next + the work envelope so you never type the CLI. Loop mode runs the whole determine → execute → prove → advance cycle continuously, with autonomy earned by the proof metric.
-argument-hint: "<project> [ go | done | <goal> ] [--max] | pilot <projects> <goal>   —   usually just the project; add --max for the full hypercritical chain; I hand you the exact next command to paste"
 ---
 
 # Pathway — next-best move for a project
@@ -185,7 +184,9 @@ re-recommend, do not present a menu.
    - **production-secure** — untrusted actors, compliance (+ research · security · techdebt).
      The goal's own words also auto-pull `design` (UI), `research`, or `data`. If the user didn't say,
      infer from the goal and state your pick in one line — don't interrogate.
-3. Run: `python3 ~/.claude/scripts/operating-layer.py work-start --project <abs-path> --goal "<goal>" --tier <tier>`
+3. Run: `python3 ~/.claude/scripts/operating-layer.py work-start --project <abs-path> --goal "<goal>" --tier <tier>`.
+   For a full development cycle, immediately enroll the same work ID with
+   `python3 ~/.claude/scripts/operating-layer.py protocol-start --work-id <work-id> --project <abs-path> --goal "<goal>"`.
 4. Immediately run ASK with the `work-start` result's `--work-id` pinned. Show the **seeded itinerary** in plain English — "this outcome
    needs N pathways: govern, data, … — I walk them in order, and it can't close until each is proved
    on a real artifact or explicitly marked not-applicable with a reason."
@@ -245,7 +246,7 @@ fail-closes to Tier 1 in code, so the field is always current).
 techdebt, design`.
 
 **Never auto, any tier:** `/ship`, `work-close`, prod-flag flips, external sends — pause and ask.
-(The `docs` pathway is Tier-2 safe: its skill is `doc-coauthoring`, which authors without committing.)
+(The `docs` pathway is Tier-2 safe: its skill is `anthropic-skills:doc-coauthoring` (a plugin skill, not under `~/.claude/skills`), which authors without committing.)
 
 **One iteration:**
 

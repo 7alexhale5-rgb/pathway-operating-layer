@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "artifact_type": "alert_execution_evidence",
+  "environment_id": "agents-specialist-fleet-focused-local-drill",
+  "runtime_digest": "263dab7dc7e1c7ec15ff4a123b5835fa8eaec06564ff2db474efed08265245f5",
+  "observed_at": "2026-09-01T21:18:41Z",
+  "alerts_wired": true,
+  "executions": [
+    {
+      "alert_id": "subagent-perf-fail-streak",
+      "condition": "three consecutive specialist failures",
+      "status": "FIRED",
+      "safe_action": "STOP_HIRING_REVISE_REREGISTER",
+      "exit_code": 3,
+      "delivery_surface": "isolated temporary ops-lead inbox"
+    }
+  ],
+  "watcher_execution": {
+    "mode": "BYTE_IDENTICAL_TEMP_REPO",
+    "exit_code": 3,
+    "delivery_surface": "isolated temporary ops-lead inbox",
+    "source_checkout_mutated": false
+  },
+  "watch_script": "/Users/alexhale/Projects/agents/scripts/subagent-perf-watch.sh",
+  "watch_script_sha256": "3211b06efc64a11f3fb4d7ee061be9d90e87bd5873b86314bc6f2c0b2ee3db6c",
+  "historical_alert": "/Users/alexhale/Projects/agents/_inbox/ops-lead/2026-08-30T021520Z-79130-subagent-perf-alert.md",
+  "historical_alert_sha256": "ac8b20b08ce2a4bcc7b96ebb6fa7ab855ed8f664e531f3454bb066cdd3f78c70",
+  "schedule_state": "MANUAL_NOT_SCHEDULED",
+  "claim_boundary": "the real watcher bytes executed in an isolated temporary repo; runtime credit is local focused-drill scope, not production monitoring"
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify approval-issue guard wiring without invoking the approval CLI."""
+"""Verify defense-in-depth approval guard wiring without invoking authority."""
 from __future__ import annotations
 
 import argparse
@@ -36,8 +36,8 @@ def default_output_root() -> Path:
 
 DEFAULT_LEDGER = default_output_root() / "operator-intelligence" / "approvals.ndjson"
 DENIAL = (
-    "DENIED: approval-issue is reserved for Alex. "
-    "Review the exact command, then run it in a normal Terminal.\n"
+    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
+    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
 )
 
 BLOCKED_FIXTURES = (
@@ -49,6 +49,12 @@ BLOCKED_FIXTURES = (
         "command",
         "python3 --check-hash-based-pycs always "
         "scripts/operating-layer.py approval-issue --help",
+    ),
+    ("command", "operating-layer.py approval-invalidate --ticket-id AT-000000000000 --reason audit"),
+    (
+        "command",
+        "APPROVAL_ISSUE_CHAT_OVERRIDE=1 operating-layer.py approval-invalidate "
+        "--ticket-id AT-000000000000 --reason audit",
     ),
 )
 ALLOWED_FIXTURES = (
