@@ -33,7 +33,7 @@ stay put: `README.md`, `LICENSE`, `install.sh`.
 ## Verify
 
 - `python3 scripts/operating-layer.py --help`
-- `python3 scripts/tests/operating_layer_test.py` → `1192/1192 checks passed`
+- `python3 scripts/tests/operating_layer_test.py` → `1389/1389 checks passed` (or current count)
 
 ## Design
 
