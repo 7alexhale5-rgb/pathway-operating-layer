@@ -20,13 +20,19 @@ import re
 import secrets
 import shutil
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import development_protocol
 
 
 # Portable defaults — derived from $HOME (and overridable by env), never a hardcoded username, so
@@ -52,6 +58,12 @@ def _default_output_root():
 
 DEFAULT_OUTPUT_ROOT = _default_output_root()
 RENDERER = DEFAULT_CLAUDE_HOME / "scripts" / "operator-md-to-html.py"
+APPROVAL_AUTHORITY_PATH = Path(
+    "/Library/Application Support/Pathway/approval-authority.ndjson"
+    if sys.platform == "darwin"
+    else "/var/lib/pathway/approval-authority.ndjson"
+)
+APPROVAL_HELPER_PATH = Path("/usr/local/libexec/pathway-approval")
 
 PRUNE_DIRS = {
     ".git",
@@ -1569,138 +1581,8 @@ def release_provider_action_verifier_binding(stdout, expected_action, receipt_sh
     return {"markers": markers, "errors": errors, "bound": not errors}
 
 
-OBSERVABILITY_METRIC_NAMES = {
-    "tradebot_market_data_age_seconds",
-    "tradebot_risk_decisions_total",
-    "tradebot_order_ack_latency_seconds",
-    "tradebot_reconciliation_mismatches_total",
-    "tradebot_policy_violations_total",
-    "tradebot_drawdown_ratio",
-    "tradebot_component_heartbeat_age_seconds",
-}
-OBSERVABILITY_METRIC_LABEL_VALUES = {
-    "tradebot_market_data_age_seconds": {
-        "asset": {"BTC-USD", "ETH-USD"},
-        "source": {"SOURCE_UNSELECTED"},
-    },
-    "tradebot_risk_decisions_total": {
-        "decision": {"APPROVE", "DENY", "ABSTAIN"},
-        "reason": {
-            "POLICY_PASS", "POLICY_VIOLATION", "STALE_DATA", "UNKNOWN_STATE",
-            "RECONCILIATION_MISMATCH", "AMBIGUOUS_SUBMIT",
-            "UNRESOLVED_PARTIAL_FILL", "STAGE_DENIED",
-        },
-    },
-    "tradebot_order_ack_latency_seconds": {"venue": {"VENUE_UNSELECTED"}},
-    "tradebot_reconciliation_mismatches_total": {
-        "asset": {"BTC-USD", "ETH-USD"},
-        "class": {"POSITION", "BALANCE", "ORDER", "RESERVATION", "SEQUENCE"},
-    },
-    "tradebot_policy_violations_total": {
-        "type": {"AUTHORITY", "STAGE", "RISK", "ARTIFACT", "SIGNATURE", "ORDER_STATE"},
-    },
-    "tradebot_drawdown_ratio": {"mode": {"SIMULATE_ONLY", "OBSERVE_ONLY"}},
-    "tradebot_component_heartbeat_age_seconds": {
-        "component": {
-            "MARKET_DATA", "DETERMINISTIC_EVALUATOR", "RISK_ENGINE",
-            "EXECUTION_ADAPTER", "AUDIT_LEDGER", "TELEMETRY_EXPORTER", "RECONCILER",
-        },
-    },
-}
-OBSERVABILITY_EVENT_NAMES = {
-    "tradebot.proposal.created", "tradebot.proposal.rejected", "tradebot.risk.decision",
-    "tradebot.order.state_changed", "tradebot.order.submit_ambiguous",
-    "tradebot.reconciliation.completed", "tradebot.halt.latched",
-    "tradebot.halt.release_requested", "tradebot.halt.release_denied",
-    "tradebot.halt.release_approved", "tradebot.kill_switch.activated",
-    "tradebot.rollback.started", "tradebot.rollback.completed", "tradebot.rollback.failed",
-    "tradebot.stage.transition_requested", "tradebot.stage.transition.denied",
-    "tradebot.stage.transition.approved", "tradebot.audit.checkpoint_signed",
-    "tradebot.telemetry.gap_detected",
-}
-OBSERVABILITY_CORRELATION_FIELDS = {
-    "event_id", "sequence", "previous_digest", "payload_hash", "producer_id",
-    "producer_key_id", "occurred_at", "trace_id",
-    "decision_id", "cycle_id", "intent_id", "client_order_id", "manifest_hash",
-    "strategy_hash", "risk_policy_hash", "data_snapshot_hash", "account_snapshot_seq",
-    "asset", "mode", "market_event_ts", "observed_at", "risk_decision", "reason_code",
-}
-OBSERVABILITY_CORRELATION_HASH_FIELDS = {
-    "previous_digest", "payload_hash", "manifest_hash", "strategy_hash",
-    "risk_policy_hash", "data_snapshot_hash",
-}
-OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS = {"occurred_at", "market_event_ts", "observed_at"}
-OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS = {"sequence", "account_snapshot_seq"}
-OBSERVABILITY_ALLOWED_ASSETS = {"BTC-USD", "ETH-USD"}
-OBSERVABILITY_ALLOWED_MODES = {"SIMULATE_ONLY", "OBSERVE_ONLY"}
-OBSERVABILITY_ALLOWED_RISK_DECISIONS = {"APPROVE", "DENY", "ABSTAIN"}
-OBSERVABILITY_ALLOWED_REASON_CODES = {
-    "POLICY_PASS", "POLICY_VIOLATION", "STALE_DATA", "UNKNOWN_STATE",
-    "RECONCILIATION_MISMATCH", "AMBIGUOUS_SUBMIT", "UNRESOLVED_PARTIAL_FILL",
-    "STAGE_DENIED",
-}
-OBSERVABILITY_DRILL_INCIDENT = {
-    "event_name": "tradebot.halt.latched",
-    "asset": "BTC-USD",
-    "mode": "SIMULATE_ONLY",
-    "risk_decision": "DENY",
-    "reason_code": "STALE_DATA",
-}
-OBSERVABILITY_DRILL_TRACE_NAME = "halt.activate"
-OBSERVABILITY_DRILL_ALERT = {
-    "alert_id": "stale-feed",
-    "condition": "market data absent",
-    "status": "FIRED",
-    "safe_action": "HALT_ENTRIES_RECONCILE_ONLY",
-}
-OBSERVABILITY_RUNBOOK_QUESTION_IDS = {
-    "CURRENT_AUTHORIZED_STAGE_AND_MODE",
-    "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS",
-    "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES",
-    "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS",
-    "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE",
-    "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE",
-    "WHY_HALT_ENTRIES_LATCHED",
-    "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED",
-    "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING",
-    "HUMAN_DISPOSITION_REQUIRED_NEXT",
-}
-OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS = {
-    "metric_artifact", "log_artifact", "trace_artifact", "alert_artifact", "canary_artifact",
-}
-OBSERVABILITY_RUNBOOK_DISPOSITIONS = {
-    "RETAIN_HALT_AND_RECONCILE",
-    "ESCALATE_AND_RETAIN_HALT",
-}
-OBSERVABILITY_RUNBOOK_ANSWER_CODES = {
-    "CURRENT_AUTHORIZED_STAGE_AND_MODE": "AUTHORITY_CONFIRMED_NO_RUNTIME",
-    "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS": "CORRELATION_IDENTIFIERS_RECONSTRUCTED",
-    "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES": "AUTHORITATIVE_HASHES_RECONSTRUCTED",
-    "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS": "TRUSTED_TIMESTAMPS_RECONSTRUCTED",
-    "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE": "VENUE_ACKNOWLEDGEMENT_REMAINS_UNCERTAIN",
-    "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE": "WORST_CASE_RESERVATION_RETAINED",
-    "WHY_HALT_ENTRIES_LATCHED": "HALT_LATCH_CONFIRMED",
-    "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED": "PROHIBITED_ACTIONS_CONFIRMED",
-    "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING": "MISSING_RECONCILIATION_EVIDENCE_IDENTIFIED",
-    "HUMAN_DISPOSITION_REQUIRED_NEXT": "HUMAN_RECONCILIATION_REQUIRED",
-}
-OBSERVABILITY_RUNBOOK_ENUM_VALUES = {
-    "order_uncertainty": {"ACKNOWLEDGEMENT_UNCERTAIN"},
-    "last_venue_evidence": {"NO_TERMINAL_VENUE_EVIDENCE"},
-    "reservation_state": {"WORST_CASE_RESERVATION_RETAINED"},
-    "exposure_state": {"OPEN_SYNTHETIC_BTC_EXPOSURE"},
-    "ledger_mismatch_state": {"LEDGER_VENUE_MISMATCH_UNRESOLVED"},
-    "halt_reason": {"STALE_MARKET_DATA_AND_UNCERTAIN_VENUE_ACK"},
-    "human_disposition": {"RETAIN_HALT_AND_RECONCILE"},
-    "next_action": {"RECONCILE_BY_CLIENT_ORDER_ID"},
-}
-OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE = {
-    "AUTHORITATIVE_VENUE_ORDER_STATE",
-}
 OBSERVABILITY_ALLOWED_STAGES = {"NONE"}
 OBSERVABILITY_ALLOWED_VERDICTS = {"NO_PROMOTE"}
-OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE = "TRUSTED_VERIFIER_NOT_CONFIGURED"
-OBSERVABILITY_TRUSTED_VERIFIER_SHA256 = frozenset()
 OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS = (
     "metric_artifact", "log_artifact", "trace_artifact", "alert_artifact",
     "runbook_drill_artifact", "canary_artifact", "verifier_artifact",
@@ -1737,73 +1619,8 @@ OBSERVABILITY_MAX_FUTURE_SKEW_SECONDS = 300
 OBSERVABILITY_MAX_OBSERVATION_WINDOW_SECONDS = 300
 OBSERVABILITY_MAX_JSON_BYTES = 5_000_000
 OBSERVABILITY_MAX_ABS_METRIC_VALUE = 10 ** 100
-OBSERVABILITY_METRIC_DOMAINS = {
-    "tradebot_market_data_age_seconds": (0, None),
-    "tradebot_risk_decisions_total": (0, None),
-    "tradebot_order_ack_latency_seconds": (0, None),
-    "tradebot_reconciliation_mismatches_total": (0, None),
-    "tradebot_policy_violations_total": (0, None),
-    "tradebot_drawdown_ratio": (0, 1),
-    "tradebot_component_heartbeat_age_seconds": (0, None),
-}
-OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT = {
-    "CURRENT_AUTHORIZED_STAGE_AND_MODE": {
-        "fields": {"authorized_stage": "stage", "mode": "mode"},
-        "evidence": ("log_artifact",),
-    },
-    "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS": {
-        "fields": {
-            "decision_id": "identifier", "cycle_id": "identifier", "intent_id": "identifier",
-            "client_order_id": "identifier",
-        },
-        "evidence": ("log_artifact",),
-    },
-    "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES": {
-        "fields": {
-            "strategy_hash": "sha256", "data_snapshot_hash": "sha256",
-            "risk_policy_hash": "sha256", "manifest_hash": "sha256",
-        },
-        "evidence": ("log_artifact",),
-    },
-    "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS": {
-        "fields": {"market_timestamp": "timestamp", "private_feed_timestamp": "timestamp"},
-        "evidence": ("log_artifact", "metric_artifact"),
-    },
-    "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE": {
-        "fields": {"order_uncertainty": "enum", "last_venue_evidence": "enum"},
-        "evidence": ("log_artifact", "trace_artifact"),
-    },
-    "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE": {
-        "fields": {
-            "reservation_state": "enum", "exposure_state": "enum",
-            "ledger_mismatch_state": "enum",
-        },
-        "evidence": ("log_artifact", "metric_artifact"),
-    },
-    "WHY_HALT_ENTRIES_LATCHED": {
-        "fields": {"halt_reason": "enum", "halt_latched": "true"},
-        "evidence": ("alert_artifact", "log_artifact"),
-    },
-    "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED": {
-        "fields": {
-            "retry_prohibited": "true", "flatten_prohibited": "true",
-            "halt_release_prohibited": "true",
-        },
-        "evidence": ("alert_artifact",),
-    },
-    "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING": {
-        "fields": {"missing_reconciliation_evidence": "evidence_list"},
-        "evidence": ("log_artifact", "metric_artifact"),
-    },
-    "HUMAN_DISPOSITION_REQUIRED_NEXT": {
-        "fields": {"human_disposition": "enum", "next_action": "enum"},
-        "evidence": ("alert_artifact",),
-    },
-}
-
-
-def _read_strict_json_object(path, label="observability companion"):
-    """Read a JSON object while rejecting duplicate keys and non-finite numbers."""
+def _parse_strict_json_object_bytes(raw, label="observability companion", max_bytes=None):
+    """Parse one captured byte snapshot, rejecting duplicates and non-finite numbers."""
     duplicates = []
 
     def unique_object(pairs):
@@ -1824,13 +1641,9 @@ def _read_strict_json_object(path, label="observability companion"):
             raise ValueError(f"non-finite number {value}")
         return number
 
-    try:
-        with open(path, "rb") as fh:
-            raw = fh.read(OBSERVABILITY_MAX_JSON_BYTES + 1)
-    except OSError as exc:
-        return {}, [f"{label} could not be read: {exc}"]
-    if len(raw) > OBSERVABILITY_MAX_JSON_BYTES:
-        return {}, [f"{label} exceeds the {OBSERVABILITY_MAX_JSON_BYTES}-byte limit"]
+    limit = OBSERVABILITY_MAX_JSON_BYTES if max_bytes is None else max_bytes
+    if len(raw) > limit:
+        return {}, [f"{label} exceeds the {limit}-byte limit"]
     try:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -1849,6 +1662,583 @@ def _read_strict_json_object(path, label="observability companion"):
         errors.append(f"{label} must be a JSON object")
         data = {}
     return data, errors
+
+
+def _read_strict_json_object(path, label="observability companion"):
+    """Read a JSON object while rejecting duplicate keys and non-finite numbers."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(OBSERVABILITY_MAX_JSON_BYTES + 1)
+    except OSError as exc:
+        return {}, [f"{label} could not be read: {exc}"]
+    return _parse_strict_json_object_bytes(raw, label)
+
+
+# ---------------------------------------------------------------------------
+# Per-project observability evidence contracts.
+#
+# The tradebot evidence schema that used to live here as module constants is
+# now versioned DATA: contracts/observability/rainman-thorp.json (extracted
+# verbatim 2026-08-30). A contract defines WHAT the evidence describes; it can
+# never lower HOW MUCH proof is required -- the receipt shape, sha256/canary/
+# restoration binding, and snapshot checks stay engine-side above and in
+# proof_is_verified. The loader below fails closed: no readable, schema-valid
+# contract means every observability receipt is refused outright.
+
+OBSERVABILITY_CONTRACT_MAX_BYTES = 65_536
+OBSERVABILITY_CONTRACT_MEMBER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{3,127}\Z")
+OBSERVABILITY_RUNBOOK_FACT_KINDS = frozenset({
+    "enum", "evidence_list", "identifier", "mode", "sha256", "stage", "timestamp", "true",
+})
+OBSERVABILITY_RUNBOOK_EVIDENCE_INVENTORY = frozenset(OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS) - {
+    "runbook_drill_artifact", "verifier_artifact",
+}
+OBSERVABILITY_CONTRACT_ENUM_FLOORS = {
+    "metric_names": 3,
+    "event_names": 3,
+    "correlation_fields": 8,
+    "correlation_hash_fields": 1,
+    "correlation_timestamp_fields": 1,
+    "correlation_sequence_fields": 1,
+    "runbook_question_ids": 3,
+    "runbook_evidence_fields": 3,
+    "runbook_dispositions": 1,
+    "runbook_missing_evidence": 1,
+}
+OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS = {
+    "allowed_assets": "asset",
+    "allowed_modes": "mode",
+    "allowed_risk_decisions": "risk_decision",
+    "allowed_reason_codes": "reason_code",
+}
+
+
+def observability_contracts_dir(contract_root=None):
+    """Engine-owned contracts root, realpath-contained inside this repo.
+
+    Resolves through symlinks (including a symlinked contracts/ directory)
+    and refuses any resolution that escapes the repo root, per threat T4.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    configured = (
+        Path(contract_root).expanduser().absolute()
+        if contract_root is not None
+        else repo_root / "contracts" / "observability"
+    )
+    contracts_dir = configured.resolve()
+    if contracts_dir != configured:
+        return None
+    return contracts_dir
+
+
+def _observability_contract_enum_errors(contract, key, floor):
+    if key not in contract:
+        return [f"observability contract is missing required key {key}"]
+    value = contract.get(key)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return [f"observability contract {key} must be a list of strings"]
+    errors = []
+    if len(value) != len(set(value)):
+        errors.append(f"observability contract {key} must not contain duplicates")
+    if len(value) < floor:
+        errors.append(
+            f"observability contract {key} needs at least {floor} member(s)"
+        )
+    for member in value:
+        if not OBSERVABILITY_CONTRACT_MEMBER_RE.fullmatch(member):
+            errors.append(
+                f"observability contract {key} member {member!r} fails the quality gate"
+            )
+            break
+    return errors
+
+
+def _observability_string_list(value):
+    """Return a validated string list or an inert empty list, never a crashable scalar."""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return value
+
+
+def _observability_finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def validate_observability_contract(contract):
+    """Schema gate for one contract object. Returns a list of errors."""
+    if not isinstance(contract, dict):
+        return ["observability contract must be an object"]
+    errors = []
+    if type(contract.get("schema_version")) is not int or contract.get("schema_version") != 1:
+        errors.append("observability contract schema_version must be integer 1")
+    if contract.get("contract_type") != "observability_evidence_contract":
+        errors.append("observability contract_type must be observability_evidence_contract")
+    if not isinstance(contract.get("project_key"), str) or not contract.get("project_key").strip():
+        errors.append("observability contract requires a non-empty project_key")
+    for key, floor in OBSERVABILITY_CONTRACT_ENUM_FLOORS.items():
+        errors.extend(_observability_contract_enum_errors(contract, key, floor))
+
+    metric_names = set(_observability_string_list(contract.get("metric_names")))
+    labels = contract.get("metric_label_values")
+    if not isinstance(labels, dict) or set(labels) != metric_names or not all(
+        isinstance(entry, dict)
+        and all(
+            isinstance(values, list) and values
+            and all(isinstance(v, str) and v.strip() for v in values)
+            and len(values) == len(set(values))
+            for values in entry.values()
+        )
+        for entry in labels.values()
+    ):
+        errors.append("observability contract metric_label_values must cover exactly metric_names")
+    domains = contract.get("metric_domains")
+    domains_valid = isinstance(domains, dict) and set(domains) == metric_names
+    if domains_valid:
+        for bounds in domains.values():
+            if not isinstance(bounds, list) or len(bounds) != 2:
+                domains_valid = False
+                break
+            minimum, maximum = bounds
+            if (not _observability_finite_number(minimum)
+                    or (maximum is not None and not _observability_finite_number(maximum))
+                    or (maximum is not None and maximum < minimum)):
+                domains_valid = False
+                break
+    if not domains_valid:
+        errors.append("observability contract metric_domains must cover exactly metric_names")
+
+    correlation = set(_observability_string_list(contract.get("correlation_fields")))
+    for subset_key in (
+        "correlation_hash_fields", "correlation_timestamp_fields",
+        "correlation_sequence_fields",
+    ):
+        if not set(_observability_string_list(contract.get(subset_key))).issubset(correlation):
+            errors.append(
+                f"observability contract {subset_key} must be a subset of correlation_fields"
+            )
+    correlation_timestamps = set(
+        _observability_string_list(contract.get("correlation_timestamp_fields")))
+    timestamp_order = contract.get("correlation_timestamp_order")
+    if (timestamp_order is not None
+            and (not isinstance(timestamp_order, list)
+                 or not all(isinstance(field, str) for field in timestamp_order)
+                 or len(timestamp_order) != len(set(timestamp_order))
+                 or set(timestamp_order) != correlation_timestamps)):
+        errors.append(
+            "observability contract correlation_timestamp_order must order every timestamp field"
+        )
+    for legacy_key in OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS:
+        if legacy_key in contract:
+            errors.extend(_observability_contract_enum_errors(contract, legacy_key, 1))
+    correlation_enum_values = contract.get("correlation_enum_values", {})
+    if (not isinstance(correlation_enum_values, dict)
+            or not all(
+                isinstance(field, str) and field in correlation
+                and isinstance(values, list) and values
+                and all(isinstance(value, str) and value.strip() for value in values)
+                and len(values) == len(set(values))
+                for field, values in correlation_enum_values.items()
+            )):
+        errors.append(
+            "observability contract correlation_enum_values must map correlation fields to value lists"
+        )
+        correlation_enum_values = {}
+    else:
+        correlation_enum_values = dict(correlation_enum_values)
+    for legacy_key, field in OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS.items():
+        legacy_values = contract.get(legacy_key)
+        if legacy_key not in contract or not isinstance(legacy_values, list):
+            continue
+        if (field in correlation_enum_values
+                and set(correlation_enum_values[field]) != set(legacy_values)):
+            errors.append(
+                f"observability contract {legacy_key} conflicts with correlation_enum_values[{field}]"
+            )
+        correlation_enum_values.setdefault(field, legacy_values)
+
+    question_ids = set(_observability_string_list(contract.get("runbook_question_ids")))
+    answer_codes = contract.get("runbook_answer_codes")
+    if not isinstance(answer_codes, dict) or set(answer_codes) != question_ids or not all(
+        isinstance(code, str) and code.strip() for code in answer_codes.values()
+    ):
+        errors.append("observability contract runbook_answer_codes must cover exactly runbook_question_ids")
+    enum_values = contract.get("runbook_enum_values")
+    enum_values_valid = isinstance(enum_values, dict) and all(
+        isinstance(field, str) and isinstance(values, list) and values
+        and all(isinstance(v, str) and v.strip() for v in values)
+        and len(values) == len(set(values))
+        for field, values in enum_values.items()
+    )
+    if not enum_values_valid:
+        errors.append("observability contract runbook_enum_values must map fields to value lists")
+    evidence_fields = set(_observability_string_list(contract.get("runbook_evidence_fields")))
+    if not evidence_fields.issubset(OBSERVABILITY_RUNBOOK_EVIDENCE_INVENTORY):
+        errors.append(
+            "observability contract runbook_evidence_fields must come from the receipt artifact inventory"
+        )
+    answer_contract = contract.get("runbook_answer_contract")
+    answer_contract_valid = isinstance(answer_contract, dict) and set(answer_contract) == question_ids
+    enum_fact_fields = set()
+    if answer_contract_valid:
+        for entry in answer_contract.values():
+            if not isinstance(entry, dict):
+                answer_contract_valid = False
+                break
+            fields = entry.get("fields")
+            evidence = entry.get("evidence")
+            if (not isinstance(fields, dict) or not fields
+                    or not all(
+                        isinstance(field, str) and isinstance(kind, str)
+                        and kind in OBSERVABILITY_RUNBOOK_FACT_KINDS
+                        for field, kind in fields.items()
+                    )
+                    or not isinstance(evidence, list) or not evidence
+                    or not all(isinstance(ref, str) for ref in evidence)
+                    or len(evidence) != len(set(evidence))
+                    or not set(evidence).issubset(evidence_fields)
+                    or not set(evidence).issubset(OBSERVABILITY_RUNBOOK_EVIDENCE_INVENTORY)):
+                answer_contract_valid = False
+                break
+            enum_fact_fields.update(field for field, kind in fields.items() if kind == "enum")
+    if not answer_contract_valid:
+        errors.append(
+            "observability contract runbook_answer_contract must cover exactly runbook_question_ids"
+        )
+    if enum_values_valid and enum_fact_fields != set(enum_values):
+        errors.append(
+            "observability contract enum facts must map exactly to runbook_enum_values"
+        )
+
+    drill_incident = contract.get("drill_incident")
+    if (not isinstance(drill_incident, dict)
+            or len(set(drill_incident) - {"event_name"}) < 3
+            or "event_name" not in drill_incident
+            or not set(drill_incident).issubset(correlation | {"event_name"})
+            or not all(isinstance(value, str) and value.strip()
+                       for value in drill_incident.values())
+            or drill_incident.get("event_name") not in set(
+                _observability_string_list(contract.get("event_names")))
+            or any(
+                field in correlation_enum_values
+                and value not in correlation_enum_values[field]
+                for field, value in drill_incident.items()
+            )):
+        errors.append(
+            "observability contract drill_incident must bind at least three contract correlation fields"
+        )
+    if not isinstance(contract.get("drill_trace_name"), str) or not contract.get("drill_trace_name").strip():
+        errors.append("observability contract requires a drill_trace_name")
+    drill_alert = contract.get("drill_alert")
+    if (not isinstance(drill_alert, dict)
+            or set(drill_alert) != {"alert_id", "condition", "status", "safe_action"}
+            or drill_alert.get("status") != "FIRED" or not all(
+        isinstance(drill_alert.get(field), str) and drill_alert.get(field).strip()
+        for field in ("alert_id", "condition", "status", "safe_action")
+    )):
+        errors.append("observability contract drill_alert must carry alert_id/condition/status/safe_action")
+
+    trusted = contract.get("trusted_verifier_sha256")
+    trusted_valid = isinstance(trusted, list) and all(
+        isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) for digest in trusted
+    )
+    if not trusted_valid or len(trusted) != len(set(trusted)):
+        errors.append(
+            "observability contract trusted_verifier_sha256 must be a unique list of lowercase sha256 digests"
+        )
+    return errors
+
+
+def load_observability_contract_snapshot(contract_path):
+    """Load, parse, and hash one exact contract byte snapshot, fail closed."""
+    contract_path = Path(contract_path)
+    if contract_path.is_symlink():
+        return {}, ["observability contract must not be a symlink"], ""
+    if not contract_path.is_file():
+        return {}, ["observability_contract_not_registered"], ""
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(contract_path, flags)
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return {}, ["observability contract must be a regular file"], ""
+            raw = fh.read(OBSERVABILITY_CONTRACT_MAX_BYTES + 1)
+    except OSError:
+        return {}, ["observability contract is unreadable"], ""
+    contract, errors = _parse_strict_json_object_bytes(
+        raw, "observability contract", OBSERVABILITY_CONTRACT_MAX_BYTES)
+    if errors:
+        return {}, errors, ""
+    errors = validate_observability_contract(contract)
+    if errors:
+        return {}, errors, ""
+    return contract, [], hashlib.sha256(raw).hexdigest()
+
+
+def load_observability_contract_file(contract_path):
+    """Compatibility wrapper returning the schema-gated contract and errors."""
+    contract, errors, _digest = load_observability_contract_snapshot(contract_path)
+    return contract, errors
+
+
+def observability_project_key(project_path, projects_root=None):
+    """Return the canonical projects-root-relative identity, including owner family."""
+    root = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser().resolve()
+    resolved = Path(resolve_project_dir(project_path, root)).expanduser()
+    try:
+        resolved = resolved.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError):
+        return "", ["observability project must resolve inside the canonical projects root"]
+    if (not relative.parts or any(
+            part in {"", ".", ".."} or part.startswith(("_", "."))
+            for part in relative.parts)):
+        return "", ["observability project key is not a canonical project path"]
+    return relative.as_posix(), []
+
+
+OBSERVABILITY_PROJECT_CONTRACT_ALIASES = MappingProxyType({
+    # The live work item and checkout are /Projects/tradebot; Phase 1 preserved
+    # the pre-existing Rainman/Thorp contract filename and project_key verbatim.
+    "tradebot": "rainman-thorp",
+})
+
+
+def _observability_contract_state(
+        contract, errors=(), path="", key="", digest="", project_key=""):
+    """Compile validated contract data into one read-only state passed through validation."""
+    contract = contract if isinstance(contract, dict) else {}
+    answer_contract = {
+        question_id: MappingProxyType({
+            "fields": MappingProxyType(dict(entry["fields"])),
+            "evidence": tuple(entry["evidence"]),
+        })
+        for question_id, entry in (contract.get("runbook_answer_contract") or {}).items()
+    }
+    correlation_enum_values = {
+        field: frozenset(members)
+        for field, members in (contract.get("correlation_enum_values") or {}).items()
+    }
+    for legacy_key, field in OBSERVABILITY_LEGACY_CORRELATION_ENUM_KEYS.items():
+        if legacy_key in contract:
+            correlation_enum_values[field] = frozenset(contract.get(legacy_key) or [])
+    timestamp_order = tuple(contract.get("correlation_timestamp_order") or [])
+    if not timestamp_order:
+        # Compatibility for schema-v1 contracts extracted before the optional
+        # order existed. Derive a chain only when every contract-declared field
+        # has one unambiguous temporal role; otherwise retain no implicit order.
+        role_tokens = {
+            "event": 0,
+            "occur": 1,
+            "occurred": 1,
+            "observe": 2,
+            "observed": 2,
+        }
+        ranked = []
+        for field in contract.get("correlation_timestamp_fields") or []:
+            roles = {
+                role_tokens[token]
+                for token in re.split(r"[^a-z0-9]+", field.lower())
+                if token in role_tokens
+            }
+            if len(roles) != 1:
+                ranked = []
+                break
+            ranked.append((roles.pop(), field))
+        if ranked and len({rank for rank, _field in ranked}) == len(ranked):
+            timestamp_order = tuple(field for _rank, field in sorted(ranked))
+    values = {
+        "errors": tuple(errors),
+        "path": str(path or ""),
+        "key": str(key or contract.get("project_key") or ""),
+        "project_key": str(project_key or key or contract.get("project_key") or ""),
+        "sha256": str(digest or ""),
+        "schema_version": contract.get("schema_version"),
+        "metric_names": frozenset(contract.get("metric_names") or []),
+        "metric_label_values": MappingProxyType({
+            name: MappingProxyType({label: frozenset(members) for label, members in entry.items()})
+            for name, entry in (contract.get("metric_label_values") or {}).items()
+        }),
+        "metric_domains": MappingProxyType({
+            name: tuple(bounds) for name, bounds in (contract.get("metric_domains") or {}).items()
+        }),
+        "event_names": frozenset(contract.get("event_names") or []),
+        "correlation_fields": frozenset(contract.get("correlation_fields") or []),
+        "correlation_hash_fields": frozenset(contract.get("correlation_hash_fields") or []),
+        "correlation_timestamp_fields": frozenset(
+            contract.get("correlation_timestamp_fields") or []),
+        "correlation_timestamp_order": timestamp_order,
+        "correlation_sequence_fields": frozenset(
+            contract.get("correlation_sequence_fields") or []),
+        "correlation_enum_values": MappingProxyType(correlation_enum_values),
+        "allowed_assets": frozenset(contract.get("allowed_assets") or []),
+        "allowed_modes": frozenset(contract.get("allowed_modes") or []),
+        "allowed_risk_decisions": frozenset(contract.get("allowed_risk_decisions") or []),
+        "allowed_reason_codes": frozenset(contract.get("allowed_reason_codes") or []),
+        "drill_incident": MappingProxyType(dict(contract.get("drill_incident") or {})),
+        "drill_trace_name": str(contract.get("drill_trace_name") or ""),
+        "drill_alert": MappingProxyType(dict(contract.get("drill_alert") or {})),
+        "runbook_question_ids": frozenset(contract.get("runbook_question_ids") or []),
+        "runbook_evidence_fields": frozenset(contract.get("runbook_evidence_fields") or []),
+        "runbook_dispositions": frozenset(contract.get("runbook_dispositions") or []),
+        "runbook_answer_codes": MappingProxyType(dict(contract.get("runbook_answer_codes") or {})),
+        "runbook_enum_values": MappingProxyType({
+            field: frozenset(members)
+            for field, members in (contract.get("runbook_enum_values") or {}).items()
+        }),
+        "runbook_missing_evidence": frozenset(contract.get("runbook_missing_evidence") or []),
+        "runbook_answer_contract": MappingProxyType(answer_contract),
+        "trusted_verifier_sha256": frozenset(contract.get("trusted_verifier_sha256") or []),
+    }
+    return MappingProxyType(values)
+
+
+def resolve_observability_contract(project_path, projects_root=None, contract_root=None):
+    """Resolve exactly one project-owned contract without consulting receipt-controlled data."""
+    project_key, key_errors = observability_project_key(project_path, projects_root)
+    reserved_alias_targets = set(OBSERVABILITY_PROJECT_CONTRACT_ALIASES.values())
+    if (not key_errors and project_key in reserved_alias_targets
+            and project_key not in OBSERVABILITY_PROJECT_CONTRACT_ALIASES):
+        key_errors = [
+            "observability contract key is reserved for an explicit compatibility alias"
+        ]
+    key = OBSERVABILITY_PROJECT_CONTRACT_ALIASES.get(project_key, project_key)
+    root = observability_contracts_dir(contract_root)
+    if key_errors or root is None:
+        errors = key_errors or ["observability contracts directory escapes the repo root"]
+        return _observability_contract_state(
+            {}, errors=errors, key=key, project_key=project_key)
+    parts = key.split("/")
+    candidate = root.joinpath(*parts[:-1], f"{parts[-1]}.json")
+    try:
+        resolved_parent = candidate.parent.resolve()
+        resolved_parent.relative_to(root)
+    except (OSError, ValueError):
+        return _observability_contract_state(
+            {}, errors=["observability contract path escapes the contracts root"],
+            key=key, project_key=project_key)
+    if resolved_parent != candidate.parent:
+        return _observability_contract_state(
+            {}, errors=["observability contract path must not contain symlink directories"],
+            key=key, project_key=project_key)
+    contract, errors, digest = load_observability_contract_snapshot(candidate)
+    if not errors and contract.get("project_key") != key:
+        errors = ["observability contract project_key does not match the canonical project path"]
+        contract = {}
+    return _observability_contract_state(
+        contract, errors=errors, path=str(candidate), key=key, digest=digest,
+        project_key=project_key)
+
+
+_OBSERVABILITY_DEFAULT_CONTRACT, OBSERVABILITY_DEFAULT_CONTRACT_ERRORS, _OBSERVABILITY_DEFAULT_SHA256 = (
+    load_observability_contract_snapshot(observability_contracts_dir() / "rainman-thorp.json")
+    if observability_contracts_dir() is not None
+    else ({}, ["observability contracts directory escapes the repo root"], "")
+)
+
+if OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+    OBSERVABILITY_METRIC_NAMES = frozenset()
+    OBSERVABILITY_METRIC_LABEL_VALUES = {}
+    OBSERVABILITY_METRIC_DOMAINS = {}
+    OBSERVABILITY_EVENT_NAMES = frozenset()
+    OBSERVABILITY_CORRELATION_FIELDS = frozenset()
+    OBSERVABILITY_CORRELATION_HASH_FIELDS = frozenset()
+    OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS = frozenset()
+    OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS = frozenset()
+    OBSERVABILITY_ALLOWED_ASSETS = frozenset()
+    OBSERVABILITY_ALLOWED_MODES = frozenset()
+    OBSERVABILITY_ALLOWED_RISK_DECISIONS = frozenset()
+    OBSERVABILITY_ALLOWED_REASON_CODES = frozenset()
+    OBSERVABILITY_DRILL_INCIDENT = {}
+    OBSERVABILITY_DRILL_TRACE_NAME = ""
+    OBSERVABILITY_DRILL_ALERT = {}
+    OBSERVABILITY_RUNBOOK_QUESTION_IDS = frozenset()
+    OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS = frozenset()
+    OBSERVABILITY_RUNBOOK_DISPOSITIONS = frozenset()
+    OBSERVABILITY_RUNBOOK_ANSWER_CODES = {}
+    OBSERVABILITY_RUNBOOK_ENUM_VALUES = {}
+    OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE = frozenset()
+    OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT = {}
+    OBSERVABILITY_TRUSTED_VERIFIER_SHA256 = frozenset()
+else:
+    OBSERVABILITY_METRIC_NAMES = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["metric_names"])
+    OBSERVABILITY_METRIC_LABEL_VALUES = {
+        name: {label: frozenset(values) for label, values in entry.items()}
+        for name, entry in _OBSERVABILITY_DEFAULT_CONTRACT["metric_label_values"].items()
+    }
+    OBSERVABILITY_METRIC_DOMAINS = {
+        name: (bounds[0], bounds[1])
+        for name, bounds in _OBSERVABILITY_DEFAULT_CONTRACT["metric_domains"].items()
+    }
+    OBSERVABILITY_EVENT_NAMES = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["event_names"])
+    OBSERVABILITY_CORRELATION_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_fields"]
+    )
+    OBSERVABILITY_CORRELATION_HASH_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_hash_fields"]
+    )
+    OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_timestamp_fields"]
+    )
+    OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["correlation_sequence_fields"]
+    )
+    OBSERVABILITY_ALLOWED_ASSETS = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["allowed_assets"])
+    OBSERVABILITY_ALLOWED_MODES = frozenset(_OBSERVABILITY_DEFAULT_CONTRACT["allowed_modes"])
+    OBSERVABILITY_ALLOWED_RISK_DECISIONS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["allowed_risk_decisions"]
+    )
+    OBSERVABILITY_ALLOWED_REASON_CODES = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["allowed_reason_codes"]
+    )
+    OBSERVABILITY_DRILL_INCIDENT = dict(_OBSERVABILITY_DEFAULT_CONTRACT["drill_incident"])
+    OBSERVABILITY_DRILL_TRACE_NAME = _OBSERVABILITY_DEFAULT_CONTRACT["drill_trace_name"]
+    OBSERVABILITY_DRILL_ALERT = dict(_OBSERVABILITY_DEFAULT_CONTRACT["drill_alert"])
+    OBSERVABILITY_RUNBOOK_QUESTION_IDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_question_ids"]
+    )
+    OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_evidence_fields"]
+    )
+    OBSERVABILITY_RUNBOOK_DISPOSITIONS = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_dispositions"]
+    )
+    OBSERVABILITY_RUNBOOK_ANSWER_CODES = dict(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_answer_codes"]
+    )
+    OBSERVABILITY_RUNBOOK_ENUM_VALUES = {
+        field: frozenset(values)
+        for field, values in _OBSERVABILITY_DEFAULT_CONTRACT["runbook_enum_values"].items()
+    }
+    OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["runbook_missing_evidence"]
+    )
+    OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT = {
+        question_id: {
+            "fields": dict(entry["fields"]),
+            "evidence": tuple(entry["evidence"]),
+        }
+        for question_id, entry in _OBSERVABILITY_DEFAULT_CONTRACT["runbook_answer_contract"].items()
+    }
+    OBSERVABILITY_TRUSTED_VERIFIER_SHA256 = frozenset(
+        _OBSERVABILITY_DEFAULT_CONTRACT["trusted_verifier_sha256"]
+    )
+OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE = (
+    "CONFIGURED_AND_VERIFIED"
+    if OBSERVABILITY_TRUSTED_VERIFIER_SHA256 and not OBSERVABILITY_DEFAULT_CONTRACT_ERRORS
+    else "TRUSTED_VERIFIER_NOT_CONFIGURED"
+)
+_OBSERVABILITY_DEFAULT_STATE = _observability_contract_state(
+    _OBSERVABILITY_DEFAULT_CONTRACT,
+    errors=OBSERVABILITY_DEFAULT_CONTRACT_ERRORS,
+    path=str((observability_contracts_dir() or Path()) / "rainman-thorp.json"),
+    key="rainman-thorp",
+    digest=_OBSERVABILITY_DEFAULT_SHA256,
+)
 
 
 def validate_pre_runtime_observability(envelope, expected=None):
@@ -1937,35 +2327,37 @@ def _finite_observability_metric_value(value):
     return abs(value) <= OBSERVABILITY_MAX_ABS_METRIC_VALUE
 
 
-def _valid_observability_metric_sample(item):
-    if not isinstance(item, dict) or item.get("name") not in OBSERVABILITY_METRIC_NAMES:
+def _valid_observability_metric_sample(item, contract_state=None):
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
+    if not isinstance(item, dict) or item.get("name") not in state["metric_names"]:
         return False
     value = item.get("value")
     labels = item.get("labels")
-    allowed_labels = OBSERVABILITY_METRIC_LABEL_VALUES[item["name"]]
+    allowed_labels = state["metric_label_values"][item["name"]]
     if (not _finite_observability_metric_value(value) or not isinstance(labels, dict)
             or set(labels) != set(allowed_labels)
             or any(not isinstance(labels[key], str) or labels[key] not in allowed_labels[key]
                    for key in allowed_labels)):
         return False
-    minimum, maximum = OBSERVABILITY_METRIC_DOMAINS[item["name"]]
+    minimum, maximum = state["metric_domains"][item["name"]]
     return value >= minimum and (maximum is None or value <= maximum)
 
 
-def _valid_observability_correlation_record(record):
+def _valid_observability_correlation_record(record, contract_state=None):
     """Require typed, usable correlation values instead of merely present JSON keys."""
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
     if (not isinstance(record, dict)
-            or record.get("event_name") not in OBSERVABILITY_EVENT_NAMES):
+            or record.get("event_name") not in state["event_names"]):
         return False
-    for key in OBSERVABILITY_CORRELATION_FIELDS:
+    for key in state["correlation_fields"]:
         value = record.get(key)
-        if key in OBSERVABILITY_CORRELATION_SEQUENCE_FIELDS:
+        if key in state["correlation_sequence_fields"]:
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 return False
-        elif key in OBSERVABILITY_CORRELATION_HASH_FIELDS:
+        elif key in state["correlation_hash_fields"]:
             if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
                 return False
-        elif key in OBSERVABILITY_CORRELATION_TIMESTAMP_FIELDS:
+        elif key in state["correlation_timestamp_fields"]:
             if (not isinstance(value, str)
                     or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value)
                     or parse_ts(value) is None):
@@ -1973,40 +2365,36 @@ def _valid_observability_correlation_record(record):
         elif key == "trace_id":
             if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
                 return False
-        elif key == "asset" and value not in OBSERVABILITY_ALLOWED_ASSETS:
-            return False
-        elif key == "mode" and value not in OBSERVABILITY_ALLOWED_MODES:
-            return False
-        elif key == "risk_decision" and value not in OBSERVABILITY_ALLOWED_RISK_DECISIONS:
-            return False
-        elif key == "reason_code" and value not in OBSERVABILITY_ALLOWED_REASON_CODES:
+        elif (key in state["correlation_enum_values"]
+              and value not in state["correlation_enum_values"][key]):
             return False
         elif not _nonempty_string(value):
             return False
     return True
 
 
-def _valid_observability_drill_answer(answer):
+def _valid_observability_drill_answer(answer, contract_state=None):
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
     if not isinstance(answer, dict):
         return False
     question_id = answer.get("question_id")
     evidence_refs = answer.get("evidence_refs")
-    contract = OBSERVABILITY_RUNBOOK_ANSWER_CONTRACT.get(question_id)
+    contract = state["runbook_answer_contract"].get(question_id)
     facts = answer.get("facts")
-    if (not contract or answer.get("answer") != OBSERVABILITY_RUNBOOK_ANSWER_CODES.get(question_id)
+    if (not contract or answer.get("answer") != state["runbook_answer_codes"].get(question_id)
             or not isinstance(facts, dict) or set(facts) != set(contract["fields"])):
         return False
     for field, kind in contract["fields"].items():
         value = facts.get(field)
         if kind == "stage" and value not in OBSERVABILITY_ALLOWED_STAGES:
             return False
-        if kind == "mode" and value not in OBSERVABILITY_ALLOWED_MODES:
+        if kind == "mode" and value not in state["allowed_modes"]:
             return False
         if (kind == "identifier"
                 and (not isinstance(value, str)
                      or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,127}", value))):
             return False
-        if kind == "enum" and value not in OBSERVABILITY_RUNBOOK_ENUM_VALUES.get(field, set()):
+        if kind == "enum" and value not in state["runbook_enum_values"][field]:
             return False
         if kind == "sha256" and not _is_sha256_digest(value):
             return False
@@ -2019,82 +2407,140 @@ def _valid_observability_drill_answer(answer):
             return False
         if (kind == "evidence_list"
                 and (not isinstance(value, list) or len(value) != len(set(value))
-                     or not value or not set(value).issubset(OBSERVABILITY_RUNBOOK_MISSING_EVIDENCE))):
+                     or not value or not set(value).issubset(state["runbook_missing_evidence"]))):
             return False
     return (
         isinstance(evidence_refs, list)
+        and len(evidence_refs) == len(set(evidence_refs))
         and set(evidence_refs) == set(contract["evidence"])
-        and all(ref in OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS for ref in evidence_refs)
+        and all(ref in state["runbook_evidence_fields"] for ref in evidence_refs)
     )
 
 
 def _validate_observability_drill_correlations(
-        runbook, log_artifact, trace_artifact, alert_artifact, receipt):
-    """Bind every frozen drill answer to one correlated synthetic incident record."""
+        runbook, log_artifact, trace_artifact, alert_artifact, receipt, contract_state=None):
+    """Bind contract-declared drill facts to one correlated incident record."""
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
     answers = {
         item.get("question_id"): item
         for item in (runbook.get("answered_questions") or [])
         if isinstance(item, dict)
     } if isinstance(runbook, dict) else {}
     records = log_artifact.get("records") if isinstance(log_artifact, dict) else None
-    if (set(answers) != OBSERVABILITY_RUNBOOK_QUESTION_IDS
-            or not all(_valid_observability_drill_answer(answer) for answer in answers.values())
+    if (set(answers) != state["runbook_question_ids"]
+            or not all(_valid_observability_drill_answer(answer, state) for answer in answers.values())
             or not isinstance(records, list)):
         return ["runbook drill cannot be correlated to the structured incident record"]
 
-    authority = answers["CURRENT_AUTHORIZED_STAGE_AND_MODE"]["facts"]
-    identifiers = answers["DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS"]["facts"]
-    hashes = answers["STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES"]["facts"]
-    timestamps = answers["LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS"]["facts"]
-    disposition = answers["HUMAN_DISPOSITION_REQUIRED_NEXT"]["facts"]
+    facts, fact_kinds = {}, {}
+    conflicting_facts = False
+    for question_id, answer in answers.items():
+        field_kinds = state["runbook_answer_contract"][question_id]["fields"]
+        for field, value in answer["facts"].items():
+            if field in facts and facts[field] != value:
+                conflicting_facts = True
+            facts[field] = value
+            fact_kinds[field] = field_kinds[field]
     match_fields = {
-        **identifiers,
-        **hashes,
-        "mode": authority.get("mode"),
-        "market_event_ts": timestamps.get("market_timestamp"),
+        field: value for field, value in facts.items()
+        if field in state["correlation_fields"]
     }
+    # Schema-v1 contracts may use semantically equivalent runbook and log clock
+    # names. Preserve the join without pinning project vocabulary: an alias is
+    # accepted only when removing generic clock words leaves one identical,
+    # unique semantic stem on each side. Ambiguous or similar names fail closed.
+    timestamp_aliases = {}
+    timestamp_alias_ambiguous = False
+    generic_clock_tokens = {"at", "event", "time", "timestamp", "ts"}
+
+    def timestamp_stem(field):
+        return tuple(
+            token for token in re.split(r"[^a-z0-9]+", field.lower())
+            if token and token not in generic_clock_tokens
+        )
+
+    correlation_timestamps_by_stem = {}
+    for field in state["correlation_timestamp_fields"]:
+        stem = timestamp_stem(field)
+        if stem:
+            correlation_timestamps_by_stem.setdefault(stem, []).append(field)
+    for field, value in facts.items():
+        if fact_kinds.get(field) != "timestamp" or field in match_fields:
+            continue
+        candidates = correlation_timestamps_by_stem.get(timestamp_stem(field), [])
+        if len(candidates) == 1:
+            target = candidates[0]
+            if target in timestamp_aliases and timestamp_aliases[target] != value:
+                timestamp_alias_ambiguous = True
+            timestamp_aliases[target] = value
+        elif len(candidates) > 1:
+            timestamp_alias_ambiguous = True
+    match_fields.update(timestamp_aliases)
     correlated_records = [
         record
         for record in records
         if (
         isinstance(record, dict)
         and all(record.get(field) == value for field, value in match_fields.items())
-        and all(record.get(field) == value for field, value in OBSERVABILITY_DRILL_INCIDENT.items())
+        and all(record.get(field) == value for field, value in state["drill_incident"].items())
         )
     ]
-    private_feed = parse_ts(timestamps.get("private_feed_timestamp"))
     observed_at = parse_ts(runbook.get("observed_at"))
     errors = []
-    if authority.get("authorized_stage") != receipt.get("authorized_stage") or not correlated_records:
+    if (conflicting_facts or timestamp_alias_ambiguous or not match_fields
+            or not correlated_records
+            or ("authorized_stage" in facts
+                and facts["authorized_stage"] != receipt.get("authorized_stage"))):
         errors.append("runbook drill facts must match one correlated structured incident record")
     incident_trace_ids = {record.get("trace_id") for record in correlated_records}
     spans = trace_artifact.get("spans") if isinstance(trace_artifact, dict) else None
     if (not isinstance(spans, list)
             or not any(
                 isinstance(span, dict)
-                and span.get("name") == OBSERVABILITY_DRILL_TRACE_NAME
+                and span.get("name") == state["drill_trace_name"]
                 and span.get("trace_id") in incident_trace_ids
                 for span in spans
             )):
-        errors.append("runbook drill requires a halt trace correlated to the incident record")
+        errors.append("runbook drill requires the contract trace correlated to the incident record")
     executions = alert_artifact.get("executions") if isinstance(alert_artifact, dict) else None
     if (not isinstance(executions, list)
             or not any(
                 isinstance(execution, dict)
                 and all(execution.get(field) == value
-                        for field, value in OBSERVABILITY_DRILL_ALERT.items())
+                        for field, value in state["drill_alert"].items())
                 for execution in executions
             )):
-        errors.append("runbook drill requires the canonical fired stale-feed alert")
-    if not private_feed or not observed_at or private_feed > observed_at:
-        errors.append("runbook drill private-feed timestamp must precede its observation")
-    if disposition.get("human_disposition") != runbook.get("operator_disposition"):
+        errors.append("runbook drill requires the contract-declared fired alert")
+    fact_timestamps = [
+        parse_ts(value) for field, value in facts.items()
+        if fact_kinds.get(field) == "timestamp"
+    ]
+    if (not observed_at or not fact_timestamps
+            or any(value is None or value > observed_at for value in fact_timestamps)):
+        errors.append("runbook drill timestamps must precede its observation")
+    enum_facts = {
+        value for field, value in facts.items()
+        if fact_kinds.get(field) == "enum"
+    }
+    if runbook.get("operator_disposition") not in enum_facts:
         errors.append("runbook drill human disposition must match the operator disposition")
     return errors
 
 
-def _validate_observability_json_artifact(field, artifact, receipt, now=None):
+def _validate_observability_json_artifact(
+        field, artifact, receipt, now=None, contract_state=None):
     """Validate one typed, nontrivial runtime evidence artifact."""
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
+    if contract_state is None and OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(OBSERVABILITY_DEFAULT_CONTRACT_ERRORS[:3])
+        ]
+    if state["errors"]:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(state["errors"][:3])
+        ]
     errors = []
     data, parse_errors = _read_strict_json_object(artifact, field)
     errors.extend(parse_errors)
@@ -2129,10 +2575,10 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
         } if isinstance(samples, list) else set()
         valid_samples = (
             isinstance(samples, list) and bool(samples)
-            and all(_valid_observability_metric_sample(item) for item in samples)
+            and all(_valid_observability_metric_sample(item, state) for item in samples)
         )
         if (not isinstance(names, list) or len(names) != len(name_set)
-                or name_set != OBSERVABILITY_METRIC_NAMES or sample_names != OBSERVABILITY_METRIC_NAMES
+                or name_set != state["metric_names"] or sample_names != state["metric_names"]
                 or not valid_samples):
             errors.append("metric_artifact must contain one typed sample for every canonical metric")
     elif field == "log_artifact":
@@ -2141,18 +2587,25 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
         records = data.get("records")
         valid_records = (
             isinstance(records, list) and bool(records)
-            and all(_valid_observability_correlation_record(item) for item in records)
+            and all(_valid_observability_correlation_record(item, state) for item in records)
         )
         receipt_observed_at = parse_ts(data.get("observed_at"))
         if valid_records and receipt_observed_at:
-            valid_records = all(
-                parse_ts(item["observed_at"]) == receipt_observed_at
-                and parse_ts(item["market_event_ts"]) <= parse_ts(item["occurred_at"])
-                <= parse_ts(item["observed_at"])
-                for item in records
-            )
+            for item in records:
+                timestamps = {
+                    name: parse_ts(item.get(name))
+                    for name in state["correlation_timestamp_fields"]
+                }
+                order = state["correlation_timestamp_order"]
+                if (any(value is None or value > receipt_observed_at
+                        for value in timestamps.values())
+                        or (order and timestamps[order[-1]] != receipt_observed_at)
+                        or any(timestamps[earlier] > timestamps[later]
+                               for earlier, later in zip(order, order[1:]))):
+                    valid_records = False
+                    break
         if (not isinstance(fields, list) or len(fields) != len(field_set)
-                or field_set != OBSERVABILITY_CORRELATION_FIELDS or not valid_records):
+                or field_set != state["correlation_fields"] or not valid_records):
             errors.append("log_artifact must contain correlated structured log records")
     elif field == "trace_artifact":
         spans = data.get("spans")
@@ -2172,7 +2625,7 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
             and _nonempty_string(item.get("alert_id"))
             and _nonempty_string(item.get("condition"))
             and item.get("status") == "FIRED"
-            and item.get("safe_action") == "HALT_ENTRIES_RECONCILE_ONLY"
+            and item.get("safe_action") == state["drill_alert"]["safe_action"]
             for item in executions
         )
         if data.get("alerts_wired") is not True or not valid_executions:
@@ -2185,13 +2638,13 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
         } if isinstance(answers, list) else set()
         valid_answers = (
             isinstance(answers, list)
-            and len(answers) == len(OBSERVABILITY_RUNBOOK_QUESTION_IDS)
-            and answer_ids == OBSERVABILITY_RUNBOOK_QUESTION_IDS
-            and all(_valid_observability_drill_answer(item) for item in answers)
+            and len(answers) == len(state["runbook_question_ids"])
+            and answer_ids == state["runbook_question_ids"]
+            and all(_valid_observability_drill_answer(item, state) for item in answers)
         )
         valid_recovery = isinstance(recovery, list) and len(recovery) >= 3 and all(
             isinstance(item, dict)
-            and item.get("artifact_field") in OBSERVABILITY_RUNBOOK_EVIDENCE_FIELDS
+            and item.get("artifact_field") in state["runbook_evidence_fields"]
             and re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256") or ""))
             and item.get("sha256") == (receipt.get("artifact_sha256") or {}).get(
                 item.get("artifact_field")
@@ -2202,7 +2655,7 @@ def _validate_observability_json_artifact(field, artifact, receipt, now=None):
                 or data.get("drill_executed") is not True
                 or not valid_answers
                 or data.get("prohibited_actions_taken") != []
-                or data.get("operator_disposition") not in OBSERVABILITY_RUNBOOK_DISPOSITIONS
+                or data.get("operator_disposition") not in state["runbook_dispositions"]
                 or not valid_recovery):
             errors.append("runbook_drill_artifact must contain the complete safe 3am drill receipt")
     elif field == "canary_artifact":
@@ -2236,10 +2689,22 @@ def _validate_observability_verifier_source(path):
     return errors
 
 
-def validate_observability_runtime_receipt(receipt, artifact_base=None, expected=None, now=None):
+def validate_observability_runtime_receipt(
+        receipt, artifact_base=None, expected=None, now=None, contract_state=None):
     """Validate the typed Tier-B receipt without trusting caller-supplied pass semantics."""
     if not isinstance(receipt, dict):
         return ["observability_receipt must be an object"]
+    state = contract_state or _OBSERVABILITY_DEFAULT_STATE
+    if contract_state is None and OBSERVABILITY_DEFAULT_CONTRACT_ERRORS:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(OBSERVABILITY_DEFAULT_CONTRACT_ERRORS[:3])
+        ]
+    if state["errors"]:
+        return [
+            "observability_contract_not_registered: "
+            + "; ".join(state["errors"][:3])
+        ]
     now = now or utc_now()
     errors = []
     if receipt.get("schema_version") != 1 or isinstance(receipt.get("schema_version"), bool):
@@ -2277,14 +2742,14 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
         isinstance(metric_names, list) and all(isinstance(item, str) for item in metric_names)
     ) else set()
     if (not isinstance(metric_names, list) or len(metric_names) != len(metric_name_set)
-            or metric_name_set != OBSERVABILITY_METRIC_NAMES):
+            or metric_name_set != state["metric_names"]):
         errors.append("runtime observability requires the exact canonical metric_names")
     correlations = receipt.get("log_correlation_fields")
     correlation_set = set(correlations) if (
         isinstance(correlations, list) and all(isinstance(item, str) for item in correlations)
     ) else set()
     if (not isinstance(correlations, list) or len(correlations) != len(correlation_set)
-            or correlation_set != OBSERVABILITY_CORRELATION_FIELDS):
+            or correlation_set != state["correlation_fields"]):
         errors.append("runtime observability requires every canonical log_correlation_field")
     issued_at, issued_errors = _observability_timestamp(receipt.get("issued_at"), "issued_at", now)
     expires_value = receipt.get("expires_at")
@@ -2328,7 +2793,8 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
             errors.append("observability artifact_sha256 map does not match current artifact bytes")
         for field in OBSERVABILITY_JSON_ARTIFACT_TYPES:
             if field in paths:
-                errors.extend(_validate_observability_json_artifact(field, paths[field], receipt, now))
+                errors.extend(_validate_observability_json_artifact(
+                    field, paths[field], receipt, now, state))
         drill_fields = (
             "runbook_drill_artifact", "log_artifact", "trace_artifact", "alert_artifact",
         )
@@ -2344,6 +2810,7 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
                     drill_artifacts["trace_artifact"],
                     drill_artifacts["alert_artifact"],
                     receipt,
+                    state,
                 ))
         verifier_path = paths.get("verifier_artifact")
         if verifier_path:
@@ -2353,9 +2820,9 @@ def validate_observability_runtime_receipt(receipt, artifact_base=None, expected
     return errors
 
 
-def observability_receipt_credit_scope(receipt, envelope=None, now=None):
-    """Return runtime/production only when neither receipt nor envelope encodes a hold."""
-    if validate_observability_runtime_receipt(receipt, now=now):
+def observability_receipt_credit_scope(receipt, envelope=None, validation_errors=()):
+    """Classify already-validated state; this pure helper never reloads or revalidates."""
+    if validation_errors:
         return ""
     envelope = envelope if isinstance(envelope, dict) else {}
     decision = envelope.get("observability_decision")
@@ -2378,7 +2845,8 @@ def observability_receipt_credit_scope(receipt, envelope=None, now=None):
     return receipt.get("claim_scope", "")
 
 
-def observability_receipt_from_evidence(evidence_path, expected=None, now=None):
+def observability_receipt_from_evidence(
+        evidence_path, expected=None, now=None, contract_state=None):
     """Load either the exact Tier-A companion or a typed Tier-B same-stem receipt."""
     now = now or utc_now()
     primary = Path(evidence_path).expanduser() if evidence_path else Path()
@@ -2398,9 +2866,9 @@ def observability_receipt_from_evidence(evidence_path, expected=None, now=None):
         artifact_sha256, artifact_paths = {}, {}
         if isinstance(receipt, dict):
             errors = list(parse_errors) + validate_observability_runtime_receipt(
-                receipt, candidate.parent, expected, now
+                receipt, candidate.parent, expected, now, contract_state
             )
-            scope = observability_receipt_credit_scope(receipt, envelope, now)
+            scope = observability_receipt_credit_scope(receipt, envelope, errors)
             if not scope and not errors:
                 errors.append("observability envelope records a hold, not runtime credit")
             artifact_paths, artifact_sha256, _ = _resolve_observability_artifacts(
@@ -2539,16 +3007,15 @@ def parse_observability_verifier_command(command, cwd, verifier_path):
     return {"argv": [sys.executable, wanted, *argv[2:]], "errors": []}
 
 
-def run_observability_verifier_argv(argv, cwd, timeout=120):
-    """Execute an already-validated observability verifier without a shell."""
-    try:
-        proc = subprocess.run(
-            argv, cwd=cwd or None, capture_output=True, text=True, timeout=timeout, shell=False
-        )
-        stdout_bytes = (proc.stdout or "").encode("utf-8", "replace")
-        return proc.returncode, hashlib.sha256(stdout_bytes).hexdigest(), len(stdout_bytes), proc.stdout or ""
-    except Exception:
-        return 1, "", 0, ""
+def run_observability_verifier_argv(
+        argv, cwd, timeout=120, expected_verifier_sha256="", trusted_sha256=()):
+    """Execute only when the verifier bytes still match receipt and contract trust."""
+    binding = parse_generic_verifier_command(shlex.join(argv), cwd)
+    digest = binding.get("source_sha256", "")
+    if (not expected_verifier_sha256 or digest != expected_verifier_sha256
+            or digest not in set(trusted_sha256 or ())):
+        return 126, "", 0, ""
+    return run_generic_verifier_snapshot(binding, cwd, timeout, isolate_source_dir=True)
 
 
 def _observability_mutant_bytes(original):
@@ -2565,13 +3032,16 @@ def _observability_mutant_bytes(original):
     return b""
 
 
-def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes, timeout=120):
+def run_observability_artifact_canaries(
+        argv, cwd, artifact_paths, before_hashes, timeout=120,
+        expected_verifier_sha256="", trusted_sha256=()):
     """Mutate, verify, and restore each bound artifact independently."""
     results, restoration_sha256, errors = {}, {}, []
     fields = list(OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
     noise_rounds = secrets.randbelow(len(fields) + 1)
     for _ in range(noise_rounds):
-        control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+        control_exit, _, _, _ = run_observability_verifier_argv(
+            argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
         if control_exit != 0:
             errors.append("verifier failed during randomized control prelude")
             return {"results": results, "restoration_sha256": restoration_sha256, "errors": errors}
@@ -2585,7 +3055,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
         try:
             if path.is_symlink() or not path.is_file():
                 raise OSError("artifact is unavailable or symlinked")
-            control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+            control_exit, _, _, _ = run_observability_verifier_argv(
+                argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
             if control_exit != 0:
                 raise ValueError("verifier failed on restored control before mutation")
             original = path.read_bytes()
@@ -2593,7 +3064,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
             if not mutated:
                 raise ValueError("artifact has no safe text mutation")
             _atomic_replace_bytes(path, mutated)
-            exit_code, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+            exit_code, _, _, _ = run_observability_verifier_argv(
+                argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
             result = exit_code != 0
         except (OSError, ValueError) as exc:
             errors.append(f"{field} mutation canary unavailable: {exc}")
@@ -2608,7 +3080,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
                 errors.append(f"{field} restoration hash mismatch")
                 result = None
             elif original:
-                control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+                control_exit, _, _, _ = run_observability_verifier_argv(
+                    argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
                 if control_exit != 0:
                     errors.append(f"{field} verifier failed after restoration")
                     result = None
@@ -2625,7 +3098,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
             if path.is_symlink() or not path.is_file():
                 raise OSError("artifact is unavailable or symlinked")
             for _ in range(secrets.randbelow(3)):
-                control_exit, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+                control_exit, _, _, _ = run_observability_verifier_argv(
+                    argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
                 if control_exit != 0:
                     raise ValueError("verifier failed during randomized replay control")
             original = path.read_bytes()
@@ -2633,7 +3107,8 @@ def run_observability_artifact_canaries(argv, cwd, artifact_paths, before_hashes
             if not mutated:
                 raise ValueError("artifact has no safe text mutation")
             _atomic_replace_bytes(path, mutated)
-            exit_code, _, _, _ = run_observability_verifier_argv(argv, cwd, timeout)
+            exit_code, _, _, _ = run_observability_verifier_argv(
+                argv, cwd, timeout, expected_verifier_sha256, trusted_sha256)
             replay_result = exit_code != 0
         except (OSError, ValueError) as exc:
             errors.append(f"{field} replay mutation canary unavailable: {exc}")
@@ -2808,6 +3283,128 @@ def _is_receipt_artifact_digest_map(key, value):
     )
 
 
+def _authority_text_safe(value):
+    if not isinstance(value, str):
+        return False
+    unsafe_bidi = {"LRE", "RLE", "LRO", "RLO", "PDF", "LRI", "RLI", "FSI", "PDI"}
+    return not any(
+        unicodedata.category(character).startswith("C")
+        or unicodedata.category(character) in {"Zl", "Zp"}
+        or unicodedata.bidirectional(character) in unsafe_bidi
+        for character in value
+    )
+
+
+def _authority_json_strings_safe(value):
+    if isinstance(value, dict):
+        return all(
+            _authority_text_safe(key) and _authority_json_strings_safe(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return all(_authority_json_strings_safe(item) for item in value)
+    return not isinstance(value, str) or _authority_text_safe(value)
+
+
+def _is_safe_authority_command(value):
+    """Recognize only the two exact helper commands emitted after approval validation.
+
+    The generic string redactor correctly treats an embedded 64-hex receipt digest as secret-like.
+    Redacting that digest makes the reviewed root command unusable, so this narrow parser repeats
+    the closed subject/consumer checks before allowing the generated command through unchanged.
+    """
+    prefix = (
+        "/usr/bin/sudo -k; /usr/bin/sudo -- "
+        "/usr/local/libexec/pathway-approval "
+    )
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 16_384:
+        return False
+    if not value.startswith(prefix) or not _authority_text_safe(value):
+        return False
+    try:
+        argv = shlex.split(value[len(prefix):])
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    action = argv[0]
+    if action == "invalidate":
+        if len(argv) != 5 or argv[1] != "--ticket-id" or argv[3] != "--reason":
+            return False
+        return bool(
+            APPROVAL_TICKET_ID_RE.fullmatch(argv[2])
+            and argv[4]
+            and redact(argv[4]) == argv[4]
+        )
+    if action != "issue" or len(argv) != 7:
+        return False
+    if argv[1] != "--subject-json" or argv[3] != "--reason" or argv[5] != "--consumer":
+        return False
+    duplicate_keys = []
+
+    def unique_subject_object(pairs):
+        parsed = {}
+        for key, item in pairs:
+            if key in parsed:
+                duplicate_keys.append(key)
+            else:
+                parsed[key] = item
+        return parsed
+
+    def reject_subject_constant(value):
+        raise ValueError(f"non-finite JSON constant {value}")
+
+    try:
+        subject = json.loads(
+            argv[2],
+            object_pairs_hook=unique_subject_object,
+            parse_constant=reject_subject_constant,
+        )
+    except (TypeError, ValueError):
+        return False
+    if duplicate_keys:
+        return False
+    canonical_subject = json.dumps(subject, sort_keys=True, separators=(",", ":"))
+    if argv[2] != canonical_subject:
+        return False
+    reason, consumer = argv[4], argv[6]
+    if (not isinstance(subject, dict) or not reason or redact(reason) != reason
+            or not _authority_text_safe(reason) or not _authority_text_safe(consumer)
+            or not _authority_json_strings_safe(subject)):
+        return False
+    if subject.get("kind") == APPROVAL_KIND_WAIVER:
+        return bool(
+            set(subject) == {
+                "kind", "schema_version", "work_id", "project", "pathway", "reason",
+                "work_context_sha256",
+            }
+            and type(subject.get("schema_version")) is int
+            and subject.get("schema_version") == WAIVER_SUBJECT_SCHEMA_VERSION
+            and subject.get("work_id")
+            and subject.get("project")
+            and subject.get("pathway") in PATHWAY_CANON_ORDER
+            and subject.get("reason") == reason
+            and _is_sha256_digest(subject.get("work_context_sha256"))
+            and consumer
+            == f"work-cover:{subject.get('work_id')}:{subject.get('pathway')}"
+            and redact(subject.get("work_id")) == subject.get("work_id")
+            and redact(subject.get("project")) == subject.get("project")
+        )
+    if subject.get("kind") == APPROVAL_KIND_RELEASE:
+        return bool(
+            set(subject)
+            == {"kind", "work_id", "project", "stage", "release_receipt_sha256"}
+            and subject.get("work_id")
+            and subject.get("project")
+            and subject.get("stage") == "production"
+            and _is_sha256_digest(subject.get("release_receipt_sha256"))
+            and re.fullmatch(r"P-[0-9a-f]{12}", consumer or "")
+            and redact(subject.get("work_id")) == subject.get("work_id")
+            and redact(subject.get("project")) == subject.get("project")
+        )
+    return False
+
+
 def redact_obj(value):
     if isinstance(value, dict):
         generated_id_keys = {
@@ -2829,6 +3426,7 @@ def redact_obj(value):
         # key fails the key check and gets scrubbed by the 64-char entropy pattern.
         return {
             k: (v if (k in generated_id_keys or _is_digest_field(k, v)
+                      or (k == "authority_command" and _is_safe_authority_command(v))
                       or _is_receipt_artifact_digest_map(k, v))
                 else redact_obj(v))
             for k, v in value.items()
@@ -2937,6 +3535,7 @@ class Paths:
         self.codex_home = Path(args.codex_home).expanduser()
         self.projects_root = Path(args.projects_root).expanduser()
         self.output_root = Path(args.output_root).expanduser()
+        self.output_root_input = self.output_root.absolute()
         self.operator_intel = self.output_root / "operator-intelligence"
         self.operator_artifacts = self.output_root / "operator-artifacts"
         self.agent_cards = self.operator_intel / "agent-capability-cards"
@@ -2956,6 +3555,9 @@ class Paths:
         self.pathway_trust_path = self.operator_intel / "pathway-trust.json"
         self.proofs_path = self.operator_intel / "proofs.ndjson"
         self.approvals_path = self.operator_intel / "approvals.ndjson"
+        # Fixed OS-owned trust root. It is deliberately not configurable through args or env;
+        # a user-writable alternate would restore the same-agent authority bypass.
+        self.approval_authority_path = APPROVAL_AUTHORITY_PATH
         self.carry_forward_path = self.operator_intel / "pathway-carry-forward.ndjson"
         self.pathway_run_plans_path = self.operator_intel / "pathway-run-plans.ndjson"
         self.pathway_decisions_path = self.operator_intel / "pathway-decisions.ndjson"
@@ -2963,6 +3565,7 @@ class Paths:
         self.pathway_pilot_latest_path = self.operator_intel / "pathway-pilot-latest.json"
         self.learning_candidates_path = self.operator_intel / "learning-candidates.ndjson"
         self.evaluations_path = self.operator_intel / "pathway-evaluations.ndjson"
+        self.development_protocol_path = self.operator_intel / "development-protocol.json"
         self.portfolio_next_path = self.operator_intel / "portfolio-next.json"
         self.rule_map_path = self.operator_intel / "rule-map.json"
         self.cockpit_path = self.operator_intel / "cockpit.json"
@@ -3062,7 +3665,181 @@ def upsert_proof(paths, proof):
 APPROVAL_TTL_SECONDS = 900
 APPROVAL_KIND_RELEASE = "release-production-approval"
 APPROVAL_KIND_WAIVER = "production-secure-waiver"
+APPROVAL_MUTATION_SUBCOMMANDS = frozenset({"approval-issue", "approval-invalidate"})
 APPROVAL_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+APPROVAL_TICKET_ID_RE = re.compile(r"^AT-[0-9a-f]{12}$")
+APPROVAL_CONSUMPTION_ID_RE = re.compile(r"^AC-[0-9a-f]{12}$")
+APPROVAL_INVALIDATION_ID_RE = re.compile(r"^AI-[0-9a-f]{12}$")
+
+
+class ApprovalEvents(list):
+    """Strict approval-ledger view.
+
+    Approval records are authority input, so a partial parse is never useful.  The ordinary
+    NDJSON reader intentionally tolerates damaged advisory rows; this reader carries an explicit
+    validity bit so every approval consumer can fail closed on one malformed, reordered, or
+    truncated event.
+    """
+
+    def __init__(self, records=(), *, valid=True, error=""):
+        super().__init__(records)
+        self.valid = bool(valid)
+        self.error = str(error or "")
+
+
+def _invalid_approval_events(error):
+    return ApprovalEvents(valid=False, error=error)
+
+
+def approval_events_valid(events):
+    return isinstance(events, ApprovalEvents) and events.valid
+
+
+def _approval_event_shape_valid(event):
+    if not isinstance(event, dict):
+        return False
+    event_kind = event.get("event")
+    required = {
+        "issued": {
+            "event", "kind", "subject_digest", "ticket_id", "subject", "issued_at",
+            "expires_at", "reason", "work_id", "issued_by",
+        },
+        "consumed": {
+            "event", "kind", "subject_digest", "ticket_id", "at", "work_id", "pathway",
+            "consumed_by", "consumption_id",
+        },
+        "invalidated": {
+            "event", "kind", "subject_digest", "ticket_id", "at", "work_id", "reason",
+            "invalidated_by", "invalidation_id",
+        },
+    }
+    if event_kind not in required or set(event) != required[event_kind]:
+        return False
+    if event.get("kind") not in {APPROVAL_KIND_RELEASE, APPROVAL_KIND_WAIVER}:
+        return False
+    if not APPROVAL_DIGEST_RE.fullmatch(str(event.get("subject_digest") or "")):
+        return False
+    if not APPROVAL_TICKET_ID_RE.fullmatch(str(event.get("ticket_id") or "")):
+        return False
+    if not isinstance(event.get("work_id"), str) or not event.get("work_id"):
+        return False
+    if event_kind == "issued":
+        subject = event.get("subject")
+        issued_at = parse_ts(str(event.get("issued_at") or ""))
+        expires_at = parse_ts(str(event.get("expires_at") or ""))
+        return bool(
+            isinstance(subject, dict)
+            and subject.get("kind") == event.get("kind")
+            and subject.get("work_id") == event.get("work_id")
+            and approval_subject_digest(subject) == event.get("subject_digest")
+            and issued_at is not None
+            and expires_at is not None
+            and expires_at > issued_at
+            and (expires_at - issued_at).total_seconds() <= APPROVAL_TTL_SECONDS
+            and isinstance(event.get("reason"), str)
+            and event.get("reason")
+            and isinstance(event.get("issued_by"), str)
+            and event.get("issued_by")
+        )
+    if event_kind == "consumed":
+        return bool(
+            parse_ts(str(event.get("at") or "")) is not None
+            and isinstance(event.get("pathway"), str)
+            and isinstance(event.get("consumed_by"), str)
+            and event.get("consumed_by")
+            and APPROVAL_CONSUMPTION_ID_RE.fullmatch(
+                str(event.get("consumption_id") or "")
+            )
+        )
+    return bool(
+        parse_ts(str(event.get("at") or "")) is not None
+        and isinstance(event.get("reason"), str)
+        and event.get("reason")
+        and isinstance(event.get("invalidated_by"), str)
+        and event.get("invalidated_by")
+        and APPROVAL_INVALIDATION_ID_RE.fullmatch(str(event.get("invalidation_id") or ""))
+    )
+
+
+def _strict_approval_events(path):
+    """Read one authority ledger completely or return an invalid empty view."""
+    ledger = Path(path)
+    if not ledger.exists():
+        return ApprovalEvents()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(ledger, flags)
+    except OSError as exc:
+        return _invalid_approval_events(f"open:{exc.__class__.__name__}")
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return _invalid_approval_events("not-regular")
+        if metadata.st_size > NDJSON_READ_MAX_BYTES:
+            return _invalid_approval_events("over-read-cap")
+        chunks = []
+        remaining = metadata.st_size + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1_048_576, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        return _invalid_approval_events(f"read:{exc.__class__.__name__}")
+    finally:
+        os.close(descriptor)
+    if len(raw) != metadata.st_size:
+        return _invalid_approval_events("short-read")
+    if raw and not raw.endswith(b"\n"):
+        return _invalid_approval_events("truncated-tail")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return _invalid_approval_events("invalid-utf8")
+
+    records = []
+    issued_by_ticket = {}
+    consumed_tickets = set()
+    invalidated_tickets = set()
+    consumption_ids = set()
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            return _invalid_approval_events(f"blank-line:{line_number}")
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            return _invalid_approval_events(f"malformed-json:{line_number}")
+        if not _approval_event_shape_valid(event):
+            return _invalid_approval_events(f"invalid-event:{line_number}")
+        ticket_id = event["ticket_id"]
+        event_kind = event["event"]
+        if event_kind == "issued":
+            if ticket_id in issued_by_ticket:
+                return _invalid_approval_events(f"duplicate-ticket:{line_number}")
+            issued_by_ticket[ticket_id] = event
+        else:
+            issued = issued_by_ticket.get(ticket_id)
+            if not issued:
+                return _invalid_approval_events(f"event-before-issue:{line_number}")
+            if any(
+                event.get(field) != issued.get(field)
+                for field in ("kind", "subject_digest", "work_id")
+            ):
+                return _invalid_approval_events(f"ticket-binding-mismatch:{line_number}")
+            if event_kind == "consumed":
+                consumption_id = event["consumption_id"]
+                if ticket_id in consumed_tickets or consumption_id in consumption_ids:
+                    return _invalid_approval_events(f"duplicate-consumption:{line_number}")
+                consumed_tickets.add(ticket_id)
+                consumption_ids.add(consumption_id)
+            elif ticket_id in invalidated_tickets:
+                return _invalid_approval_events(f"duplicate-invalidation:{line_number}")
+            else:
+                invalidated_tickets.add(ticket_id)
+        records.append(event)
+    return ApprovalEvents(records)
 
 
 def approval_subject_digest(subject):
@@ -3072,17 +3849,104 @@ def approval_subject_digest(subject):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def approval_store_is_protected(paths):
+    """Production always uses OS authority, regardless of output-root pathname.
+
+    Tests may inject a separate authority policy into an imported module; the
+    production CLI has no environment, pathname, or argument escape hatch.
+    """
+    return True
+
+
+def _authority_path_is_os_owned(path):
+    """Require an unbroken root-owned, non-writable chain for the live trust root."""
+    authority = Path(path)
+    expected = APPROVAL_AUTHORITY_PATH
+    if authority != expected or not authority.is_absolute():
+        return False
+    components = [authority]
+    cursor = authority.parent
+    stop = Path("/Library") if sys.platform == "darwin" else Path("/var/lib")
+    while True:
+        components.append(cursor)
+        if cursor == stop:
+            break
+        if cursor == cursor.parent:
+            return False
+        cursor = cursor.parent
+    try:
+        for component in components:
+            metadata = component.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
+                return False
+            if stat.S_IMODE(metadata.st_mode) & 0o022:
+                return False
+        return stat.S_ISREG(authority.lstat().st_mode)
+    except OSError:
+        return False
+
+
 def approval_events_for(paths):
-    return read_ndjson(paths.approvals_path)
+    """Return the effective authority view, never a partial or user-forged one.
+
+    Isolated canonical-suite stores remain self-contained.  Every real store requires the fixed,
+    OS-owned authority ledger for issued and invalidated events; the user ledger contributes only
+    structurally valid consumptions that bind an exact OS-authorized ticket.
+    """
+    if not approval_store_is_protected(paths):
+        return _strict_approval_events(paths.approvals_path)
+    # Root ownership does not establish fresh human consent when the same user
+    # can obtain root with a cached sudo credential. Retain history, but withhold
+    # protected credit until independently authenticated mutations are available.
+    return _invalid_approval_events("fresh-authentication-unavailable")
+
+
+def _os_owned_approval_events(paths):
+    """Read historical OS-owned records; ownership alone grants no live credit."""
+    authority_path = Path(
+        getattr(paths, "approval_authority_path", APPROVAL_AUTHORITY_PATH)
+    )
+    if not authority_path.exists():
+        return _invalid_approval_events("authority-ledger-missing")
+    if not _authority_path_is_os_owned(authority_path):
+        return _invalid_approval_events("authority-ledger-permissions")
+    authority_events = _strict_approval_events(authority_path)
+    if not approval_events_valid(authority_events):
+        return _invalid_approval_events(f"authority-{authority_events.error}")
+    return authority_events
 
 
 def latest_approval_event(events, digest, event_kind):
+    if not approval_events_valid(events):
+        return None
     match = None
     for event in events or []:
         if (isinstance(event, dict) and event.get("event") == event_kind
                 and event.get("subject_digest") == digest):
             match = event
     return match
+
+
+def approval_event_for_ticket(events, ticket_id, event_kind, consumption_id=""):
+    """Return the latest exact-ticket event, optionally bound to one consumption id."""
+    if not approval_events_valid(events):
+        return None
+    match = None
+    for event in events or []:
+        if (not isinstance(event, dict) or event.get("event") != event_kind
+                or event.get("ticket_id") != ticket_id):
+            continue
+        if consumption_id and event.get("consumption_id") != consumption_id:
+            continue
+        match = event
+    return match
+
+
+def approval_ticket_invalidated(events, ticket_id):
+    """An append-only invalidation permanently revokes exactly one issued ticket."""
+    if not approval_events_valid(events):
+        return True
+    return approval_event_for_ticket(events, ticket_id, "invalidated") is not None
 
 
 @contextlib.contextmanager
@@ -3101,14 +3965,16 @@ def _approvals_write_lock(paths):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def _approvals_ledger_over_cap(paths):
-    """A ledger past the NDJSON read cap would be read truncated; rewriting from that read would
-    permanently destroy the newest events (the consumptions). Refuse to write instead."""
-    try:
-        size = Path(paths.approvals_path).stat().st_size
-    except OSError:
-        return False
-    return size > NDJSON_READ_MAX_BYTES
+def _approval_records_size(records):
+    return sum(
+        len(json.dumps(redact_obj(record), sort_keys=True).encode("utf-8")) + 1
+        for record in records
+    )
+
+
+def _approval_write_fits(records):
+    """Refuse the write that would cross the read cap, not merely the write after it."""
+    return _approval_records_size(records) <= NDJSON_READ_MAX_BYTES
 
 
 def find_active_approval(events, digest, now=None):
@@ -3119,11 +3985,17 @@ def find_active_approval(events, digest, now=None):
     issued event's ticket_id blocks it. A fresh issued event appended after a consumption is a
     new, consumable ticket for the same subject — otherwise one spent ticket would lock a
     legitimate re-approval out forever (adversarial review finding, 2026-08-16)."""
+    if not approval_events_valid(events):
+        return None, "ledger_invalid"
     now = now or utc_now()
     issued = latest_approval_event(events, digest, "issued")
     if issued is None:
         return None, "no_ticket"
     ticket_id = issued.get("ticket_id", "")
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return None, "invalid_ticket_id"
+    if approval_ticket_invalidated(events, ticket_id):
+        return None, "invalidated"
     for event in events or []:
         if (isinstance(event, dict) and event.get("event") == "consumed"
                 and event.get("subject_digest") == digest
@@ -3143,6 +4015,46 @@ def find_active_approval(events, digest, now=None):
     return issued, ""
 
 
+def prebound_approval_for_consumer(events, digest, consumed_by, now=None):
+    """Return a root-preconsumed approval only while its first attachment is timely.
+
+    The OS helper binds and consumes at issue time, before the agent can attach the ticket to a
+    waiver row or release proof. That pre-consumption must not make the 15-minute review window
+    infinite. Status-time corroboration deliberately uses the timeless receipt-specific helpers
+    instead, so already persisted historical proof does not expire retroactively.
+    """
+    if not approval_events_valid(events):
+        return None, "ledger_invalid"
+    issued = latest_approval_event(events, digest, "issued")
+    if issued is None:
+        return None, "no_ticket"
+    ticket_id = issued.get("ticket_id", "")
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return None, "invalid_ticket_id"
+    if approval_ticket_invalidated(events, ticket_id):
+        return None, "invalidated"
+    subject = issued.get("subject")
+    if not isinstance(subject, dict) or approval_subject_digest(subject) != digest:
+        return None, "subject_mismatch"
+    issued_at = parse_ts(str(issued.get("issued_at") or ""))
+    expires_at = parse_ts(str(issued.get("expires_at") or ""))
+    if issued_at is None or expires_at is None or expires_at <= issued_at:
+        return None, "invalid_window"
+    if (expires_at - issued_at).total_seconds() > APPROVAL_TTL_SECONDS:
+        return None, "invalid_window"
+    current = now or utc_now()
+    if current < issued_at:
+        return None, "not_yet_valid"
+    if current > expires_at:
+        return None, "expired"
+    prior = approval_event_for_ticket(events, ticket_id, "consumed")
+    if prior is None:
+        return None, "consumption_not_human_bound"
+    if prior.get("consumed_by") != consumed_by:
+        return None, "consumed"
+    return prior, ""
+
+
 def consume_approval(paths, subject, consumed_by, now=None):
     """Single-use consumption bound to one consumer, under the ledger write lock.
 
@@ -3153,14 +4065,22 @@ def consume_approval(paths, subject, consumed_by, now=None):
     digest = approval_subject_digest(subject)
     with _approvals_write_lock(paths):
         events = approval_events_for(paths)
-        prior = latest_approval_event(events, digest, "consumed")
+        if not approval_events_valid(events):
+            return None, "ledger_invalid"
+        if approval_store_is_protected(paths):
+            return prebound_approval_for_consumer(
+                events, digest, consumed_by, now=now
+            )
+        issued = latest_approval_event(events, digest, "issued")
+        ticket_id = issued.get("ticket_id", "") if isinstance(issued, dict) else ""
+        if ticket_id and approval_ticket_invalidated(events, ticket_id):
+            return None, "invalidated"
+        prior = approval_event_for_ticket(events, ticket_id, "consumed")
         if prior is not None and prior.get("consumed_by") == consumed_by:
             return prior, ""
         issued, refusal = find_active_approval(events, digest, now=now)
         if issued is None:
             return None, refusal
-        if _approvals_ledger_over_cap(paths):
-            return None, "ledger_over_read_cap"
         record = {
             "event": "consumed",
             "kind": issued.get("kind"),
@@ -3170,12 +4090,15 @@ def consume_approval(paths, subject, consumed_by, now=None):
             "work_id": subject.get("work_id", ""),
             "pathway": subject.get("pathway", ""),
             "consumed_by": consumed_by,
-            "consumption_id": f"AC-{sha_text(digest + '|' + str(consumed_by), 12)}",
+            "consumption_id": f"AC-{sha_text(ticket_id + '|' + digest + '|' + str(consumed_by), 12)}",
         }
+        records_to_write = [*events, record]
+        if not _approval_write_fits(records_to_write):
+            return None, "ledger_over_read_cap"
         # append_records rewrites the whole file atomically, so a true append must carry every
         # existing event forward. The ledger stays append-only at the semantic level: events are
         # never edited or removed, only added.
-        write_ndjson(paths.approvals_path, events + [record])
+        write_ndjson(paths.approvals_path, records_to_write)
         return record, ""
 
 
@@ -3193,6 +4116,11 @@ def _approval_issuer_identity():
         return "unknown"
 
 
+def _approval_helper_command(action, arguments):
+    argv = ["/usr/bin/sudo", "--", str(APPROVAL_HELPER_PATH), action, *map(str, arguments)]
+    return "/usr/bin/sudo -k; " + shlex.join(argv)
+
+
 def release_approval_subject(work_id, project, release_receipt_sha256):
     return {
         "kind": APPROVAL_KIND_RELEASE,
@@ -3203,13 +4131,65 @@ def release_approval_subject(work_id, project, release_receipt_sha256):
     }
 
 
-def waiver_subject(work_id, project, pathway, reason):
+WAIVER_SUBJECT_SCHEMA_VERSION = 2
+
+
+def work_context_sha256(item, pathway):
+    """Bind a waiver to the immutable meaning of one current work obligation.
+
+    Status and proof fields are intentionally excluded because consuming the waiver changes them.
+    Identity-shaping fields and the itinerary pathway set are included, so editing the goal,
+    project, tier, profile, overlays, or obligation set orphans the human-reviewed waiver.
+    """
+    if not isinstance(item, dict) or pathway not in PATHWAY_CANON_ORDER:
+        return ""
+    raw_project = str(item.get("project") or "")
+    try:
+        resolved_project = str(Path(raw_project).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    itinerary = item.get("itinerary")
+    if not isinstance(itinerary, list):
+        return ""
+    itinerary_pathways = sorted({
+        entry.get("pathway")
+        for entry in itinerary
+        if isinstance(entry, dict) and entry.get("pathway") in PATHWAY_CANON_ORDER
+    }, key=pathway_sort_key)
+    if pathway not in itinerary_pathways:
+        return ""
+    context = {
+        "schema_version": 1,
+        "work_id": str(item.get("work_id") or ""),
+        "project_name": str(item.get("project_name") or ""),
+        "project_path_input": raw_project,
+        "project_path_resolved": resolved_project,
+        "goal": item.get("goal"),
+        "tier": item.get("tier"),
+        "outcome_profile": item.get("outcome_profile"),
+        "risk_overlays": item.get("risk_overlays"),
+        "itinerary_pathways": itinerary_pathways,
+        "obligation": {"pathway": pathway},
+    }
+    try:
+        encoded = json.dumps(
+            context, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return ""
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def waiver_subject(work_id, project, pathway, reason, context_sha256):
     return {
         "kind": APPROVAL_KIND_WAIVER,
+        "schema_version": WAIVER_SUBJECT_SCHEMA_VERSION,
         "work_id": str(work_id or ""),
         "project": str(project or ""),
         "pathway": str(pathway or ""),
         "reason": str(reason or ""),
+        "work_context_sha256": str(context_sha256 or ""),
     }
 
 
@@ -3220,12 +4200,31 @@ def approval_claim_corroborated(digest, expected_subject, consumer, consumption_
     whose subject is exactly what the claim implies, a consumption by this exact consumer, and a
     matching consumption id) can never drift apart. Also re-checks the issued window against the
     authority's own TTL, so a hand-widened expiry in the ledger cannot be honored later."""
+    if not approval_events_valid(events):
+        return False
     digest = str(digest or "")
     if not APPROVAL_DIGEST_RE.fullmatch(digest):
         return False
-    issued = latest_approval_event(events, digest, "issued")
-    consumed = latest_approval_event(events, digest, "consumed")
-    if issued is None or consumed is None:
+    consumed = next(
+        (
+            event for event in reversed(events or [])
+            if isinstance(event, dict)
+            and event.get("event") == "consumed"
+            and event.get("subject_digest") == digest
+            and event.get("consumption_id") == consumption_id
+            and event.get("consumed_by") == consumer
+        ),
+        None,
+    )
+    if consumed is None:
+        return False
+    ticket_id = consumed.get("ticket_id", "")
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return False
+    issued = approval_event_for_ticket(events, ticket_id, "issued")
+    if issued is None or issued.get("subject_digest") != digest:
+        return False
+    if approval_ticket_invalidated(events, ticket_id):
         return False
     subject = issued.get("subject") if isinstance(issued.get("subject"), dict) else {}
     if subject != expected_subject or approval_subject_digest(subject) != digest:
@@ -3243,6 +4242,7 @@ def approval_claim_corroborated(digest, expected_subject, consumer, consumption_
     return (
         consumed.get("consumed_by") == consumer
         and consumed.get("consumption_id") == consumption_id
+        and consumed.get("subject_digest") == digest
     )
 
 
@@ -3261,16 +4261,45 @@ def release_approval_corroborated(proof, events):
     )
 
 
-def waiver_corroborated(entry, work_id, project, events):
+def release_approval_failure_state(proof, events):
+    """Classify why one historical release claim is not currently corroborated."""
+    if not approval_events_valid(events):
+        return "approval_ledger_invalid"
+    if not isinstance(proof, dict):
+        return "release_proof_missing"
+    consumed = next(
+        (
+            event for event in events
+            if event.get("event") == "consumed"
+            and event.get("subject_digest") == proof.get("release_approval_digest")
+            and event.get("consumption_id") == proof.get("release_approval_consumed_id")
+            and event.get("consumed_by") == proof.get("proof_id")
+        ),
+        None,
+    )
+    if consumed and approval_ticket_invalidated(events, consumed.get("ticket_id", "")):
+        return "approval_invalidated"
+    return "approval_uncorroborated"
+
+
+def waiver_corroborated(entry, item, events):
     """A production-secure N/A row survives status recomputation only when its waiver claim maps
     back to an issued subject for this exact work/project/pathway/reason and to that row's own
     work-cover consumption."""
     if not isinstance(entry, dict):
         return False
+    item = item if isinstance(item, dict) else {}
+    pathway = entry.get("pathway")
+    context_sha256 = work_context_sha256(item, pathway)
+    if not context_sha256:
+        return False
     return approval_claim_corroborated(
         entry.get("waiver_digest"),
-        waiver_subject(work_id, project, entry.get("pathway"), entry.get("reason")),
-        f"work-cover:{work_id}:{entry.get('pathway')}",
+        waiver_subject(
+            item.get("work_id"), item.get("project_name"), pathway,
+            entry.get("reason"), context_sha256,
+        ),
+        f"work-cover:{item.get('work_id')}:{pathway}",
         entry.get("waiver_consumed_id"),
         events,
     )
@@ -3307,7 +4336,52 @@ def proof_result_is_passing(result):
     return bool(re.match(r"^(?:pass|passed)(?:[\s:_-].*)$", normalized))
 
 
-def proof_is_verified(proof, verifier_binding_cache=None):
+def observability_bound_contract_is_current(proof, contract_root=None):
+    """Verify a historical proof against its exact engine-owned contract snapshot."""
+    if not isinstance(proof, dict):
+        return False
+    key = str(proof.get("observability_contract_key") or "")
+    project_key = str(proof.get("observability_project_key") or "")
+    if (not key or key.startswith("/") or "\\" in key
+            or any(part in {"", ".", ".."} for part in key.split("/"))):
+        return False
+    if (project_key in set(OBSERVABILITY_PROJECT_CONTRACT_ALIASES.values())
+            and project_key not in OBSERVABILITY_PROJECT_CONTRACT_ALIASES):
+        return False
+    if OBSERVABILITY_PROJECT_CONTRACT_ALIASES.get(project_key, project_key) != key:
+        return False
+    root = observability_contracts_dir(contract_root)
+    if root is None:
+        return False
+    parts = key.split("/")
+    expected_path = root.joinpath(*parts[:-1], f"{parts[-1]}.json")
+    recorded_path = Path(str(proof.get("observability_contract_path") or ""))
+    if recorded_path != expected_path or expected_path.is_symlink():
+        return False
+    try:
+        if expected_path.parent.resolve() != expected_path.parent:
+            return False
+    except OSError:
+        return False
+    contract, errors, current_sha256 = load_observability_contract_snapshot(expected_path)
+    if errors or contract.get("project_key") != key:
+        return False
+    bound_sha256 = str(proof.get("observability_contract_sha256") or "")
+    verifier_sha256 = str(
+        (proof.get("observability_receipt") or {}).get("verifier_source_sha256") or "")
+    return (
+        bool(re.fullmatch(r"[0-9a-f]{64}", bound_sha256))
+        and current_sha256 == bound_sha256
+        and proof.get("observability_contract_post_sha256") == bound_sha256
+        and proof.get("observability_contract_schema_version") == contract.get("schema_version")
+        and verifier_sha256 in set(contract.get("trusted_verifier_sha256") or [])
+        and proof.get("observability_executed_verifier_sha256") == verifier_sha256
+        and proof.get("observability_post_verifier_sha256") == verifier_sha256
+    )
+
+
+def proof_is_verified(
+        proof, verifier_binding_cache=None, observability_contract_root=None):
     """Keystone: a proof counts as REAL verification ONLY when a re-executed verifier exited 0
     on an explicitly passing result. Free-text attestation (a --verified-by string) and bare human
     attestation (a --reviewer name) are claims, not verifications — a name is not a verifiable
@@ -3359,11 +4433,8 @@ def proof_is_verified(proof, verifier_binding_cache=None):
             and bool(proof.get("release_approval_consumed_id"))
         )
     if proof.get("pathway") == "observability":
-        verifier_digest = str(
-            (proof.get("observability_receipt") or {}).get("verifier_source_sha256") or ""
-        )
-        if (OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE != "CONFIGURED_AND_VERIFIED"
-                or verifier_digest not in OBSERVABILITY_TRUSTED_VERIFIER_SHA256):
+        if not observability_bound_contract_is_current(
+                proof, observability_contract_root):
             return False
         return (
             proof.get("canary_mutant_failed") is True
@@ -3495,13 +4566,71 @@ def _bullet_lines(text):
     return out
 
 
-def extract_carry_forward_sections(text):
-    """Best-effort parser for human evidence artifacts.
+def _json_carry_forward_sections(text):
+    """Extract a carry-forward baton from one strict JSON object.
 
-    The store is authoritative and structured; this parser only lets an artifact provide better
-    values than the safe defaults. It recognizes markdown headings such as `## What Changed` and
-    keeps the rest deterministic/stdlib-only.
+    JSON receipts are first-class proof artifacts, so they must preserve the same durable
+    continuity fields as Markdown reports. Duplicate keys, non-finite numbers, malformed list
+    fields, and non-object roots fail closed instead of silently degrading to fallback prose.
     """
+    if not (text or "").lstrip().startswith("{"):
+        return None
+    duplicates = []
+
+    def unique_object(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                duplicates.append(str(key))
+            else:
+                obj[key] = value
+        return obj
+
+    def reject_constant(value):
+        raise ValueError(f"non-finite number {value}")
+
+    def finite_number(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"non-finite number {value}")
+        return number
+
+    try:
+        data = json.loads(
+            text,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+            parse_float=finite_number,
+        )
+    except (TypeError, ValueError):
+        return {}
+    if duplicates or not isinstance(data, dict):
+        return {}
+
+    parsed = {}
+    summary = data.get("summary") or data.get("scope")
+    if isinstance(summary, str) and summary.strip():
+        parsed["summary"] = summary.strip()[:500]
+    for field in CARRY_FORWARD_LIST_FIELDS:
+        if field not in data:
+            continue
+        values = data[field]
+        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+            return {}
+        parsed[field] = [item.strip() for item in values if item.strip()][:12]
+    return parsed
+
+
+def extract_carry_forward_sections(text):
+    """Parse durable carry-forward fields from JSON receipts or Markdown artifacts.
+
+    The store is authoritative and structured; this parser lets an artifact provide better values
+    than the safe defaults. JSON is strict and fail-closed. Markdown recognizes headings such as
+    `## What Changed`. Both paths remain deterministic and stdlib-only.
+    """
+    json_sections = _json_carry_forward_sections(text)
+    if json_sections is not None:
+        return json_sections
     aliases = {
         "summary": "summary",
         "what changed": "what_changed",
@@ -3690,23 +4819,27 @@ def build_carry_forward_record(proof, work_item=None, approval_events=None):
         "pathway": pathway,
         "source_artifact": source_artifact,
         "summary": extracted.get("summary") or fallback_summary,
-        "what_changed": extracted.get("what_changed") or ([
+        "what_changed": extracted["what_changed"] if "what_changed" in extracted else ([
             f"{pathway} completed with verified evidence at {source_artifact}."
         ] if credits_pathway else [
             f"{pathway} recorded a verified hold at {source_artifact}; coverage remains open."
         ]),
-        "more_relevant": extracted.get("more_relevant") or [
+        "more_relevant": extracted["more_relevant"] if "more_relevant" in extracted else [
             f"Use the {pathway} proof before ranking or executing the next pathway."
         ],
-        "less_relevant": extracted.get("less_relevant") or [],
-        "next_pathway_must_use": extracted.get("next_pathway_must_use") or [
+        "less_relevant": extracted["less_relevant"] if "less_relevant" in extracted else [],
+        "next_pathway_must_use": (
+            extracted["next_pathway_must_use"]
+            if "next_pathway_must_use" in extracted else [
             f"Read {source_artifact} before acting on the next recommendation."
-        ],
-        "do_not_do_yet": extracted.get("do_not_do_yet") or [],
-        "open_decisions": extracted.get("open_decisions") or [],
-        "active_risk_overlays": extracted.get("active_risk_overlays") or [
+        ]),
+        "do_not_do_yet": extracted["do_not_do_yet"] if "do_not_do_yet" in extracted else [],
+        "open_decisions": extracted["open_decisions"] if "open_decisions" in extracted else [],
+        "active_risk_overlays": (
+            extracted["active_risk_overlays"]
+            if "active_risk_overlays" in extracted else [
             o.get("id", "") for o in (work_item or {}).get("risk_overlays", []) if o.get("id")
-        ],
+        ]),
         "artifact_sha256": artifact_sha256,
         "proof_id": proof.get("proof_id", ""),
         "run_id": proof.get("run_id", ""),
@@ -3751,7 +4884,127 @@ def latest_carry_forward_for_work(paths, work_id):
         return {}
     # NDJSON append order is the deterministic tie-breaker when multiple proofs land inside
     # the same timestamp second. The most recently written baton must win continuity.
-    return max(enumerate(records), key=lambda item: (item[1].get("created_at", ""), item[0]))[1]
+    latest = max(enumerate(records), key=lambda item: (item[1].get("created_at", ""), item[0]))[1]
+    release_batons = [
+        record for record in records
+        if record.get("pathway") == "release" and record.get("credits_pathway") is True
+    ]
+    if not release_batons:
+        return latest
+    proofs = read_ndjson(paths.proofs_path)
+    approval_events = approval_events_for(paths)
+    latest_release = max(
+        enumerate(release_batons),
+        key=lambda item: (item[1].get("created_at", ""), item[0]),
+    )[1]
+    release_proof_ids = {latest_release.get("proof_id")}
+    valid_release_proof = next(
+        (
+            proof for proof in reversed(proofs)
+            if proof.get("work_id") == work_id
+            and proof.get("pathway") == "release"
+            and proof.get("proof_id") in release_proof_ids
+            and proof_is_verified(proof)
+            and release_approval_corroborated(proof, approval_events)
+        ),
+        None,
+    )
+    if valid_release_proof is not None:
+        return latest
+    latest_release = max(
+        enumerate(release_batons),
+        key=lambda item: (item[1].get("created_at", ""), item[0]),
+    )[1]
+    release_proof = next(
+        (
+            proof for proof in reversed(proofs)
+            if proof.get("proof_id") == latest_release.get("proof_id")
+        ),
+        None,
+    )
+    release_state = release_approval_failure_state(release_proof, approval_events)
+    release_messages = {
+        "approval_ledger_invalid": (
+            "The approval authority ledger is unavailable or invalid; release proof is open again.",
+            "Current approval-ledger state cannot corroborate the historical release credit.",
+            "Restore the OS-owned approval authority ledger, then recheck release credit.",
+        ),
+        "approval_invalidated": (
+            "The release approval no longer corroborates; release proof is open again.",
+            "Current approval-ledger state invalidated the release credit.",
+            "Re-establish independent human approval before release credit.",
+        ),
+        "approval_uncorroborated": (
+            "The release claim does not match current approval authority; release proof is open again.",
+            "Current approval-ledger state does not corroborate the historical release claim.",
+            "Reconcile the exact issued ticket, consumption, and release proof binding.",
+        ),
+        "release_proof_missing": (
+            "The credited release baton has no referenced proof row; release proof is open again.",
+            "The current proof ledger cannot resolve the historical release baton.",
+            "Restore or replace the exact release proof before relying on release credit.",
+        ),
+    }
+    release_summary, release_change, release_next = release_messages[release_state]
+    release_what_changed = [release_change]
+    release_next_pathway_must_use = [release_next]
+    release_hold = ["Do not treat the historical release carry-forward as proved."]
+    corrected = dict(latest)
+    corrected.update({
+        "release_credit_current": False,
+        "release_pathway_outcome": release_state,
+        "release_proof_id": (
+            release_proof.get("proof_id", "")
+            if release_proof is not None else latest_release.get("proof_id", "")
+        ),
+        "release_approval_state_reason": (
+            getattr(approval_events, "error", "") or release_state
+        ),
+        "release_approval_summary": release_summary,
+        "release_approval_what_changed": release_what_changed,
+        "release_approval_next_pathway_must_use": release_next_pathway_must_use,
+        "release_approval_do_not_do_yet": release_hold,
+    })
+    if release_state == "approval_invalidated":
+        corrected["invalidated_release_proof_id"] = release_proof.get("proof_id", "")
+    if latest.get("pathway") == "release":
+        corrected.update({
+            "credits_pathway": False,
+            "pathway_outcome": release_state,
+            "summary": release_summary,
+            "what_changed": release_what_changed,
+            "next_pathway_must_use": release_next_pathway_must_use,
+            "do_not_do_yet": release_hold,
+            "source": "operating-layer invalidation-aware carry-forward view",
+        })
+    return corrected
+
+
+def release_carry_forward_overlay(carry_forward):
+    """Render the namespaced release hold without replacing a later pathway's own baton."""
+    carry_forward = carry_forward if isinstance(carry_forward, dict) else {}
+    if carry_forward.get("release_credit_current") is not False:
+        return ""
+    raw_summary = carry_forward.get("release_approval_summary")
+    summary = raw_summary.strip() if isinstance(raw_summary, str) else ""
+
+    def string_items(value):
+        if not isinstance(value, list):
+            return []
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+    next_steps = "; ".join(string_items(
+        carry_forward.get("release_approval_next_pathway_must_use")
+    )[:2])
+    holds = "; ".join(string_items(
+        carry_forward.get("release_approval_do_not_do_yet")
+    )[:2])
+    pieces = [summary]
+    if next_steps:
+        pieces.append(f"Required: {next_steps}")
+    if holds:
+        pieces.append(f"Hold: {holds}")
+    return " ".join(piece for piece in pieces if piece)
 
 
 def carry_forward_effect(carry_forward, recommended_pathway):
@@ -3762,10 +5015,14 @@ def carry_forward_effect(carry_forward, recommended_pathway):
     overlays = ", ".join(carry_forward.get("active_risk_overlays", [])[:4])
     changed_part = f" It changed: {changed}." if changed else ""
     overlay_part = f" Active overlays remain: {overlays}." if overlays else ""
-    return (
+    effect = (
         f"Latest `{carry_forward.get('pathway')}` output says: {carry_forward.get('summary')} "
         f"{changed_part}{overlay_part} Therefore `{recommended_pathway}` must use: {must_use}."
     )
+    release_overlay = release_carry_forward_overlay(carry_forward)
+    if release_overlay:
+        effect += f" Release approval overlay: {release_overlay}"
+    return effect
 
 
 def pathways_referenced_by_text(text):
@@ -4541,7 +5798,12 @@ def resolve_project_dir(raw, projects_root=None):
     if not raw:
         return ""
     p = Path(raw).expanduser()
-    if p.exists():
+    # A bare NAME is a project name, never a cwd-relative path: `--project koho` run from
+    # ~/Projects/koho found the empty stray folder ~/Projects/koho/koho and reported STATE.md
+    # missing when it existed (found 2026-09-03; a downstream patch could not catch it because
+    # this resolver had already committed to the wrong directory). Paths keep the old rule.
+    bare = os.sep not in raw and not raw.startswith(".")
+    if not bare and p.exists():
         return str(p.resolve())
     candidate = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser() / raw
     if candidate.exists():
@@ -4564,11 +5826,13 @@ def resolve_project_dir(raw, projects_root=None):
         ]
         if len(hits) == 1:
             return str(hits[0].resolve())
+    if bare and p.exists():
+        return str(p.resolve())
     return str(p)
 
 
 def build_proof_record(args, work_item=None, run_id="", measurement_id_value="", projects_root=None,
-                       paths=None):
+                       paths=None, observability_contract_root=None):
     evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
     if not evidence_path or not Path(evidence_path).exists():
         return None, finding(
@@ -4578,6 +5842,18 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "Proof registry requires --evidence pointing at an existing local artifact.",
             [line_evidence(evidence_path or "<missing>")],
             "Pass a real Markdown, JSON, screenshot, report, test output, or other verification artifact.",
+            "static",
+            "high",
+        )
+    if (args.pathway or "") == "observability" and not work_item:
+        return None, finding(
+            "proof-add-unlinked-observability-work-id",
+            "proof-registry",
+            "warn",
+            f"Observability proof refused for unknown work_id {args.work_id or '<missing>'}.",
+            [line_evidence((paths.work_items_path if paths else "<work-items>"),
+                           source=args.work_id or "<missing>")],
+            "Run work-start first and bind the proof to that canonical work item.",
             "static",
             "high",
         )
@@ -4606,6 +5882,15 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "project": project_name,
         "target_project": project_path,
     }
+    observability_contract_state = (
+        resolve_observability_contract(
+            project_path, projects_root, observability_contract_root)
+        if (args.pathway or "") == "observability" and work_item
+        else _observability_contract_state(
+            {}, errors=["observability_contract_not_registered"])
+        if (args.pathway or "") == "observability"
+        else _OBSERVABILITY_DEFAULT_STATE
+    )
     proof_id = proof_id_for(
         evidence_path, args.work_id or "", args.pathway or "", proof_type,
         args.recommendation_id or "")
@@ -4626,10 +5911,16 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 args.work_id or "", project_name, _peek_sha)
             _peek_digest = approval_subject_digest(release_approval_subject_value)
             _peek_events = approval_events_for(paths)
-            _active, _refusal = find_active_approval(_peek_events, _peek_digest)
-            _prior = latest_approval_event(_peek_events, _peek_digest, "consumed")
-            release_approval_available = _active is not None or (
-                _prior is not None and _prior.get("consumed_by") == proof_id)
+            if approval_store_is_protected(paths):
+                _prior, _refusal = prebound_approval_for_consumer(
+                    _peek_events, _peek_digest, proof_id
+                )
+                release_approval_available = _prior is not None
+            else:
+                _active, _refusal = find_active_approval(_peek_events, _peek_digest)
+                _prior = latest_approval_event(_peek_events, _peek_digest, "consumed")
+                release_approval_available = _active is not None or (
+                    _prior is not None and _prior.get("consumed_by") == proof_id)
     release_receipt = (
         release_provider_action_from_evidence(evidence_path)
         if release_provider_action_contract
@@ -4663,7 +5954,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "missing": [],
         }
     observability_receipt = (
-        observability_receipt_from_evidence(evidence_path, proof_context, now=utc_now())
+        observability_receipt_from_evidence(
+            evidence_path, proof_context, now=utc_now(),
+            contract_state=observability_contract_state)
         if (args.pathway or "") == "observability"
         else {
             "receipt": {}, "receipt_path": "", "receipt_sha256": "", "credit_scope": "",
@@ -4693,6 +5986,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
     observability_artifact_canary_results = {}
     observability_artifact_restoration_sha256 = {}
     observability_artifact_canary_errors = []
+    observability_executed_verifier_sha256 = ""
+    observability_post_verifier_sha256 = ""
     verify_error = ""
     verify_cwd = project_path or str(Path(evidence_path).parent)
     if verify_cmd:
@@ -4822,8 +6117,22 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 verify_cmd, verify_cwd,
                 observability_receipt["artifact_paths"].get("verifier_artifact", ""),
             )
-            if command_check["errors"] or observability_receipt["outcome"] != "runtime":
-                command_errors = command_check["errors"] or [
+            bound_verifier_sha256 = sha256_file(
+                observability_receipt["artifact_paths"].get("verifier_artifact", ""))
+            receipt_verifier_sha256 = str(
+                (observability_receipt.get("receipt") or {}).get(
+                    "verifier_source_sha256") or "")
+            trust_errors = []
+            if bound_verifier_sha256 != receipt_verifier_sha256:
+                trust_errors.append(
+                    "observability verifier source no longer matches the receipt digest")
+            if (bound_verifier_sha256 not in
+                    observability_contract_state["trusted_verifier_sha256"]):
+                trust_errors.append(
+                    "observability verifier source is not registered in the resolved contract")
+            if (command_check["errors"] or trust_errors
+                    or observability_receipt["outcome"] != "runtime"):
+                command_errors = command_check["errors"] + trust_errors or [
                     "runtime observability receipt is invalid; verifier was not executed"
                 ]
                 observability_receipt = {
@@ -4836,9 +6145,19 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                 canary_target_reason = "observability_receipt_or_command_invalid"
             else:
                 _t0 = time.monotonic()
+                execution_candidate_sha256 = sha256_file(command_check["argv"][1])
                 exit_code, verify_stdout_sha256, verify_stdout_bytes, verify_stdout = (
-                    run_observability_verifier_argv(command_check["argv"], verify_cwd)
+                    run_observability_verifier_argv(
+                        command_check["argv"], verify_cwd,
+                        expected_verifier_sha256=receipt_verifier_sha256,
+                        trusted_sha256=observability_contract_state[
+                            "trusted_verifier_sha256"],
+                    )
                 )
+                if exit_code == 126:
+                    verify_error = "observability_verifier_digest_changed_before_execution"
+                else:
+                    observability_executed_verifier_sha256 = execution_candidate_sha256
                 first_run_secs = time.monotonic() - _t0
                 trivial_verifier = verify_stdout_bytes < STDOUT_BYTE_FLOOR
                 canary_target_reason = "observability_artifact_canaries_recorded_separately"
@@ -4847,6 +6166,9 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
                         command_check["argv"], verify_cwd,
                         observability_receipt["artifact_paths"],
                         observability_receipt["artifact_sha256"],
+                        expected_verifier_sha256=receipt_verifier_sha256,
+                        trusted_sha256=observability_contract_state[
+                            "trusted_verifier_sha256"],
                     )
                     observability_artifact_canary_results = artifact_canaries["results"]
                     observability_artifact_restoration_sha256 = artifact_canaries[
@@ -5040,7 +6362,7 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             "recommendation_id": args.recommendation_id or "",
             "project": project_name,
             "target_project": project_path,
-        }, now=utc_now())
+        }, now=utc_now(), contract_state=observability_contract_state)
         observability_post_receipt_sha256 = post_receipt["receipt_sha256"]
         observability_post_observability_artifact_sha256 = dict(post_receipt["artifact_sha256"])
         if observability_post_artifact_sha256 != artifact_sha256:
@@ -5072,6 +6394,30 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         if post_receipt["credit_scope"] != observability_receipt["credit_scope"]:
             observability_snapshot_errors.append(
                 "observability credit scope changed during verifier execution"
+            )
+        contract_path = Path(observability_contract_state["path"])
+        contract_post_sha256 = (
+            sha256_file(contract_path)
+            if contract_path.is_file() and not contract_path.is_symlink()
+            else ""
+        )
+        if contract_post_sha256 != observability_contract_state["sha256"]:
+            observability_snapshot_errors.append(
+                "observability contract changed during verifier execution"
+            )
+        verifier_path = Path(str(
+            observability_receipt.get("artifact_paths", {}).get(
+                "verifier_artifact", "")))
+        observability_post_verifier_sha256 = (
+            sha256_file(verifier_path)
+            if verifier_path.is_file() and not verifier_path.is_symlink()
+            else ""
+        )
+        if (observability_executed_verifier_sha256
+                and observability_post_verifier_sha256
+                != observability_executed_verifier_sha256):
+            observability_snapshot_errors.append(
+                "observability verifier changed during execution"
             )
         observability_snapshot_stable = not observability_snapshot_errors
         if observability_snapshot_errors:
@@ -5199,6 +6545,13 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
         "release_approval_consumed_id": release_approval_consumed_id,
         "release_approval_error": release_approval_error,
         "observability_receipt": observability_receipt["receipt"],
+        "observability_contract_key": observability_contract_state["key"],
+        "observability_project_key": observability_contract_state["project_key"],
+        "observability_contract_path": observability_contract_state["path"],
+        "observability_contract_schema_version": observability_contract_state["schema_version"],
+        "observability_contract_sha256": observability_contract_state["sha256"],
+        "observability_contract_post_sha256": (
+            contract_post_sha256 if (args.pathway or "") == "observability" else ""),
         "observability_receipt_path": observability_receipt["receipt_path"],
         "observability_receipt_sha256": observability_receipt["receipt_sha256"],
         "observability_credit_scope": observability_receipt["credit_scope"],
@@ -5220,6 +6573,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
             observability_artifact_restoration_sha256
         ),
         "observability_artifact_canary_errors": observability_artifact_canary_errors,
+        "observability_executed_verifier_sha256": observability_executed_verifier_sha256,
+        "observability_post_verifier_sha256": observability_post_verifier_sha256,
         "reviewer": reviewer,
         "recommendation_id": args.recommendation_id or "",
         "run_id": run_id,
@@ -5233,7 +6588,8 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
     # a trivial transcript quietly parked the pathway in logged_unverified —
     # the caller had no signal until a later work-status archaeology dig
     # (2026-08-10: three re-log rounds before anyone saw cwd_invalid).
-    if (verify_cmd and not proof_is_verified(proof)
+    if (verify_cmd and not proof_is_verified(
+            proof, observability_contract_root=observability_contract_root)
             and not proof.get("release_provider_action_verified")):
         if verify_error == "cwd_invalid":
             reason = (
@@ -5310,10 +6666,10 @@ def build_proof_record(args, work_item=None, run_id="", measurement_id_value="",
               and proof.get("observability_outcome") == "blocked_no_runtime"):
             reason = "the verified blocked_no_runtime contract is carry-forward evidence, not observability credit."
         elif (proof.get("pathway") == "observability"
-              and OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE != "CONFIGURED_AND_VERIFIED"):
+              and not observability_bound_contract_is_current(proof)):
             reason = (
-                "runtime observability cannot earn credit until an external trusted-verifier "
-                "digest is configured and verified."
+                "runtime observability requires the resolved project contract, its unchanged "
+                "bound digest, and a verifier digest registered in that contract."
             )
         elif proof.get("pathway") == "observability" and proof.get("canary_mutant_failed") is not True:
             reason = "positive observability proof requires a successful anti-gaming verifier canary."
@@ -5590,7 +6946,7 @@ def scan_intel(args, paths, write_outputs=True):
     counts = Counter()
 
     ingest_logs = [
-        paths.claude_home / "hooks" / "ingest.log",
+        paths.claude_home / "logs" / "hook-ingest.log",
         paths.codex_home / "hooks" / "ingest.log",
     ]
     ingest_groups = {}
@@ -6862,7 +8218,7 @@ def stale_measurements(measurements):
     return stale
 
 
-def work_status_summary(paths, work_id):
+def work_status_summary(paths, work_id, approval_events_override=None):
     records = load_work_records(paths)
     item = next((w for w in records["items"] if w.get("work_id") == work_id), None)
     runs = [r for r in records["runs"] if r.get("work_id") == work_id]
@@ -6873,7 +8229,11 @@ def work_status_summary(paths, work_id):
     stale = stale_measurements(measurements)
     pathways_seen = sorted(set(r.get("pathway") for r in runs if r.get("pathway")), key=pathway_sort_key)
     proof_records = read_ndjson(paths.proofs_path)
-    approval_events = approval_events_for(paths)
+    approval_events = (
+        approval_events_override
+        if approval_events_override is not None
+        else approval_events_for(paths)
+    )
     proved_pathway_map = proved_pathways_from_proofs(work_id, proof_records, approval_events)
     missing_core_pathways = [p for p in CORE_PATHWAYS if p not in pathways_seen]
     if item:
@@ -6909,10 +8269,12 @@ def work_status_summary(paths, work_id):
             unsupported_proved = (
                 entry.get("status") == "proved"
                 and pathway not in proved_pathway_map
-                and (production_secure or recorded_receipt)
+                # Release is always an approval-backed current-state claim. Unlike ordinary
+                # legacy/manual coverage, a persisted release label cannot survive deletion of
+                # the proof row that binds it to the authority ledger.
+                and (production_secure or recorded_receipt or pathway == "release")
             )
-            waived = waiver_corroborated(
-                entry, work_id, (item or {}).get("project_name", ""), approval_events)
+            waived = waiver_corroborated(entry, item, approval_events)
             if (production_secure and entry.get("status") == "na" and not waived) or unsupported_proved:
                 entry["status"] = "required"
                 entry["proved_by_run"] = ""
@@ -6954,6 +8316,211 @@ def work_status_summary(paths, work_id):
     }
 
 
+def current_work_item_view(paths, item, summary=None, approval_events=None):
+    """Project the effective status of a historically closed item without rewriting history.
+
+    Only a consumed ticket whose removal is the difference between ready and not-ready may reopen
+    a closed item as approval-invalidated.  An invalidated but unused ticket is audit history, not
+    causal work state.
+    """
+    if not isinstance(item, dict) or item.get("status", "active") != "closed":
+        return item, summary
+    work_id = item.get("work_id")
+    if not work_id:
+        return item, summary
+    events = approval_events if approval_events is not None else approval_events_for(paths)
+    proof_records = read_ndjson(paths.proofs_path)
+    persisted_release_proved = any(
+        isinstance(entry, dict)
+        and entry.get("pathway") == "release"
+        and entry.get("status") == "proved"
+        for entry in item.get("itinerary", [])
+    )
+    if not approval_events_valid(events):
+        has_waiver_claim = any(
+            isinstance(entry, dict)
+            and bool(entry.get("waiver_digest") or entry.get("waiver_consumed_id"))
+            for entry in item.get("itinerary", [])
+        )
+        has_release_claim = any(
+            proof.get("work_id") == work_id
+            and proof.get("pathway") == "release"
+            and bool(
+                proof.get("release_approval_digest")
+                or proof.get("release_approval_consumed_id")
+            )
+            for proof in proof_records
+        )
+        current_summary = summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") == "ready":
+            return item, current_summary
+        if not (
+            has_waiver_claim
+            or has_release_claim
+            or persisted_release_proved
+            or production_secure_waiver_locked(item)
+        ):
+            return item, current_summary
+        current_view = dict(item)
+        current_view.update({
+            "persisted_status": "closed",
+            "status": "active",
+            "current_status": "active",
+                "current_status_reason": (
+                    "approval_ledger_invalid"
+                    if has_waiver_claim or has_release_claim or persisted_release_proved
+                    else "production_secure_not_ready"
+                ),
+        })
+        current_summary = dict(current_summary)
+        current_summary["work_item"] = current_view
+        return current_view, current_summary
+
+    # A release `proved` label is a cached projection of a currently corroborated proof, never
+    # durable authority by itself. If the user-writable proof ledger loses that row, reopening must
+    # not depend on finding approval fields in the now-missing row: otherwise deleting the claim
+    # hides both the proof loss and any OS-ledger invalidation that followed it.
+    current_release_proofs = [
+        proof for proof in proof_records
+        if proof.get("work_id") == work_id and proof.get("pathway") == "release"
+    ]
+    if persisted_release_proved and not any(
+            proof_credits_pathway(proof, events) for proof in current_release_proofs):
+        current_summary = summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        referenced_proof_ids = {
+            entry.get("proved_by_run")
+            for entry in item.get("itinerary", [])
+            if isinstance(entry, dict) and entry.get("pathway") == "release"
+        }
+        release_proof = next(
+            (
+                proof for proof in reversed(current_release_proofs)
+                if proof.get("run_id") in referenced_proof_ids
+                or proof.get("proof_id") in referenced_proof_ids
+            ),
+            current_release_proofs[-1] if current_release_proofs else None,
+        )
+        current_view = dict(item)
+        current_view.update({
+            "persisted_status": "closed",
+            "status": "active",
+            "current_status": "active",
+            "current_status_reason": release_approval_failure_state(release_proof, events),
+        })
+        current_summary = dict(current_summary)
+        current_summary["work_item"] = current_view
+        return current_view, current_summary
+    consumed_tickets = {
+        event.get("ticket_id")
+        for event in events
+        if event.get("event") == "consumed" and event.get("work_id") == work_id
+    }
+    causal_ticket_ids = {
+        event.get("ticket_id")
+        for event in events
+        if event.get("event") == "invalidated"
+        and event.get("work_id") == work_id
+        and event.get("ticket_id") in consumed_tickets
+    }
+    current_summary = summary
+    if causal_ticket_ids:
+        current_summary = current_summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") != "ready":
+            without_invalidations = ApprovalEvents([
+                event for event in events
+                if not (
+                    event.get("event") == "invalidated"
+                    and event.get("ticket_id") in causal_ticket_ids
+                )
+            ])
+            counterfactual = work_status_summary(
+                paths, work_id, approval_events_override=without_invalidations
+            )
+            if counterfactual.get("closeout_readiness") == "ready":
+                current_view = dict(item)
+                current_view.update({
+                    "persisted_status": "closed",
+                    "status": "active",
+                    "current_status": "active",
+                    "current_status_reason": "approval_invalidated",
+                })
+                current_summary = dict(current_summary)
+                current_summary["work_item"] = current_view
+                return current_view, current_summary
+
+    def claim_was_explicitly_invalidated(digest, consumption_id):
+        consumed = next(
+            (
+                event for event in events
+                if event.get("event") == "consumed"
+                and event.get("subject_digest") == digest
+                and event.get("consumption_id") == consumption_id
+            ),
+            None,
+        )
+        return bool(
+            consumed
+            and approval_ticket_invalidated(events, consumed.get("ticket_id", ""))
+        )
+
+    project_name = item.get("project_name", "")
+    has_uncorroborated_claim = any(
+        isinstance(entry, dict)
+        and bool(entry.get("waiver_digest") or entry.get("waiver_consumed_id"))
+        and not waiver_corroborated(entry, item, events)
+        and not claim_was_explicitly_invalidated(
+            entry.get("waiver_digest"), entry.get("waiver_consumed_id")
+        )
+        for entry in item.get("itinerary", [])
+    )
+    if not has_uncorroborated_claim:
+        has_uncorroborated_claim = any(
+            proof.get("work_id") == work_id
+            and bool(
+                proof.get("release_approval_digest")
+                or proof.get("release_approval_consumed_id")
+            )
+            and not release_approval_corroborated(proof, events)
+            and not claim_was_explicitly_invalidated(
+                proof.get("release_approval_digest"),
+                proof.get("release_approval_consumed_id"),
+            )
+            for proof in proof_records
+        )
+    if not has_uncorroborated_claim:
+        if not production_secure_waiver_locked(item):
+            return item, current_summary
+        current_summary = current_summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") == "ready":
+            return item, current_summary
+        reason = "production_secure_not_ready"
+    else:
+        current_summary = current_summary or work_status_summary(
+            paths, work_id, approval_events_override=events
+        )
+        if current_summary.get("closeout_readiness") == "ready":
+            return item, current_summary
+        reason = "approval_uncorroborated"
+    current_view = dict(item)
+    current_view.update({
+        "persisted_status": "closed",
+        "status": "active",
+        "current_status": "active",
+        "current_status_reason": reason,
+    })
+    current_summary = dict(current_summary)
+    current_summary["work_item"] = current_view
+    return current_view, current_summary
+
+
 def work_warnings(item, runs, measurements, open_controls, stale, itinerary_open=None):
     warnings = []
     if not item:
@@ -6984,8 +8551,23 @@ def work_warnings(item, runs, measurements, open_controls, stale, itinerary_open
 def build_daily_dashboard(paths):
     records = load_work_records(paths)
     work_items = sorted(records["items"], key=lambda w: w.get("updated_at", ""), reverse=True)
-    active = [w for w in work_items if w.get("status", "active") != "closed"]
-    summaries = [work_status_summary(paths, w.get("work_id")) for w in active[:25]]
+    approval_events = approval_events_for(paths)
+    active = []
+    invalidation_summaries = {}
+    for item in work_items:
+        current_view, summary = current_work_item_view(
+            paths, item, approval_events=approval_events
+        )
+        if current_view.get("status", "active") == "closed":
+            continue
+        active.append(current_view)
+        if summary is not None:
+            invalidation_summaries[item.get("work_id")] = summary
+    summaries = [
+        invalidation_summaries.get(item.get("work_id"))
+        or work_status_summary(paths, item.get("work_id"))
+        for item in active[:25]
+    ]
     stuck = [
         s for s in summaries
         if s["open_controls"] or s["stale_measurements"] or any("No pathway runs" in w for w in s["warnings"])
@@ -6995,7 +8577,7 @@ def build_daily_dashboard(paths):
         "generated_at": iso_now(),
         "active_work_items": active,
         "active_count": len(active),
-        "closed_count": len([w for w in work_items if w.get("status") == "closed"]),
+        "closed_count": len(work_items) - len(active),
         "work_summaries": summaries,
         "stuck_work_items": [
             {
@@ -7369,7 +8951,7 @@ def run_work_start(args, paths):
     # every downstream consumer (verify cwd, boundary checks, portfolio joins, stable_work_id)
     # treats this field as a path, and stable_work_id would otherwise hash it relative to the
     # invoking process's cwd, making the work_id unstable across invocation directories.
-    project_path = resolve_project_dir(args.project, paths.projects_root)
+    project_path = str(Path(resolve_project_dir(args.project, paths.projects_root)).resolve())
     work_id = stable_work_id(project_path, args.goal)
     context = current_work_context(paths, project_path)
     existing = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == work_id), None)
@@ -7410,6 +8992,9 @@ def run_work_start(args, paths):
         itinerary=itinerary,
         closeout_readiness="not_ready",
     )
+    if getattr(args, "development_protocol", False):
+        development_protocol.start(paths.development_protocol_path, work_id, project_path, args.goal)
+        update_work_item(paths, work_id, development_protocol_required=True)
     dashboard = build_daily_dashboard(paths)
     return {"records": [item], "findings": [], "work_id": work_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
 
@@ -7487,7 +9072,9 @@ def run_work_cover(args, paths):
                 waiver_consumption, consume_refusal = consume_approval(
                     paths,
                     waiver_subject(
-                        args.work_id, item.get("project_name", ""), args.pathway, args.reason),
+                        args.work_id, item.get("project_name", ""), args.pathway, args.reason,
+                        work_context_sha256(item, args.pathway),
+                    ),
                     f"work-cover:{args.work_id}:{args.pathway}",
                 )
                 if waiver_consumption is None:
@@ -7635,13 +9222,13 @@ def run_approval_issue(args, paths):
     # The ledger is written through the redactor. A reason the redactor rewrites would be stored
     # as different bytes than the digest binds, and the ticket would be stillborn with a refusal
     # that reads like tampering. Refuse loudly at issue time instead.
-    if redact(reason) != reason:
+    if redact(reason) != reason or not _authority_text_safe(reason):
         return _refuse(
             "approval-issue-reason-not-storable",
-            "The reason contains secret-like text that the ledger redactor would rewrite, so the "
-            "ticket could never be consumed.",
-            "Reword the reason without credential-shaped text (no `token:`/`secret=`/`password:` "
-            "phrasing and no 64-character-plus runs), then re-issue.",
+            "The reason contains secret-like or visually unsafe control text, so the reviewed "
+            "authority command cannot preserve it safely.",
+            "Reword the reason without credential-shaped, control, bidi, or line-separator text, "
+            "then re-issue.",
         )
     item = next(
         (w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
@@ -7652,6 +9239,12 @@ def run_approval_issue(args, paths):
             "Check the work_id with work-status.",
         )
     project = item.get("project_name", "")
+    if not all(_authority_text_safe(value) for value in (str(args.work_id), str(project))):
+        return _refuse(
+            "approval-issue-unsafe-identity-text",
+            "The work ID or project name contains visually unsafe Unicode control text.",
+            "Repair the work item identity before requesting approval.",
+        )
     if kind == APPROVAL_KIND_WAIVER:
         if (args.pathway or "") not in PATHWAY_CANON_ORDER:
             return _refuse(
@@ -7659,7 +9252,18 @@ def run_approval_issue(args, paths):
                 "A production-secure waiver ticket requires --pathway (a canonical pathway name).",
                 f"Choose one of: {', '.join(PATHWAY_CANON_ORDER)}.",
             )
-        subject = waiver_subject(args.work_id, project, args.pathway, reason)
+        context_sha256 = work_context_sha256(item, args.pathway)
+        if not context_sha256:
+            return _refuse(
+                "approval-issue-invalid-work-context",
+                "The current work context cannot be bound to a waiver subject.",
+                "Repair the work item project, goal, tier, profile, overlays, and itinerary "
+                "before requesting a waiver.",
+            )
+        subject = waiver_subject(
+            args.work_id, project, args.pathway, reason, context_sha256
+        )
+        authority_consumer = f"work-cover:{args.work_id}:{args.pathway}"
     else:
         receipt_raw = (getattr(args, "release_receipt", None) or "").strip()
         if not receipt_raw:
@@ -7684,6 +9288,47 @@ def run_approval_issue(args, paths):
                 "Fix the file and re-run.",
             )
         subject = release_approval_subject(args.work_id, project, receipt_sha)
+        recommendation_id = (getattr(args, "recommendation_id", None) or "").strip()
+        if not recommendation_id:
+            try:
+                receipt_payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if isinstance(receipt_payload, dict):
+                    recommendation_id = str(receipt_payload.get("recommendation_id") or "")
+            except (OSError, TypeError, ValueError):
+                recommendation_id = ""
+        evidence_path = str(Path(getattr(args, "evidence", None) or receipt_path).expanduser())
+        proof_type = getattr(args, "proof_type", None) or "artifact"
+        derived_consumer = proof_id_for(
+            evidence_path, args.work_id, "release", proof_type, recommendation_id
+        )
+        provided_consumer = (getattr(args, "consumer", None) or "").strip()
+        if provided_consumer and provided_consumer != derived_consumer:
+            return _refuse(
+                "approval-issue-consumer-mismatch",
+                "--consumer does not match the intended evidence, proof type, and recommendation.",
+                f"Use --consumer {derived_consumer}, then log the same receipt with the same "
+                "work id, release pathway, --evidence, --proof-type, and recommendation id.",
+            )
+        authority_consumer = provided_consumer or derived_consumer
+    if approval_store_is_protected(paths):
+        command = _approval_helper_command(
+            "issue",
+            [
+                "--subject-json",
+                json.dumps(subject, sort_keys=True, separators=(",", ":")),
+                "--reason",
+                reason,
+                "--consumer",
+                authority_consumer,
+            ],
+        )
+        refusal = _refuse(
+            "approval-issue-human-helper-required",
+            "The user-writable operating-layer CLI cannot issue live approval authority.",
+            f"Review the exact subject, then run this in Alex's normal Terminal: {command}",
+        )
+        refusal["authority_command"] = command
+        return refusal
     digest = approval_subject_digest(subject)
     now = utc_now()
     issued_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -7705,14 +9350,20 @@ def run_approval_issue(args, paths):
         "issued_by": _approval_issuer_identity(),
     }
     with _approvals_write_lock(paths):
-        if _approvals_ledger_over_cap(paths):
+        events = approval_events_for(paths)
+        if not approval_events_valid(events):
+            return _refuse(
+                "approval-issue-ledger-invalid",
+                "The approvals ledger is malformed, truncated, symlinked, or over its read cap.",
+                "Repair or rotate the ledger before issuing another ticket.",
+            )
+        if not _approval_write_fits([*events, event]):
             return _refuse(
                 "approval-issue-ledger-over-cap",
-                "The approvals ledger is past the NDJSON read cap; writing now would destroy the "
-                "newest events.",
+                "This approval event would put the ledger past its exact read cap.",
                 "Rotate the approvals ledger before issuing another ticket.",
             )
-        write_ndjson(paths.approvals_path, approval_events_for(paths) + [event])
+        write_ndjson(paths.approvals_path, [*events, event])
     next_step = (
         f"work-cover --work-id {args.work_id} --pathway {args.pathway} --na --reason "
         "\"<the exact same reason>\""
@@ -7727,6 +9378,112 @@ def run_approval_issue(args, paths):
         "expires_in_seconds": APPROVAL_TTL_SECONDS,
         "single_use": True,
         "next_step": next_step,
+    }
+
+
+def run_approval_invalidate(args, paths):
+    """Append an exact-ticket invalidation (Alex's deliberate corrective act).
+
+    Invalidation never rewrites issuance or consumption history. Status-time corroboration
+    consults this event, so an invalidated ticket cannot credit a waiver or release proof even
+    when its consumption predates the correction.
+    """
+    def _refuse(fid, message, remediation):
+        return {
+            "findings": [finding(
+                fid, "approval-authority", "error", message,
+                [line_evidence(paths.approvals_path, source=args.ticket_id or "")],
+                remediation, "static", "high",
+            )],
+            "records": [],
+        }
+
+    ticket_id = (args.ticket_id or "").strip()
+    if not APPROVAL_TICKET_ID_RE.fullmatch(ticket_id):
+        return _refuse(
+            "approval-invalidate-invalid-ticket-id",
+            "approval-invalidate requires one exact ticket id in the AT-<12 lowercase hex> form.",
+            "Copy the ticket_id from the approvals ledger and re-run the reviewed command.",
+        )
+    reason = (args.reason or "").strip()
+    if not reason:
+        return _refuse(
+            "approval-invalidate-missing-reason",
+            "approval-invalidate requires --reason so the correction is auditable.",
+            "State the bounded correction reason and re-run the reviewed command.",
+        )
+    if redact(reason) != reason or not _authority_text_safe(reason):
+        return _refuse(
+            "approval-invalidate-reason-not-storable",
+            "The invalidation reason contains secret-like or visually unsafe control text.",
+            "Reword the reason without credential-shaped, control, bidi, or line-separator text, "
+            "then re-run.",
+        )
+    if approval_store_is_protected(paths):
+        command = _approval_helper_command(
+            "invalidate", ["--ticket-id", ticket_id, "--reason", reason]
+        )
+        refusal = _refuse(
+            "approval-invalidate-human-helper-required",
+            "The user-writable operating-layer CLI cannot invalidate live approval authority.",
+            f"Review the exact ticket and reason, then run this in Alex's normal Terminal: {command}",
+        )
+        refusal["authority_command"] = command
+        return refusal
+
+    with _approvals_write_lock(paths):
+        events = approval_events_for(paths)
+        if not approval_events_valid(events):
+            return _refuse(
+                "approval-invalidate-ledger-invalid",
+                "The approvals ledger is malformed, truncated, symlinked, or over its read cap.",
+                "Repair or rotate the ledger before invalidating a ticket.",
+            )
+        if not _approval_write_fits(events):
+            return _refuse(
+                "approval-invalidate-ledger-over-cap",
+                "The approvals ledger is at or past its exact read cap.",
+                "Rotate the approvals ledger before invalidating a ticket.",
+            )
+        issued = approval_event_for_ticket(events, ticket_id, "issued")
+        if issued is None:
+            return _refuse(
+                "approval-invalidate-ticket-not-found",
+                f"No issued approval ticket exists with id {ticket_id}.",
+                "Check the exact ticket_id in the approvals ledger.",
+            )
+        prior = approval_event_for_ticket(events, ticket_id, "invalidated")
+        if prior is not None:
+            return {
+                "findings": [],
+                "records": [prior],
+                "ticket_id": ticket_id,
+                "status": "already_invalidated",
+            }
+        at = iso_now()
+        event = {
+            "event": "invalidated",
+            "kind": issued.get("kind", ""),
+            "subject_digest": issued.get("subject_digest", ""),
+            "ticket_id": ticket_id,
+            "at": at,
+            "work_id": issued.get("work_id", ""),
+            "reason": reason,
+            "invalidated_by": _approval_issuer_identity(),
+            "invalidation_id": f"AI-{sha_text(ticket_id + '|' + at + '|' + reason, 12)}",
+        }
+        if not _approval_write_fits([*events, event]):
+            return _refuse(
+                "approval-invalidate-ledger-over-cap",
+                "This invalidation event would put the ledger past its exact read cap.",
+                "Rotate the approvals ledger before invalidating a ticket.",
+            )
+        write_ndjson(paths.approvals_path, [*events, event])
+    return {
+        "findings": [],
+        "records": [event],
+        "ticket_id": ticket_id,
+        "status": "invalidated",
     }
 
 
@@ -7745,7 +9502,22 @@ def run_work_status(args, paths):
             )],
             "records": [],
         }
+    # Keep the append-only ledger row for current-view causality. The summary deliberately
+    # recomputes cached itinerary states, so passing its projected item would erase the historical
+    # `release: proved` marker before current_work_item_view can detect a deleted release proof.
+    persisted_item = next(
+        (
+            item for item in read_ndjson(paths.work_items_path)
+            if item.get("work_id") == args.work_id
+        ),
+        None,
+    )
     summary = work_status_summary(paths, args.work_id)
+    current_item, current_summary = current_work_item_view(
+        paths, persisted_item or summary.get("work_item"), summary=summary
+    )
+    if current_item is not None and current_summary is not None:
+        summary = current_summary
     return {"records": [summary], "findings": [], "summary": summary}
 
 
@@ -7853,6 +9625,8 @@ def run_work_log(args, paths):
             "static",
             "medium",
         ))
+        if args.pathway == "observability":
+            return {"findings": findings, "records": []}
 
     evidence_path = str(Path(args.evidence).expanduser()) if args.evidence else ""
     evidence_id = evidence_id_for_path(evidence_path) if evidence_path else ""
@@ -7867,6 +9641,8 @@ def run_work_log(args, paths):
         "evidence_path": evidence_path,
         "status": args.result or "recorded",
         "source": "operating-layer work-log",
+        # Retain the original artifact even when the proof pointer is later updated.
+        "artifact_sha256": sha256_file(evidence_path) if evidence_path else "",
     }
     measurement = {
         "measurement_id": measurement_id(run_id, args.gate or args.kind),
@@ -7960,6 +9736,14 @@ def run_work_log(args, paths):
     }
 
 
+def protocol_work_identity(paths, work_id):
+    item = next((row for row in read_ndjson(paths.work_items_path)
+                 if row.get("work_id") == work_id), None)
+    if not item or not item.get("project") or not item.get("goal"):
+        raise ValueError("protocol requires an existing canonical work item")
+    return resolve_project_dir(item["project"], paths.projects_root), item["goal"]
+
+
 def run_work_close(args, paths):
     if not args.work_id:
         return {
@@ -7977,6 +9761,42 @@ def run_work_close(args, paths):
         }
     summary = work_status_summary(paths, args.work_id)
     findings = []
+    protocol_ready, protocol_status = development_protocol.enforce_close(
+        paths.development_protocol_path, args.work_id,
+        (resolve_project_dir(summary["work_item"]["project"], paths.projects_root),
+         summary["work_item"]["goal"]) if summary.get("work_item") else None,
+    )
+    if (summary.get("work_item") or {}).get("development_protocol_required") and not protocol_status.get("exists"):
+        protocol_ready = False
+    if not protocol_ready:
+        findings.append(
+            finding(
+                "work-close-protocol-incomplete",
+                "development-protocol",
+                "warn",
+                f"Development protocol checklist is incomplete for {args.work_id}.",
+                [
+                    line_evidence(
+                        paths.development_protocol_path,
+                        source=", ".join(protocol_status.get("open", [])),
+                    )
+                ],
+                "Complete each required protocol step with an evidence file and passing verifier.",
+                "static",
+                "high",
+            )
+        )
+        dashboard = build_daily_dashboard(paths)
+        return {
+            "records": [summary, protocol_status],
+            "findings": findings,
+            "closed": False,
+            "work_id": args.work_id,
+            "report": None,
+            "html": None,
+            "dashboard": str(paths.daily_dashboard_path),
+            "daily": dashboard,
+        }
     if summary["closeout_readiness"] != "ready":
         findings.append(finding(
             "work-close-not-ready",
@@ -8043,6 +9863,21 @@ def run_proof_add(args, paths):
     work_item = None
     if args.work_id:
         work_item = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == args.work_id), None)
+    if args.pathway == "observability" and not work_item:
+        return {
+            "records": [],
+            "findings": [finding(
+                "proof-add-unlinked-observability-work-id",
+                "proof-registry",
+                "warn",
+                f"Observability proof refused for unknown work_id {args.work_id or '<missing>'}.",
+                [line_evidence(paths.work_items_path, source=args.work_id or "<missing>")],
+                "Run work-start first and bind the proof to that canonical work item.",
+                "static",
+                "high",
+            )],
+            "proofs_path": str(paths.proofs_path),
+        }
     proof, proof_finding = build_proof_record(
         args, work_item=work_item, projects_root=paths.projects_root, paths=paths)
     # No proof at all (e.g. missing evidence) is fatal. A proof accompanied by a
@@ -8214,7 +10049,7 @@ def project_local_findings(project_path, max_files=40, max_records=200):
     Returns (findings_list, source_count). Each finding carries an explicit
     `pathway` when the source declared one, so it routes deterministically.
     """
-    root = Path(project_path).expanduser()
+    root = Path(resolve_project_dir(project_path) or project_path).expanduser()
     planning = root / ".planning"
     findings = []
     source_count = 0
@@ -8307,8 +10142,13 @@ def project_local_findings(project_path, max_files=40, max_records=200):
 
 def active_work_for_project(paths, project_path, project_name):
     items = read_ndjson(paths.work_items_path)
+    approval_events = approval_events_for(paths)
+    effective_items = [
+        current_work_item_view(paths, item, approval_events=approval_events)[0]
+        for item in items
+    ]
     matches = [
-        w for w in items
+        w for w in effective_items
         if w.get("status", "active") != "closed"
         and (w.get("project") == project_path or w.get("project_name") == project_name)
     ]
@@ -8641,6 +10481,7 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
     confidence = confidence or recommendation_confidence(ranked, has_context, trust)
     if blocked_on_deferred:
         cf = latest_carry_forward or {}
+        release_overlay = release_carry_forward_overlay(cf)
         open_decisions = cf.get("open_decisions", []) or []
         do_not_do_yet = cf.get("do_not_do_yet", []) or []
         next_requirements = cf.get("next_pathway_must_use", []) or []
@@ -8662,6 +10503,7 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
             f"- Outcome: `{cf.get('pathway_outcome', '')}`",
             f"- Credits pathway: `{str(bool(cf.get('credits_pathway'))).lower()}`",
             f"- Continuity effect: {carry_forward_note}",
+            *([f"- Release approval overlay: {release_overlay}"] if release_overlay else []),
             "",
             "## Requirements to resolve",
             "",
@@ -8747,6 +10589,7 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
         lines += ["", "Missing evidence:"]
         lines.extend(f"- {item}" for item in missing)
     cf = latest_carry_forward or {}
+    release_overlay = release_carry_forward_overlay(cf)
     lines += [
         "",
         "## What Previous Work Changed",
@@ -8764,6 +10607,8 @@ def render_pathway_next_report(paths, project_name, recommended, ranked, card, w
             f"- **Open decisions:** {'; '.join(cf.get('open_decisions', [])[:3]) or '—'}",
             f"- **Active risk overlays:** {', '.join(cf.get('active_risk_overlays', [])[:6]) or '—'}",
         ]
+        if release_overlay:
+            lines.append(f"- **Release approval overlay:** {release_overlay}")
     if autonomy:
         lines += [
             "",
@@ -9045,11 +10890,12 @@ def compute_pathway_next(args, paths):
              if item.get("work_id") == requested_work_id),
             None,
         )
+        effective_known_item = current_work_item_view(paths, known_item)[0] if known_item else None
         selected_item = (
-            known_item
-            if known_item
-            and known_item.get("status", "active") != "closed"
-            and work_item_is_within_project(known_item, project_path, project_name)
+            effective_known_item
+            if effective_known_item
+            and effective_known_item.get("status", "active") != "closed"
+            and work_item_is_within_project(effective_known_item, project_path, project_name)
             else None
         )
         if not selected_item:
@@ -9835,9 +11681,6 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
     def proved(rec):
         rec_ts = parse_ts(rec.get("timestamp"))
         for proof in proofs:
-            if not proof_credits_pathway(
-                    proof, approval_events, verifier_binding_cache):
-                continue  # keystone: attested (free-text) proofs never raise the autonomy proof rate
             proof_rec = proof.get("recommendation_id")
             if proof_rec:
                 if proof_rec != rec.get("recommendation_id"):
@@ -9854,7 +11697,11 @@ def compute_pathway_metric(paths, window_days=1, gate_target=0.5):
             if rec_ts and proof_ts:
                 delta = (proof_ts - rec_ts).total_seconds()
                 if 0 <= delta <= window_days * 86400:
-                    return True
+                    # Match first: unrelated proofs cannot credit this recommendation.
+                    # Keep the same verification and release-approval predicate.
+                    if proof_credits_pathway(
+                            proof, approval_events, verifier_binding_cache):
+                        return True
         return False
 
     by_pathway = {}
@@ -10289,10 +12136,15 @@ def portfolio_next_items(paths):
     proofs = read_ndjson(paths.proofs_path)
     recs = read_ndjson(paths.recommendations_path)
     out = []
+    approval_events = approval_events_for(paths)
+    effective_work_items = [
+        current_work_item_view(paths, item, approval_events=approval_events)[0]
+        for item in work_records["items"]
+    ]
     for project in projects:
         name = project.get("name", "")
         work_items = [
-            w for w in work_records["items"]
+            w for w in effective_work_items
             if w.get("status", "active") != "closed"
             and (w.get("project") == project.get("path") or w.get("project_name") == name)
         ]
@@ -11246,7 +13098,28 @@ def compute_tier_calibration(paths, min_outcomes=MIN_TIER_CALIBRATION_OUTCOMES,
     confirmed changes by ADR. Tier definitions are global, so it aggregates closed outcomes across
     ALL projects. A tier with fewer than `min_outcomes` closes makes no calibration claim."""
     items = read_ndjson(paths.work_items_path)
-    closed = [w for w in items if w.get("status") in ("closed", "done") and w.get("tier") in PATHWAY_TIERS]
+    approval_events = approval_events_for(paths)
+    closed = []
+    for item in items:
+        if item.get("status") not in ("closed", "done") or item.get("tier") not in PATHWAY_TIERS:
+            continue
+        work_id = item.get("work_id")
+        summary = (
+            work_status_summary(paths, work_id, approval_events_override=approval_events)
+            if work_id else None
+        )
+        current_item, current_summary = current_work_item_view(
+            paths, item, summary=summary, approval_events=approval_events
+        )
+        if current_item.get("status") not in ("closed", "done"):
+            continue
+        # Calibration learns from the same current, corroborated itinerary that status and
+        # routing expose. Persisted labels are history, not authority after an approval or proof
+        # loses corroboration.
+        projected = dict(current_item)
+        if current_summary is not None:
+            projected["itinerary"] = current_summary.get("itinerary", [])
+        closed.append(projected)
 
     def canon_key(pathway):
         return (pathway_sort_key(pathway), pathway)  # name tiebreak keeps off-canon pathways deterministically ordered
@@ -11605,6 +13478,12 @@ def print_result(result, json_out=False):
     if json_out:
         print(json.dumps(redact_obj(result), indent=2, sort_keys=True))
         return
+    if result.get("authority_command"):
+        print(json.dumps(redact_obj({
+            "findings": result.get("findings", []),
+            "authority_command": result["authority_command"],
+        }), indent=2, sort_keys=True))
+        return
     summary = {
         "findings": len(result.get("findings", [])),
         "records": len(result.get("records", [])) if "records" in result else None,
@@ -11618,9 +13497,10 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Operating layer workflow CLI")
     parser.add_argument("subcommand", choices=[
         "intel", "tools", "portfolio", "evidence", "ai-contract", "boundary", "agent-cards",
-        "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily", "approval-issue",
+        "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily", "approval-issue", "approval-invalidate",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
-        "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate", "all"
+        "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate",
+        "protocol-start", "protocol-status", "protocol-step", "all"
     ])
     parser.add_argument("--claude-home", default=str(DEFAULT_CLAUDE_HOME))
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME))
@@ -11668,6 +13548,11 @@ def build_parser():
     parser.add_argument("--na", action="store_true", help="work-cover: mark the pathway not-applicable (requires --reason).")
     parser.add_argument("--add", action="store_true", help="work-cover: append the pathway to the itinerary as newly required.")
     parser.add_argument("--release-receipt", help="approval-issue: exact release receipt JSON the single-use production approval binds to.")
+    parser.add_argument("--ticket-id", help="approval-invalidate: exact AT- ticket to revoke append-only.")
+    parser.add_argument("--consumer", help="approval-issue: exact root-bound consumer for a live release ticket.")
+    parser.add_argument("--step", help="development protocol step id.")
+    parser.add_argument("--development-protocol", action="store_true")
+    parser.add_argument("--instrument", action="append", default=[], help="Hash a prompt, rubric, scorer, or verifier dependency.")
     return parser
 
 
@@ -11717,6 +13602,8 @@ def main(argv=None):
         result = run_work_cover(args, paths)
     elif args.subcommand == "approval-issue":
         result = run_approval_issue(args, paths)
+    elif args.subcommand == "approval-invalidate":
+        result = run_approval_invalidate(args, paths)
     elif args.subcommand == "work-daily":
         result = run_work_daily(args, paths)
     elif args.subcommand == "proof-add":
@@ -11743,9 +13630,61 @@ def main(argv=None):
         result = run_tier_calibrate(args, paths)
     elif args.subcommand == "pathway-evaluate":
         result = run_pathway_evaluate(args, paths)
+    elif args.subcommand == "protocol-start":
+        if not args.work_id or not args.project or not args.goal:
+            result = {
+                "ok": False,
+                "error": "protocol-start requires --work-id, --project, and --goal",
+            }
+        else:
+            try:
+                project, goal = protocol_work_identity(paths, args.work_id)
+                if str(Path(resolve_project_dir(args.project, paths.projects_root)).resolve()) != project or args.goal != goal:
+                    result = {"ok": False, "error": "protocol project and goal must match the canonical work item"}
+                else:
+                    protocol = development_protocol.start(
+                        paths.development_protocol_path, args.work_id, project, goal,
+                    )
+                    update_work_item(paths, args.work_id, development_protocol_required=True)
+                    result = {
+                        "ok": True,
+                        "protocol": protocol,
+                        "work_id": args.work_id,
+                    }
+            except (OSError, ValueError, TypeError) as exc:
+                result = {"ok": False, "error": str(exc)}
+    elif args.subcommand == "protocol-status":
+        try:
+            result = development_protocol.status(
+                paths.development_protocol_path, args.work_id or "",
+                protocol_work_identity(paths, args.work_id or ""),
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            result = {"ok": False, "error": str(exc)}
+    elif args.subcommand == "protocol-step":
+        try:
+            result = development_protocol.step(
+                paths.development_protocol_path,
+                args.work_id or "",
+                args.step or "",
+                (args.result or "").replace("not-applicable", "na"),
+                args.evidence or "",
+                args.verify_cmd or "",
+                args.reason or "",
+                args.instrument,
+                expected_identity=protocol_work_identity(paths, args.work_id or ""),
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            result = {"ok": False, "error": str(exc)}
     else:
         result = run_all(args, paths)
     print_result(result, args.json)
+    if args.subcommand.startswith("protocol-") and result.get("ok") is False:
+        return 1
+    if args.subcommand in APPROVAL_MUTATION_SUBCOMMANDS:
+        records = result.get("records") if isinstance(result, dict) else None
+        if result.get("findings") or not isinstance(records, list) or not records:
+            return 2
     return 0
 
 

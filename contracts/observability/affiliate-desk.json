@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "contract_type": "observability_evidence_contract",
+  "project_key": "affiliate-desk",
+  "evidence_source": "Affiliate Desk local Creative runtime health and claim proof",
+  "metric_names": [
+    "affiliate_desk_claim_proof_facts_total",
+    "affiliate_desk_fail_closed_alerts_total",
+    "affiliate_desk_local_runtime_tests_total"
+  ],
+  "metric_label_values": {
+    "affiliate_desk_claim_proof_facts_total": {
+      "suite": ["CLAIM_PROOF"],
+      "status": ["PASS"]
+    },
+    "affiliate_desk_fail_closed_alerts_total": {
+      "component": ["CREATIVE_RUNTIME"],
+      "reason": ["OUTBOX_HEARTBEAT_MISSING"],
+      "status": ["FIRED"]
+    },
+    "affiliate_desk_local_runtime_tests_total": {
+      "suite": ["HEALTH_RUNTIME"],
+      "status": ["PASS"]
+    }
+  },
+  "metric_domains": {
+    "affiliate_desk_claim_proof_facts_total": [0, null],
+    "affiliate_desk_fail_closed_alerts_total": [0, null],
+    "affiliate_desk_local_runtime_tests_total": [0, null]
+  },
+  "event_names": [
+    "affiliate_desk.health.fail_closed_detected",
+    "affiliate_desk.runtime.check_completed",
+    "affiliate_desk.claim_proof.completed"
+  ],
+  "correlation_fields": [
+    "check_digest",
+    "component",
+    "environment_class",
+    "event_id",
+    "mode",
+    "observed_at",
+    "occurred_at",
+    "reason_code",
+    "risk_decision",
+    "runtime_digest",
+    "sequence",
+    "suite_run_id",
+    "trace_id"
+  ],
+  "correlation_hash_fields": ["check_digest", "runtime_digest"],
+  "correlation_timestamp_fields": ["observed_at", "occurred_at"],
+  "correlation_timestamp_order": ["occurred_at", "observed_at"],
+  "correlation_sequence_fields": ["sequence"],
+  "correlation_enum_values": {
+    "component": ["CREATIVE_RUNTIME"],
+    "environment_class": ["LOCAL"],
+    "mode": ["SAFE_TEST"],
+    "reason_code": ["OUTBOX_HEARTBEAT_MISSING"],
+    "risk_decision": ["DENY"]
+  },
+  "drill_incident": {
+    "event_name": "affiliate_desk.health.fail_closed_detected",
+    "component": "CREATIVE_RUNTIME",
+    "environment_class": "LOCAL",
+    "mode": "SAFE_TEST",
+    "reason_code": "OUTBOX_HEARTBEAT_MISSING",
+    "risk_decision": "DENY"
+  },
+  "drill_trace_name": "affiliate_desk.health.fail_closed",
+  "drill_alert": {
+    "alert_id": "creative-runtime-heartbeat-missing",
+    "condition": "creative runtime heartbeat missing in local health drill",
+    "status": "FIRED",
+    "safe_action": "KEEP_LOCAL_NO_PROMOTE"
+  },
+  "runbook_question_ids": [
+    "CONFIRM_FAIL_CLOSED_HEALTH_SIGNAL",
+    "CONFIRM_LOCAL_RUNTIME_PROOF",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION",
+    "CONFIRM_TRACE_AND_CHECK_BINDING"
+  ],
+  "runbook_evidence_fields": [
+    "alert_artifact",
+    "canary_artifact",
+    "log_artifact",
+    "metric_artifact",
+    "trace_artifact"
+  ],
+  "runbook_dispositions": ["KEEP_LOCAL_NO_PROMOTE"],
+  "runbook_answer_codes": {
+    "CONFIRM_FAIL_CLOSED_HEALTH_SIGNAL": "FAIL_CLOSED_HEALTH_SIGNAL_CONFIRMED",
+    "CONFIRM_LOCAL_RUNTIME_PROOF": "LOCAL_RUNTIME_PROOF_CONFIRMED",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": "SAFE_LOCAL_DISPOSITION_CONFIRMED",
+    "CONFIRM_TRACE_AND_CHECK_BINDING": "TRACE_AND_CHECK_BINDING_CONFIRMED"
+  },
+  "runbook_enum_values": {
+    "operator_disposition": ["KEEP_LOCAL_NO_PROMOTE"],
+    "reason_code": ["OUTBOX_HEARTBEAT_MISSING"],
+    "risk_decision": ["DENY"]
+  },
+  "runbook_missing_evidence": ["PRODUCTION_RUNTIME_RECEIPT"],
+  "runbook_answer_contract": {
+    "CONFIRM_FAIL_CLOSED_HEALTH_SIGNAL": {
+      "fields": {
+        "component": "identifier",
+        "reason_code": "enum",
+        "risk_decision": "enum"
+      },
+      "evidence": ["alert_artifact", "log_artifact"]
+    },
+    "CONFIRM_LOCAL_RUNTIME_PROOF": {
+      "fields": {
+        "observed_at": "timestamp",
+        "runtime_digest": "sha256",
+        "suite_run_id": "identifier"
+      },
+      "evidence": ["log_artifact", "metric_artifact"]
+    },
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": {
+      "fields": {
+        "operator_disposition": "enum",
+        "safe_action": "identifier",
+        "authorized_stage": "stage"
+      },
+      "evidence": ["alert_artifact", "canary_artifact"]
+    },
+    "CONFIRM_TRACE_AND_CHECK_BINDING": {
+      "fields": {
+        "trace_id": "identifier",
+        "check_digest": "sha256"
+      },
+      "evidence": ["log_artifact", "trace_artifact"]
+    }
+  },
+  "trusted_verifier_sha256": [
+    "fe75a9614b949cf348ac75623530c6308c2280c5ebb4cd44281e81bf5f435af8"
+  ]
+}

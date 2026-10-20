@@ -17,6 +17,7 @@ FILES=(
   "commands/pathway.md"
   "references/pathway-operating-layer.md"
   "hooks/approval-issue-guard.py"
+  "hooks/approval-issue-guard.sh"
 )
 
 link_file() {
@@ -43,5 +44,7 @@ done
 link_file \
   "$REPO/hooks/approval-issue-guard.py" \
   "$CX/hooks/approval-issue-guard.py"
+
+link_file "$REPO/hooks/approval-issue-guard.sh" "$CX/hooks/approval-issue-guard.sh"
 
 echo "Done. Verify: python3 \"$CL/scripts/tests/operating_layer_test.py\""

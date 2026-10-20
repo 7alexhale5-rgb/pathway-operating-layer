@@ -17,10 +17,9 @@ This repo follows ICM (Jake Van Clief's folder method): this file routes, each r
 | Run or extend the staleness/integrity test suite         | `tests/`      | [tests/CONTEXT.md](tests/CONTEXT.md)           | none   |
 | Read or update present state, feature artifacts, handoffs | `.planning/` | [.planning/CONTEXT.md](.planning/CONTEXT.md)   | `/pathway`, `/research-stack` |
 
-`hooks/`, `skills/`, `commands/` stay where their registrations expect them (the
-approval-issue guard, the `/pathway` skill and slash command) — `scripts/CONTEXT.md`
-points to each. `contracts/` and `security/` are installed paths that are not tracked in
-this checkout. Root files
+`contracts/`, `hooks/`, `security/`, `skills/`, `commands/` stay where their
+registrations expect them (the approval-issue guard, the `/pathway` skill and slash
+command, the observability contract) — `scripts/CONTEXT.md` points to each. Root files
 stay put: `README.md`, `LICENSE`, `install.sh`.
 
 ## Rules
@@ -34,7 +33,7 @@ stay put: `README.md`, `LICENSE`, `install.sh`.
 ## Verify
 
 - `python3 scripts/operating-layer.py --help`
-- `python3 scripts/tests/operating_layer_test.py` → `1192/1192 checks passed`
+- `python3 scripts/tests/operating_layer_test.py` → `1389/1389 checks passed` (or current count)
 
 ## Design
 

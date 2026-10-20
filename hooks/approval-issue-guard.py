@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Block direct agent Bash calls to the approval-issue CLI command.
+"""Defense-in-depth warning for direct agent approval mutation commands.
 
-This is a PreToolUse forcing function, not a human identity boundary. Alex can
-still run the reviewed command in a normal Terminal outside an agent session.
+The OS-owned helper and authority ledger are the identity boundary. This hook
+reduces accidental attempts on shells that actually invoke it.
+Register the sibling shell launcher for the conservative no-candidate fast path.
+The launcher invokes this parser with ``python3 -S`` when decoding is required.
 """
 from __future__ import annotations
 
-import json
-import re
-import shlex
 import sys
-from pathlib import Path
 
 
 DENIAL = (
-    "DENIED: approval-issue is reserved for Alex. "
-    "Review the exact command, then run it in a normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
+
+RESTRICTED_SUBCOMMANDS = frozenset({"approval-issue", "approval-invalidate"})
 
 BASH_TOOL_NAMES = frozenset(
     {
@@ -29,8 +29,8 @@ BASH_TOOL_NAMES = frozenset(
 )
 SHELL_NAMES = frozenset({"bash", "sh", "zsh"})
 SHELL_SEPARATORS = frozenset({";", "&", "|", "\n", "(", ")", "{", "}"})
-ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
-PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?\Z")
+ASSIGNMENT_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*=.*"
+PYTHON_PATTERN = r"python(?:\d+(?:\.\d+)*)?\Z"
 MAX_NESTED_COMMANDS = 32
 PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
 SHELL_VALUE_OPTIONS = frozenset({"--init-file", "--rcfile", "-o", "+o", "-O", "+O"})
@@ -82,39 +82,69 @@ VALUE_OPTIONS = frozenset(
         "--gate-target",
         "--tier",
         "--release-receipt",
+        "--ticket-id",
+        "--consumer",
     }
 )
 
 # Used only when shlex rejects malformed shell text. The match must begin at a
 # command boundary and place the real runner before the restricted subcommand.
-SUSPICIOUS_FALLBACK_RE = re.compile(
+SUSPICIOUS_FALLBACK_PATTERN = (
     r"(?:\A|&&|\|\||[;\n])\s*"
     r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
     r"(?:env\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?"
     r"(?:command\s+)?"
     r"(?:(?:\S*/)?python(?:\d+(?:\.\d+)*)?(?:\s+-\S+)*\s+)?"
-    r"(?:\S*/)?operating-layer\.py\s+[^;\n]*\bapproval-issue\b",
-    re.DOTALL | re.IGNORECASE,
+    r"(?:\S*/)?operating-layer\.py\s+[^;\n]*\bapproval-(?:issue|invalidate)\b"
 )
 
 
 def _basename(value: str) -> str:
-    return Path(value).name.casefold()
+    import os
+
+    return os.path.basename(value).casefold()
 
 
 def _normalize_quote_prefixes(command: str) -> str:
     """Make literal Bash ANSI-C and locale quotes parse like ordinary quotes."""
+    import re
+
     continued = command.replace("\\\r\n", "").replace("\\\n", "")
     return re.sub(r"\$(?=['\"])", "", continued)
 
 
-def _could_contain_issuance(command: str) -> bool:
+def _assignment_matches(value: str) -> bool:
+    import re
+
+    return re.fullmatch(ASSIGNMENT_PATTERN, value, flags=re.DOTALL) is not None
+
+
+def _python_matches(value: str) -> bool:
+    import re
+
+    return re.fullmatch(PYTHON_PATTERN, value) is not None
+
+
+def _suspicious_fallback_matches(command: str) -> bool:
+    import re
+
+    return re.search(
+        SUSPICIOUS_FALLBACK_PATTERN,
+        command,
+        flags=re.DOTALL | re.IGNORECASE,
+    ) is not None
+
+
+def _could_contain_restricted_subcommand(command: str) -> bool:
     """Cheap prefilter which cannot reject a literal shell-joined subcommand."""
-    dequoted = command.casefold().translate(str.maketrans("", "", "'\"\\"))
-    return "approval-issue" in dequoted
+    continued = command.replace("\\\r\n", "").replace("\\\n", "")
+    dequoted = continued.casefold().translate(str.maketrans("", "", "'\"\\$"))
+    return any(subcommand in dequoted for subcommand in RESTRICTED_SUBCOMMANDS)
 
 
 def _shell_tokens(command: str) -> list[str]:
+    import shlex
+
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n()<>{}")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
@@ -183,7 +213,7 @@ def _segments(tokens: list[str]):
 
 
 def _skip_assignments(tokens: list[str], index: int) -> int:
-    while index < len(tokens) and ASSIGNMENT_RE.fullmatch(tokens[index]):
+    while index < len(tokens) and _assignment_matches(tokens[index]):
         index += 1
     return index
 
@@ -286,7 +316,7 @@ def _env_command_tokens(tokens: list[str], env_index: int) -> list[str] | None:
         index = 0
         while index < len(arguments):
             token = arguments[index]
-            if ASSIGNMENT_RE.fullmatch(token):
+            if _assignment_matches(token):
                 index += 1
                 continue
             if token == "--":
@@ -310,6 +340,8 @@ def _env_command_tokens(tokens: list[str], env_index: int) -> list[str] | None:
                 if expansions > MAX_NESTED_COMMANDS:
                     return None
                 try:
+                    import shlex
+
                     split_tokens = shlex.split(
                         _normalize_quote_prefixes(split_value), comments=False, posix=True,
                     )
@@ -406,40 +438,51 @@ def _segment_issues(tokens: list[str], depth: int) -> bool:
             ):
                 if depth >= MAX_NESTED_COMMANDS:
                     return True
-                return command_issues_approval(tokens[option_index + 1], depth + 1)
+                return command_changes_approval_authority(tokens[option_index + 1], depth + 1)
             if option == "--" or not option.startswith(("-", "+")):
                 return False
             option_index += 1
         return False
 
     script_index = index
-    if PYTHON_RE.fullmatch(executable):
+    if _python_matches(executable):
         script_index = _python_script_index(tokens, index)
         if script_index is None or script_index >= len(tokens):
             return False
 
     if _basename(tokens[script_index]) != "operating-layer.py":
         return False
-    return _operating_subcommand(tokens[script_index + 1 :]) == "approval-issue"
+    return _operating_subcommand(tokens[script_index + 1 :]) in RESTRICTED_SUBCOMMANDS
 
 
-def command_issues_approval(command: str, depth: int = 0) -> bool:
+def command_changes_approval_authority(command: str, depth: int = 0) -> bool:
+    if not _could_contain_restricted_subcommand(command):
+        return False
     normalized = _normalize_quote_prefixes(command)
-    if not _could_contain_issuance(normalized):
+    if not _could_contain_restricted_subcommand(normalized):
         return False
     normalized = _strip_heredoc_bodies(normalized)
-    if not _could_contain_issuance(normalized):
+    if not _could_contain_restricted_subcommand(normalized):
         return False
     try:
         tokens = _shell_tokens(normalized)
     except ValueError:
-        return bool(SUSPICIOUS_FALLBACK_RE.search(normalized))
+        return _suspicious_fallback_matches(normalized)
     return any(_segment_issues(segment, depth) for segment in _segments(tokens))
 
 
 def main() -> int:
     try:
-        data = json.load(sys.stdin)
+        raw_input = sys.stdin.read()
+        # Without JSON escapes, every string's contents occur verbatim in the
+        # payload. The same conservative prefilter used on decoded commands can
+        # therefore prove absence here. Any backslash forces full decoding, so
+        # Unicode escapes and escaped shell quotes cannot hide a command.
+        if "\\" not in raw_input and not _could_contain_restricted_subcommand(raw_input):
+            return 0
+        import json
+
+        data = json.loads(raw_input)
         if not isinstance(data, dict) or data.get("tool_name") not in BASH_TOOL_NAMES:
             return 0
         tool_input = data.get("tool_input")
@@ -450,7 +493,7 @@ def main() -> int:
             for key in ("command", "cmd")
             if isinstance(tool_input.get(key), str)
         ]
-        if not any(command_issues_approval(command) for command in commands):
+        if not any(command_changes_approval_authority(command) for command in commands):
             return 0
     except Exception:
         return 0
