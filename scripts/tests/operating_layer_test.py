@@ -24,6 +24,7 @@ HERE = Path(__file__).resolve().parent
 CLI = (HERE / ".." / "operating-layer.py").resolve()
 REPO = HERE.parent.parent
 APPROVAL_GUARD = REPO / "hooks" / "approval-issue-guard.py"
+APPROVAL_GUARD_LAUNCHER = REPO / "hooks" / "approval-issue-guard.sh"
 APPROVAL_GUARD_VERIFIER = REPO / "scripts" / "verify-approval-issue-guard.py"
 APPROVAL_HELPER_SOURCE = REPO / "security" / "pathway-approval"
 INSTALLER = REPO / "install.sh"
@@ -164,7 +165,7 @@ def run_approval_guard(payload, env=None, raw=False):
         hook_env.update(env)
     hook_input = payload if raw else json.dumps(payload)
     return subprocess.run(
-        ["python3", "-S", str(APPROVAL_GUARD)],
+        ["/bin/bash", str(APPROVAL_GUARD_LAUNCHER)],
         input=hook_input,
         capture_output=True,
         text=True,
@@ -6982,8 +6983,8 @@ def test_approval_issue_guard_repeatable_verifier():
     check(installed.returncode == 0,
           f"verifier fixture installs guard links ({installed.stderr.strip()})")
 
-    claude_hook = claude_home / "hooks" / "approval-issue-guard.py"
-    codex_hook = codex_home / "hooks" / "approval-issue-guard.py"
+    claude_hook = claude_home / "hooks" / "approval-issue-guard.sh"
+    codex_hook = codex_home / "hooks" / "approval-issue-guard.sh"
     claude_settings = claude_home / "settings.json"
     codex_settings = codex_home / "hooks.json"
 
@@ -7010,8 +7011,8 @@ def test_approval_issue_guard_repeatable_verifier():
             encoding="utf-8",
         )
 
-    claude_command = f"python3 -S {claude_hook}"
-    codex_command = f"python3 -S {codex_hook}"
+    claude_command = f"/bin/bash {claude_hook}"
+    codex_command = f"/bin/bash {codex_hook}"
     save_settings(claude_settings, claude_command)
     save_settings(codex_settings, codex_command)
     save_settings(isolated_settings, claude_command)
@@ -7023,7 +7024,7 @@ def test_approval_issue_guard_repeatable_verifier():
     verifier_cmd = [
         sys.executable,
         str(APPROVAL_GUARD_VERIFIER),
-        "--repo-hook", str(APPROVAL_GUARD),
+        "--repo-hook", str(APPROVAL_GUARD_LAUNCHER),
         "--claude-hook", str(claude_hook),
         "--codex-hook", str(codex_hook),
         "--claude-settings", str(claude_settings),
@@ -7096,7 +7097,7 @@ def test_approval_issue_guard_repeatable_verifier():
     save_settings(codex_settings, f"python3 {codex_hook}")
     old_launch = verify()
     check(old_launch.returncode != 0 and "exact guard entry" in old_launch.stdout,
-          "approval guard verifier refuses configuration missing measured -S")
+          "approval guard verifier refuses configuration missing measured shell entry point")
     save_settings(codex_settings, codex_command)
 
     # Observe the interpreter flag in a child, rather than trusting argv text.
@@ -7104,8 +7105,8 @@ def test_approval_issue_guard_repeatable_verifier():
     spec = importlib.util.spec_from_file_location("guard_launch_verifier", APPROVAL_GUARD_VERIFIER)
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
-    launch_probe = ROOT / "guard-launch-probe.py"
-    launch_probe.write_text("import sys\nraise SystemExit(0 if sys.flags.no_site else 1)\n")
+    launch_probe = ROOT / "guard-launch-probe.sh"
+    launch_probe.write_text("python3 -S -c 'import sys; raise SystemExit(0 if sys.flags.no_site else 1)'\n")
     launch_result, _ = verifier.run_hook(launch_probe, "{}")
     check(launch_result.returncode == 0,
           "approval guard verifier actually launches Python without site initialization")
@@ -7128,15 +7129,9 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects invalid settings JSON")
     save_settings(claude_settings, claude_command)
 
-    slow_hook = ROOT / "slow-approval-guard.py"
+    slow_hook = ROOT / "slow-approval-guard.sh"
     slow_hook.write_text(
-        "import subprocess, sys, time\n"
-        "time.sleep(0.06)\n"
-        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
-        "input=sys.stdin.read(), capture_output=True, text=True)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "raise SystemExit(proc.returncode)\n",
+        "sleep 0.06\n" + f"/bin/bash {shlex.quote(str(APPROVAL_GUARD_LAUNCHER))}\n",
         encoding="utf-8",
     )
     point_installed_links(slow_hook)
@@ -7144,17 +7139,10 @@ def test_approval_issue_guard_repeatable_verifier():
     check(slow.returncode != 0 and "p95" in slow.stdout.lower(),
           "approval guard verifier rejects a hook at or above the p95 limit")
 
-    mutating_hook = ROOT / "mutating-approval-guard.py"
+    mutating_hook = ROOT / "mutating-approval-guard.sh"
     mutating_hook.write_text(
-        "import subprocess, sys\n"
-        "from pathlib import Path\n"
-        f"with Path({str(ledger)!r}).open('ab') as handle:\n"
-        "    handle.write(b'test-only-change\\n')\n"
-        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
-        "input=sys.stdin.read(), capture_output=True, text=True)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "raise SystemExit(proc.returncode)\n",
+        f"printf 'test-only-change\\n' >> {shlex.quote(str(ledger))}\n"
+        + f"/bin/bash {shlex.quote(str(APPROVAL_GUARD_LAUNCHER))}\n",
         encoding="utf-8",
     )
     point_installed_links(mutating_hook)
@@ -7164,7 +7152,7 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects any ledger mutation")
 
     ledger.write_bytes(ledger_bytes)
-    point_installed_links(APPROVAL_GUARD)
+    point_installed_links(APPROVAL_GUARD_LAUNCHER)
 
     codex_hook.unlink()
     codex_hook.symlink_to(CLI)

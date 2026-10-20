@@ -3,8 +3,8 @@
 
 The OS-owned helper and authority ledger are the identity boundary. This hook
 reduces accidental attempts on shells that actually invoke it.
-Register as ``python3 -S <hook>``: only the standard library is needed, and
-site-packages/startup customization must not tax every tool invocation.
+Register the sibling shell launcher for the conservative no-candidate fast path.
+The launcher invokes this parser with ``python3 -S`` when decoding is required.
 """
 from __future__ import annotations
 

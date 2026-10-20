@@ -14,9 +14,9 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_REPO_HOOK = REPO / "hooks" / "approval-issue-guard.py"
-DEFAULT_CLAUDE_HOOK = Path.home() / ".claude" / "hooks" / "approval-issue-guard.py"
-DEFAULT_CODEX_HOOK = Path.home() / ".codex" / "hooks" / "approval-issue-guard.py"
+DEFAULT_REPO_HOOK = REPO / "hooks" / "approval-issue-guard.sh"
+DEFAULT_CLAUDE_HOOK = Path.home() / ".claude" / "hooks" / "approval-issue-guard.sh"
+DEFAULT_CODEX_HOOK = Path.home() / ".codex" / "hooks" / "approval-issue-guard.sh"
 DEFAULT_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 DEFAULT_CODEX_SETTINGS = Path.home() / ".codex" / "hooks.json"
 DEFAULT_ISOLATED_SETTINGS = (
@@ -36,8 +36,8 @@ def default_output_root() -> Path:
 
 DEFAULT_LEDGER = default_output_root() / "operator-intelligence" / "approvals.ndjson"
 DENIAL = (
-    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
-    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
 
 BLOCKED_FIXTURES = (
@@ -145,11 +145,10 @@ def check_symlink(installed: Path, tracked: Path, label: str, failures: list[str
 
 
 def run_hook(hook: Path, raw_input: str) -> tuple[subprocess.CompletedProcess, float]:
-    # Match the registered command, including PATH-selected python3 and -S.
-    # This stdlib-only hook does not need site packages or startup customizations.
+    # Match the registered shell entry point, including its conservative fast path.
     started = time.perf_counter_ns()
     proc = subprocess.run(
-        ["python3", "-S", str(hook)],
+        ["/bin/bash", str(hook)],
         input=raw_input,
         capture_output=True,
         text=True,
@@ -230,19 +229,19 @@ def main(argv: list[str] | None = None) -> int:
     check_settings(
         claude_settings,
         "Claude settings",
-        f"python3 -S {claude_hook}",
+        f"/bin/bash {claude_hook}",
         failures,
     )
     check_settings(
         codex_settings,
         "Codex settings",
-        f"python3 -S {codex_hook}",
+        f"/bin/bash {codex_hook}",
         failures,
     )
     check_settings(
         isolated_settings,
         "isolated GLM/Kimi settings",
-        f"python3 -S {claude_hook}",
+        f"/bin/bash {claude_hook}",
         failures,
     )
 
