@@ -876,6 +876,12 @@ def _dispatch(argv, config, identity):
     if any(argument.startswith("--ledger") or argument.startswith("--authority-dir") for argument in command_argv):
         raise AuthorityError("path-override-refused", "Production authority paths cannot be overridden.")
     args = _build_parser().parse_args(command_argv)
+    if config.enforce_installed_location and args.command in {"issue", "invalidate"}:
+        raise AuthorityError(
+            "fresh-authentication-unavailable",
+            "Approval mutation is held: sudo identity does not prove fresh authentication. "
+            "An independently authenticating authority service is required.",
+        )
     _validate_runtime(config, allow_missing_ledger=args.command == "bootstrap")
     handlers = {
         "bootstrap": _command_bootstrap,

@@ -94,30 +94,24 @@ canary record remains evidence of a hold and cannot be relabeled by passing
 
 ## Approval Authority (single-use waivers and production approvals)
 
-The approval authority is separated from every project checkout. On macOS, the
-fixed trust root is the root-owned, mode `0644` ledger at
-`/Library/Application Support/Pathway/approval-authority.ndjson`; the only
-writer is the root-owned executable at `/usr/local/libexec/pathway-approval`.
-Neither path is configurable through arguments or environment variables. The
-repository CLI cannot issue, consume, or invalidate live authority. It validates
-the requested subject and renders the exact helper command for Alex to review
-and run from a normal Terminal with fresh `sudo` authentication.
+verified: 2026-10-20T11:00:03-05:00
 
-The tracked installer is a one-time trust ceremony because it starts in a
-mutable checkout. Never execute that repository copy directly with `sudo`.
-Review the installer and helper digests, stage both with fixed Apple tools into
-`/private/var/root/pathway-approval-bootstrap`, verify the root-owned staged bytes, and
-run only the verified staged installer. Steady-state separation begins only
-after the helper, authority directory, ledger, and password-required sudoers
-rule are root-owned and the installed helper verifies the full path chain. Do
-not treat an installed copy as proof that a particular approval was
-human-authorized; each authority mutation still requires a fresh, explicit
-Terminal invocation.
+**Implementation hold:** root ownership and sudo environment fields do not prove
+fresh human consent when an administrator credential can be cached. No independent
+per-mutation authentication service is implemented. The helper refuses issuance and
+invalidation, and the production CLI refuses protected release and waiver credit.
+OS-owned ledger records remain audit history only. Ordinary unprotected proof flows
+are unchanged. This is an engineering gap; entering a password does not complete it.
+
+The paths and ticket format below describe the intended authority contract, not a
+working fresh-consent boundary. The installer validates destination ancestors before
+copying, but installation does not lift this hold. An independently authenticating
+service and adversarial verification are required before protected credit can resume.
 
 The one-time bootstrap preserves the digest-pinned user ledger only as audit
 history and invalidates every legacy issuance. No legacy ticket receives live
 root authority merely because its old bytes were imported. Any still-needed
-waiver or release must be issued afresh through the installed helper.
+waiver or release remains blocked until the independent authentication boundary exists.
 
 A ticket is content-bound by a SHA-256 over its canonical JSON subject and has a
 15-minute validity window. The helper requires the final consumer before issue
@@ -125,8 +119,8 @@ and atomically appends both the `issued` and exact `consumed` events. This keeps
 the reviewed command bound to one release proof ID or one
 `work-cover:<work_id>:<pathway>` consumer. The legacy user ledger at
 `operator-intelligence/approvals.ndjson` remains historical evidence only and
-cannot grant live credit. The OS ledger is the durable authority that every
-status, routing, carry-forward, and closeout decision re-verifies.
+cannot grant live credit. OS ledger history cannot currently grant protected credit in status, routing,
+carry-forward, or closeout.
 
 Two subjects exist. A release production approval binds kind, work ID, project,
 stage, and the release receipt's exact SHA-256, so editing one byte of the

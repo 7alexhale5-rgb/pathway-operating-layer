@@ -3010,19 +3010,12 @@ def parse_observability_verifier_command(command, cwd, verifier_path):
 def run_observability_verifier_argv(
         argv, cwd, timeout=120, expected_verifier_sha256="", trusted_sha256=()):
     """Execute only when the verifier bytes still match receipt and contract trust."""
-    try:
-        if expected_verifier_sha256:
-            current_sha256 = sha256_file(argv[1]) if len(argv) >= 2 else ""
-            if (current_sha256 != expected_verifier_sha256
-                    or current_sha256 not in set(trusted_sha256 or ())):
-                return 126, "", 0, ""
-        proc = subprocess.run(
-            argv, cwd=cwd or None, capture_output=True, text=True, timeout=timeout, shell=False
-        )
-        stdout_bytes = (proc.stdout or "").encode("utf-8", "replace")
-        return proc.returncode, hashlib.sha256(stdout_bytes).hexdigest(), len(stdout_bytes), proc.stdout or ""
-    except Exception:
-        return 1, "", 0, ""
+    binding = parse_generic_verifier_command(shlex.join(argv), cwd)
+    digest = binding.get("source_sha256", "")
+    if (not expected_verifier_sha256 or digest != expected_verifier_sha256
+            or digest not in set(trusted_sha256 or ())):
+        return 126, "", 0, ""
+    return run_generic_verifier_snapshot(binding, cwd, timeout, isolate_source_dir=True)
 
 
 def _observability_mutant_bytes(original):
@@ -3856,48 +3849,13 @@ def approval_subject_digest(subject):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _ephemeral_approval_store(paths):
-    """Whether this is an isolated canonical-suite store with no symlink escape.
-
-    The lexical output root matters. A same-user replacement of the live output directory with a
-    symlink into a test-shaped path must never make the default CLI unprotected.
-    """
-    try:
-        lexical_root = Path(
-            getattr(paths, "output_root_input", Path(paths.approvals_path).parents[1])
-        ).absolute()
-        test_parent = Path("/private/tmp").absolute()
-        relative = lexical_root.relative_to(test_parent)
-        if (
-            len(relative.parts) != 2
-            or not relative.parts[0].startswith("operating-layer-test-")
-            or relative.parts[1] != "out"
-        ):
-            return False
-        if lexical_root.resolve(strict=True) != lexical_root:
-            return False
-        suite_root = test_parent / relative.parts[0]
-        metadata = suite_root.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
-            return False
-        if stat.S_IMODE(metadata.st_mode) & 0o077:
-            return False
-        expected = lexical_root / "operator-intelligence" / "approvals.ndjson"
-        actual = Path(paths.approvals_path).absolute()
-        if actual != expected or actual.resolve(strict=False) != actual:
-            return False
-        cursor = suite_root
-        for part in ("out", "operator-intelligence"):
-            cursor = cursor / part
-            if cursor.exists() and cursor.is_symlink():
-                return False
-        return True
-    except (AttributeError, IndexError, OSError, RuntimeError, ValueError):
-        return False
-
-
 def approval_store_is_protected(paths):
-    return not _ephemeral_approval_store(paths)
+    """Production always uses OS authority, regardless of output-root pathname.
+
+    Tests may inject a separate authority policy into an imported module; the
+    production CLI has no environment, pathname, or argument escape hatch.
+    """
+    return True
 
 
 def _authority_path_is_os_owned(path):
@@ -3937,6 +3895,14 @@ def approval_events_for(paths):
     """
     if not approval_store_is_protected(paths):
         return _strict_approval_events(paths.approvals_path)
+    # Root ownership does not establish fresh human consent when the same user
+    # can obtain root with a cached sudo credential. Retain history, but withhold
+    # protected credit until independently authenticated mutations are available.
+    return _invalid_approval_events("fresh-authentication-unavailable")
+
+
+def _os_owned_approval_events(paths):
+    """Read historical OS-owned records; ownership alone grants no live credit."""
     authority_path = Path(
         getattr(paths, "approval_authority_path", APPROVAL_AUTHORITY_PATH)
     )
@@ -4927,17 +4893,18 @@ def latest_carry_forward_for_work(paths, work_id):
         return latest
     proofs = read_ndjson(paths.proofs_path)
     approval_events = approval_events_for(paths)
-    release_proof_ids = {
-        baton.get("proof_id") for baton in release_batons if baton.get("proof_id")
-    }
+    latest_release = max(
+        enumerate(release_batons),
+        key=lambda item: (item[1].get("created_at", ""), item[0]),
+    )[1]
+    release_proof_ids = {latest_release.get("proof_id")}
     valid_release_proof = next(
         (
             proof for proof in reversed(proofs)
             if proof.get("work_id") == work_id
-            and (
-                proof.get("pathway") == "release"
-                or proof.get("proof_id") in release_proof_ids
-            )
+            and proof.get("pathway") == "release"
+            and proof.get("proof_id") in release_proof_ids
+            and proof_is_verified(proof)
             and release_approval_corroborated(proof, approval_events)
         ),
         None,
@@ -9329,16 +9296,18 @@ def run_approval_issue(args, paths):
                     recommendation_id = str(receipt_payload.get("recommendation_id") or "")
             except (OSError, TypeError, ValueError):
                 recommendation_id = ""
+        evidence_path = str(Path(getattr(args, "evidence", None) or receipt_path).expanduser())
+        proof_type = getattr(args, "proof_type", None) or "artifact"
         derived_consumer = proof_id_for(
-            str(receipt_path), args.work_id, "release", "artifact", recommendation_id
+            evidence_path, args.work_id, "release", proof_type, recommendation_id
         )
         provided_consumer = (getattr(args, "consumer", None) or "").strip()
         if provided_consumer and provided_consumer != derived_consumer:
             return _refuse(
                 "approval-issue-consumer-mismatch",
-                "--consumer does not match the exact proof id derived from the reviewed receipt.",
+                "--consumer does not match the intended evidence, proof type, and recommendation.",
                 f"Use --consumer {derived_consumer}, then log the same receipt with the same "
-                "work id, release pathway, artifact proof type, and recommendation id.",
+                "work id, release pathway, --evidence, --proof-type, and recommendation id.",
             )
         authority_consumer = provided_consumer or derived_consumer
     if approval_store_is_protected(paths):
@@ -9767,6 +9736,14 @@ def run_work_log(args, paths):
     }
 
 
+def protocol_work_identity(paths, work_id):
+    item = next((row for row in read_ndjson(paths.work_items_path)
+                 if row.get("work_id") == work_id), None)
+    if not item or not item.get("project") or not item.get("goal"):
+        raise ValueError("protocol requires an existing canonical work item")
+    return resolve_project_dir(item["project"], paths.projects_root), item["goal"]
+
+
 def run_work_close(args, paths):
     if not args.work_id:
         return {
@@ -9785,7 +9762,9 @@ def run_work_close(args, paths):
     summary = work_status_summary(paths, args.work_id)
     findings = []
     protocol_ready, protocol_status = development_protocol.enforce_close(
-        paths.development_protocol_path, args.work_id
+        paths.development_protocol_path, args.work_id,
+        (resolve_project_dir(summary["work_item"]["project"], paths.projects_root),
+         summary["work_item"]["goal"]) if summary.get("work_item") else None,
     )
     if (summary.get("work_item") or {}).get("development_protocol_required") and not protocol_status.get("exists"):
         protocol_ready = False
@@ -13499,6 +13478,12 @@ def print_result(result, json_out=False):
     if json_out:
         print(json.dumps(redact_obj(result), indent=2, sort_keys=True))
         return
+    if result.get("authority_command"):
+        print(json.dumps(redact_obj({
+            "findings": result.get("findings", []),
+            "authority_command": result["authority_command"],
+        }), indent=2, sort_keys=True))
+        return
     summary = {
         "findings": len(result.get("findings", [])),
         "records": len(result.get("records", [])) if "records" in result else None,
@@ -13653,21 +13638,12 @@ def main(argv=None):
             }
         else:
             try:
-                exists = any(
-                    item.get("work_id") == args.work_id
-                    for item in read_ndjson(paths.work_items_path)
-                )
-                if not exists:
-                    result = {
-                        "ok": False,
-                        "error": "protocol-start requires an existing pathway work item; run work-start first",
-                    }
+                project, goal = protocol_work_identity(paths, args.work_id)
+                if resolve_project_dir(args.project, paths.projects_root) != project or args.goal != goal:
+                    result = {"ok": False, "error": "protocol project and goal must match the canonical work item"}
                 else:
                     protocol = development_protocol.start(
-                        paths.development_protocol_path,
-                        args.work_id,
-                        args.project,
-                        args.goal,
+                        paths.development_protocol_path, args.work_id, project, goal,
                     )
                     update_work_item(paths, args.work_id, development_protocol_required=True)
                     result = {
@@ -13679,7 +13655,10 @@ def main(argv=None):
                 result = {"ok": False, "error": str(exc)}
     elif args.subcommand == "protocol-status":
         try:
-            result = development_protocol.status(paths.development_protocol_path, args.work_id or "")
+            result = development_protocol.status(
+                paths.development_protocol_path, args.work_id or "",
+                protocol_work_identity(paths, args.work_id or ""),
+            )
         except (OSError, ValueError, TypeError) as exc:
             result = {"ok": False, "error": str(exc)}
     elif args.subcommand == "protocol-step":
@@ -13693,6 +13672,7 @@ def main(argv=None):
                 args.verify_cmd or "",
                 args.reason or "",
                 args.instrument,
+                expected_identity=protocol_work_identity(paths, args.work_id or ""),
             )
         except (OSError, ValueError, TypeError) as exc:
             result = {"ok": False, "error": str(exc)}

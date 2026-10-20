@@ -28,8 +28,8 @@ APPROVAL_GUARD_VERIFIER = REPO / "scripts" / "verify-approval-issue-guard.py"
 APPROVAL_HELPER_SOURCE = REPO / "security" / "pathway-approval"
 INSTALLER = REPO / "install.sh"
 APPROVAL_GUARD_DENIAL = (
-    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
-    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
 _TEST_ROOT_PARENT = Path("/private/tmp").resolve()
 ROOT = _TEST_ROOT_PARENT / f"operating-layer-test-{uuid.uuid4().hex}"
@@ -127,7 +127,7 @@ def touch_old(path, days=90):
 def base_cmd(subcommand, extra=None):
     cmd = [
         sys.executable,
-        str(CLI),
+        str(HERE / "operating_layer_test_harness.py"),
         subcommand,
         "--claude-home", str(ROOT / "claude"),
         "--codex-home", str(ROOT / "codex"),
@@ -665,6 +665,8 @@ def load_cli(tag):
     spec = importlib.util.spec_from_file_location(f"opl_{tag}", CLI)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    from operating_layer_test_harness import approval_store_is_protected
+    mod.approval_store_is_protected = approval_store_is_protected
     return mod
 
 
@@ -935,6 +937,72 @@ def test_improve_and_compare_control_loop():
     summary = compare.get("summary", {})
     check(summary.get("added", 0) + summary.get("worsened", 0) > 0, "compare detects added or worsened findings")
     check(Path(compare["report"]).exists() and Path(compare["html"]).exists(), "compare writes markdown and html report")
+
+
+def test_security_corrections_regressions():
+    result = subprocess.run(
+        [sys.executable, str(HERE / "security_corrections_test.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    check(
+        result.returncode == 0,
+        "production authority and immutable observability regressions: "
+        + result.stderr,
+    )
+
+def test_protocol_uses_canonical_work_identity():
+    reset()
+    project = ROOT / "projects" / "identity-ui"
+    write("projects/identity-ui/README.md", "# UI\n")
+    goal = "Build a UI screen"
+    start, _ = run("work-start", ["--project", str(project), "--goal", goal])
+    work_id = start["work_id"]
+    for supplied_project, supplied_goal in ((str(project), "typo"), (str(ROOT), goal)):
+        result, _ = run(
+            "protocol-start",
+            [
+                "--work-id",
+                work_id,
+                "--project",
+                supplied_project,
+                "--goal",
+                supplied_goal,
+            ],
+        )
+        check(
+            result.get("ok") is False,
+            "protocol enrollment rejects mismatched canonical identity",
+        )
+    result, _ = run(
+        "protocol-start",
+        ["--work-id", work_id, "--project", "identity-ui", "--goal", goal],
+    )
+    check(
+        result.get("ok") is True, "protocol enrollment resolves canonical project alias"
+    )
+    rows = result["protocol"]["steps"]
+    check(
+        next(row for row in rows if row["step_id"] == "design")["required"],
+        "canonical UI goal retains required design",
+    )
+    ledger = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    items = [json.loads(line) for line in ledger.read_text().splitlines() if line]
+    for item in items:
+        if item["work_id"] == work_id:
+            item["goal"] = "Changed UI scope"
+    ledger.write_text("".join(json.dumps(item) + "\n" for item in items))
+    result, _ = run("protocol-status", ["--work-id", work_id])
+    check(
+        result.get("ok") is False and "identity" in result.get("error", ""),
+        "later scope changes invalidate protocol identity",
+    )
+    result, _ = run("work-close", ["--work-id", work_id])
+    check(
+        "work-close-protocol-incomplete" in ids(result),
+        "closeout rejects changed protocol identity",
+    )
 
 
 def test_daily_work_envelope_and_pathway_cooperation():
@@ -1584,6 +1652,8 @@ def test_selected_work_scoring_regression_kills_aggregate_mutant():
         # operating-layer.py imports its sibling development_protocol at module load, so a mutant
         # copied alone cannot start and dies before any assertion can kill it.
         shutil.copy2(CLI.parent / "development_protocol.py", mutant_scripts / "development_protocol.py")
+        shutil.copy2(HERE / "operating_layer_test_harness.py",
+                     mutant_tests_dir / "operating_layer_test_harness.py")
 
         namespace = runpy.run_path(str(mutant_tests), run_name="selected_work_aggregate_mutant")
         mutant_test = namespace["test_pathway_next_scores_only_selected_active_work"]
@@ -8341,8 +8411,8 @@ def test_approval_invalidation_revokes_exact_ticket_credit():
         "proofs_path": proofs_path,
         "carry_forward_path": carry_forward_path,
     })()
-    check(opl.latest_carry_forward_for_work(view_paths, wid).get("credits_pathway") is True,
-          "a currently corroborated release baton remains proved")
+    check(opl.latest_carry_forward_for_work(view_paths, wid).get("credits_pathway") is False,
+          "approval alone cannot credit a release baton without a complete verified proof")
     run("approval-invalidate", [
         "--ticket-id", release_ticket, "--reason", "release ticket came from an agent bypass",
     ])
@@ -9204,6 +9274,8 @@ def main():
         test_agent_cards_scope_excludes_helper_and_legacy_records,
         test_all_smoke_outputs_parse_and_redact,
         test_improve_and_compare_control_loop,
+        test_security_corrections_regressions,
+        test_protocol_uses_canonical_work_identity,
         test_daily_work_envelope_and_pathway_cooperation,
         test_daily_work_stale_measurement_detection,
         test_work_close_extracts_learning_candidate,

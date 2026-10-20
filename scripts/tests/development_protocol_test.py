@@ -63,6 +63,47 @@ def main():
         assert blocked["status"] == "blocked"
         assert blocked["verifier_exit"] == 127
         assert blocked["output_sha256"] == ""
+        alias = root / "project-link"
+        alias.symlink_to(root, target_is_directory=True)
+        for index, legacy in enumerate((str(root) + "/", str(alias))):
+            wid = "W-legacy-" + str(index)
+            d.start(store, wid, legacy, "legacy goal")
+            expected = (str(root.resolve()), "legacy goal")
+            d.status(store, wid, expected)
+            assert next(r for r in d.read(store) if r["work_id"] == wid)["project"] == expected[0]
+            assert d.start(store, wid, expected[0], expected[1])["project"] == expected[0]
+            for wrong in ((str(root.parent), "legacy goal"), (expected[0], "changed goal")):
+                try:
+                    d.status(store, wid, wrong)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("changed legacy identity accepted")
+        d.start(store, "W-legacy-start", str(alias), "legacy goal")
+        assert d.start(store, "W-legacy-start", str(root.resolve()), "legacy goal")["project"] == str(root.resolve())
+        for transition in ("running", "blocked", "pass"):
+            wid = "W-reopen-" + transition
+            proof = root / (wid + ".txt")
+            proof.write_text("v1")
+            d.start(store, wid, str(root), "build a UI screen")
+            for sid, _ in d.STEPS:
+                step_proof = proof if sid == "build" else root / (wid + "-" + sid + ".txt")
+                step_proof.write_text("v1")
+                assert d.step(store, wid, sid, "pass", str(step_proof), "true")["ok"]
+            assert d.status(store, wid)["ready"]
+            if transition == "pass":
+                # A changed verifier must revoke later completion even with identical bytes.
+                d.step(store, wid, "build", "pass", str(proof), "test -f " + str(proof))
+            else:
+                d.step(store, wid, "build", transition)
+                saved = next(r for r in d.read(store) if r["work_id"] == wid)
+                assert next(s for s in saved["steps"] if s["step_id"] == "closeout")["status"] == "pending"
+                proof.write_text("v2")
+                assert d.step(store, wid, "build", "pass", str(proof), "true")["ok"]
+                saved = next(r for r in d.read(store) if r["work_id"] == wid)
+                assert next(s for s in saved["steps"] if s["step_id"] == "review")["status"] == "pending"
+            assert not d.status(store, wid)["ready"]
+            assert "review" in d.status(store, wid)["open"]
     print("development protocol tests: passed")
 
 

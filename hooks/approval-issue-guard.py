@@ -12,8 +12,8 @@ import sys
 
 
 DENIAL = (
-    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
-    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
 
 RESTRICTED_SUBCOMMANDS = frozenset({"approval-issue", "approval-invalidate"})
