@@ -91,6 +91,25 @@ def main():
             assert next(r for r in d.read(store) if r["work_id"] == "W-relative")["project"] == str(root.resolve())
         finally:
             os.chdir(original_cwd)
+        first = root / "project-a"
+        second = root / "project-b"
+        first.mkdir()
+        second.mkdir()
+        d.start(store, "W-relative-legacy", str(first), "same goal")
+        rows = d.read(store)
+        legacy = next(r for r in rows if r["work_id"] == "W-relative-legacy")
+        legacy["project"] = "."  # Actual pre-canonicalization persisted shape.
+        for row in legacy["steps"]:
+            row["status"] = "not-applicable"
+        d.write(store, rows)
+        try:
+            os.chdir(second)
+            migrated = d.status(store, "W-relative-legacy", (str(second.resolve()), "same goal"))
+            assert not migrated["ready"]
+            saved = next(r for r in d.read(store) if r["work_id"] == "W-relative-legacy")
+            assert all(row["status"] == "pending" for row in saved["steps"])
+        finally:
+            os.chdir(original_cwd)
         for transition in ("running", "blocked", "pass"):
             wid = "W-reopen-" + transition
             proof = root / (wid + ".txt")

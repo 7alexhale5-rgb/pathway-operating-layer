@@ -78,6 +78,7 @@ def write(path, records):
 
 
 def start(path, work_id, project, goal, required=()):
+    project = str(Path(project).expanduser().resolve())
     with locked(path):
         records = read(path)
         existing = next((r for r in records if r["work_id"] == work_id), None)
@@ -198,6 +199,12 @@ def validate_identity(record, expected_identity):
             equivalent = stored.resolve() == expected.resolve()
         if not equivalent or record["goal"] != goal:
             raise ValueError("protocol identity no longer matches canonical work item")
+        if not stored.is_absolute():
+            # Old relative identities did not record their original cwd. Do not
+            # carry completion across an identity we can no longer establish.
+            for row in record["steps"]:
+                row["status"] = "pending"
+                row["exception_reason"] = "Legacy relative project has no recorded base; repeat this step."
         record["project"] = str(project)
 
 

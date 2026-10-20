@@ -599,6 +599,7 @@ class ACLIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "libexec"
             path.mkdir(mode=0o755)
+            path.chmod(0o755)
             subprocess.run(["/bin/chmod", "+a", "everyone allow add_file,delete_child", str(path)], check=True)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
             with self.assertRaises(authority.AuthorityError) as caught:
