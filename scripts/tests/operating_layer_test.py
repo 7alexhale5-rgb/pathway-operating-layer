@@ -6834,6 +6834,34 @@ def test_approval_issue_guard_allows_non_issuance_text_and_fail_open_inputs():
         check(proc.stdout == "" and proc.stderr == "",
               f"approval guard is silent for {label}")
 
+    # The raw-input fast path must not hide JSON escapes or shell-joined names.
+    for subcommand in ("approval-issue", "approval-invalidate"):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {
+            "command": "operating-layer.py " + subcommand + " --help"}})
+        for index, char in enumerate(subcommand):
+            escaped = subcommand[:index] + "\\u%04x" % ord(char) + subcommand[index + 1:]
+            proc = run_approval_guard(payload.replace(subcommand, escaped), raw=True)
+            check(proc.returncode == 2 and proc.stderr == APPROVAL_GUARD_DENIAL,
+                  f"approval guard decodes escaped {subcommand} character {index}")
+        joined = subcommand[:3] + "'" + subcommand[3:7] + "'" + subcommand[7:]
+        proc = run_approval_guard({"tool_name": "Bash", "tool_input": {
+            "command": "operating-layer.py " + joined + " --help"}})
+        check(proc.returncode == 2 and proc.stderr == APPROVAL_GUARD_DENIAL,
+              f"approval guard keeps unescaped shell-joined {subcommand} blocked")
+
+    # A fresh interpreter proves the optimization removes imports, not timing
+    # samples or validation: ordinary commands never initialize the JSON stack.
+    probe = subprocess.run(
+        ["python3", "-S", "-c",
+         "import runpy, sys; "
+         f"guard=runpy.run_path({str(APPROVAL_GUARD)!r}); "
+         "assert guard['main']() == 0; assert 'json' not in sys.modules"],
+        input='{"tool_name":"Bash","tool_input":{"command":"true"}}',
+        capture_output=True, text=True, timeout=5,
+    )
+    check(probe.returncode == 0,
+          "approval guard skips JSON initialization only for proven noncandidate input")
+
     invalid = run_approval_guard("{not-json", raw=True)
     check(invalid.returncode == 0, "approval guard fails open on invalid JSON")
     check(invalid.stdout == "" and invalid.stderr == "",
