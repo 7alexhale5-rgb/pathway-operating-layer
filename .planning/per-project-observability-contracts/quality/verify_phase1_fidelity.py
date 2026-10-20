@@ -11,7 +11,9 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[3]
-BASE_REF = "9ecedb6"
+# Published history contains identical source bytes under this reachable commit.
+BASE_REF = "7bcb274b84d484f8b473972049fdb00a3a50a8e1"
+BASE_ENGINE_SHA256 = "0f77ec3726e50809373102a3f3450f3b9ab44edef8c453bb2c75e0a076a1de45"
 BASE_COMMIT = "9ecedb620169fdcd5919e5cd7f3fd26d9ac67387"
 ENGINE_PATH = "scripts/operating-layer.py"
 CONTRACT_PATH = REPO / "contracts" / "observability" / "rainman-thorp.json"
@@ -264,8 +266,10 @@ def main() -> int:
 
     expected_keys = set(METADATA) | set(CONTRACT_TO_CONSTANT)
     mismatches = [contract_error] if contract_error else []
-    if resolved != BASE_COMMIT:
-        mismatches.append(f"base ref resolved to {resolved}, expected {BASE_COMMIT}")
+    if resolved != BASE_REF:
+        mismatches.append(f"base ref resolved to {resolved}, expected {BASE_REF}")
+    if sha256_bytes(source) != BASE_ENGINE_SHA256:
+        mismatches.append("published base engine differs from the historical source bytes")
     if set(contract) != expected_keys:
         mismatches.append("contract key set differs from the 23 extracted fields plus 4 metadata fields")
     for key, expected in METADATA.items():
