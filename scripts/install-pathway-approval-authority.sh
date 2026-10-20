@@ -96,8 +96,11 @@ require_staged_file "$STAGED_HELPER"
 [ "$(digest_of "$STAGED_HELPER")" = "$EXPECTED_HELPER_SHA256" ] || fail "staged helper digest mismatch"
 [ -x /usr/sbin/visudo ] || fail "visudo is required"
 
+umask 022
+/usr/bin/install -d -o root -g wheel -m 0755 /usr/local
 /usr/bin/install -d -o root -g wheel -m 0755 "$INSTALL_DIR"
 /usr/bin/install -d -o root -g wheel -m 0755 "$AUTHORITY_DIR"
+umask 077
 /usr/bin/install -o root -g wheel -m 0755 "$STAGED_HELPER" "$INSTALL_HELPER"
 [ "$(digest_of "$INSTALL_HELPER")" = "$EXPECTED_HELPER_SHA256" ] || fail "final installed helper digest mismatch"
 

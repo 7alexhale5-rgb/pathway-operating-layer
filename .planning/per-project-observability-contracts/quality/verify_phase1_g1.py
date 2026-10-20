@@ -9,9 +9,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from verify_phase1_fidelity import CONTRACT_PATH, validate_g1_receipt
+
 
 REPO = Path(__file__).resolve().parents[3]
-RECEIPT_PATH = Path(__file__).with_name("receipt-phase1-g1.json")
+RECEIPT_PATH = Path(__file__).with_name("receipt-phase1-g1-2026-10-20.json")
 WORK_ID = "W-20260830-pathway-operating-layer-per-project-observabilit-e65d28"
 BASE_COMMIT = "9ecedb620169fdcd5919e5cd7f3fd26d9ac67387"
 COMMANDS = (
@@ -51,6 +53,9 @@ def run(command: list[str]) -> str:
 
 
 def main() -> int:
+    errors = validate_g1_receipt(RECEIPT_PATH, sha256_file(CONTRACT_PATH))
+    if errors:
+        return fail("; ".join(errors))
     try:
         receipt = json.loads(RECEIPT_PATH.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:

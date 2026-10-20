@@ -269,7 +269,7 @@ def main() -> int:
     if set(contract) != expected_keys:
         mismatches.append("contract key set differs from the 23 extracted fields plus 4 metadata fields")
     for key, expected in METADATA.items():
-        if contract.get(key) != expected:
+        if type(contract.get(key)) is not type(expected) or contract.get(key) != expected:
             mismatches.append(f"metadata mismatch: {key}")
     for contract_key, constant_name in CONTRACT_TO_CONSTANT.items():
         if constant_name not in constants:

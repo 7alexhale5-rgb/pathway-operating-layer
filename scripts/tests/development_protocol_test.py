@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import tempfile
 from pathlib import Path
 import sys
@@ -51,6 +52,17 @@ def main():
             raise AssertionError("N/A without reason accepted")
         evidence.write_text("changed\n")
         assert "karpathy-spec" in d.status(store, "W-test")["open"]
+        missing_project = root / "removed-project"
+        missing_project.mkdir()
+        d.start(store, "W-missing", str(missing_project), "verify a missing project")
+        missing_project.rmdir()
+        failed = d.step(store, "W-missing", "pathway", "pass", str(evidence), "true")
+        assert not failed["ok"]
+        record = next(row for row in json.loads(store.read_text()) if row["work_id"] == "W-missing")
+        blocked = next(row for row in record["steps"] if row["step_id"] == "pathway")
+        assert blocked["status"] == "blocked"
+        assert blocked["verifier_exit"] == 127
+        assert blocked["output_sha256"] == ""
     print("development protocol tests: passed")
 
 

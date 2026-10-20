@@ -634,7 +634,9 @@ def test_agents_observability_contract_uses_generic_drill_envelope():
           "Rainman market-timestamp mutation cannot bypass the generic alias join")
 
     future_log = json.loads(json.dumps(log))
-    future_log["records"][0]["occurred_at"] = "2026-09-01T21:18:42Z"
+    future_log["records"][0]["occurred_at"] = (
+        observed_at + opl.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     future_log_path = write(
         "out/operator-artifacts/agents-g3-future-log.json",
         json.dumps(future_log) + "\n",
@@ -5989,7 +5991,7 @@ def test_phase1_g1_verifier_rejects_ambiguous_receipts():
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
     receipt_path = (
-        REPO / ".planning/per-project-observability-contracts/quality/receipt-phase1-g1.json"
+        REPO / ".planning/per-project-observability-contracts/quality/receipt-phase1-g1-2026-10-20.json"
     )
     raw = receipt_path.read_text(encoding="utf-8")
     contract_sha256 = verifier.sha256_bytes(verifier.CONTRACT_PATH.read_bytes())
@@ -6026,6 +6028,31 @@ def test_phase1_g1_verifier_rejects_ambiguous_receipts():
           and verifier.validate_g1_receipt(missing_lineage_path, contract_sha256)
           and verifier.validate_g1_receipt(wrong_verification_path, contract_sha256),
           "malformed carry-forward, lineage, and verification fields cannot earn G1 credit")
+
+
+    # Exercise the entrypoints with temporary mutants, without changing tracked evidence.
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    contract = json.loads(verifier.CONTRACT_PATH.read_text())
+    contract["schema_version"] = True
+    mutant_contract = write("out/g1-mutants/bool-contract.json", json.dumps(contract))
+    with patch.object(verifier, "CONTRACT_PATH", mutant_contract), patch.object(sys, "argv", [str(verifier_path)]), contextlib.redirect_stdout(io.StringIO()):
+        check(verifier.main() == 1, "fidelity rejects boolean metadata in place of integer")
+
+    sys.path.insert(0, str(verifier_path.parent))
+    try:
+        runner_spec = importlib.util.spec_from_file_location("phase1_g1_runner", verifier_path.with_name("verify_phase1_g1.py"))
+        runner = importlib.util.module_from_spec(runner_spec)
+        runner_spec.loader.exec_module(runner)
+    finally:
+        sys.path.pop(0)
+    altered = json.loads(raw)
+    altered["verification"]["canonical_suite"] = "forged result"
+    altered_path = write("out/g1-mutants/altered-verification.json", json.dumps(altered))
+    with patch.object(runner, "RECEIPT_PATH", altered_path), patch.object(runner, "run", side_effect=AssertionError("altered receipt reached execution")), contextlib.redirect_stdout(io.StringIO()):
+        check(runner.main() == 1, "G1 command rejects altered verification before executing checks")
 
 
 def test_audit_proof_integrity_uses_active_outcomes_and_reports_history():

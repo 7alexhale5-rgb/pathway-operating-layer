@@ -265,6 +265,8 @@ def step(
                     output_hash = hashlib.sha256(completed.stdout).hexdigest()
                 except subprocess.TimeoutExpired:
                     code, output_hash = 124, ""
+                except OSError:
+                    code, output_hash = 127, ""
                 stable = sha == digest(p) and all(
                     digest(q) == h for q, h in dependencies.items()
                 )
