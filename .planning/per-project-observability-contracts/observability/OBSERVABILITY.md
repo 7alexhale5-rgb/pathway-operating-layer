@@ -1,5 +1,5 @@
 ---
-timestamp: 2026-09-01
+timestamp: 2026-10-20T09:51:24-05:00
 work_id: W-20260830-pathway-operating-layer-per-project-observabilit-e65d28
 phase: 3
 gate: G3
@@ -40,6 +40,12 @@ The real watcher bytes then returned exit 3 and wrote the alert into the isolate
 temporary ops-lead inbox; no Agents checkout path was written.
 
 ## Verification
+
+The 2026-10-20 cleanup reran the live report, isolated three-failure watcher drill,
+and both negative canaries before regenerating the current receipt. The focused
+G3 verifier passed all seven artifact mutation checks; Agents source hashes
+remained unchanged. This receipt expires after twelve hours and must be
+regenerated from another executed drill before later runtime credit.
 
 - Valid receipt: contract resolution `agents -> agents.json`, receipt validation
   has no errors, executed verifier exits 0, `proof_is_verified=True`, scope is

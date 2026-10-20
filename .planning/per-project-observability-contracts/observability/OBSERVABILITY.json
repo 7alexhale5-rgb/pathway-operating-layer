@@ -18,8 +18,8 @@
     "authorized_stage": "NONE",
     "current_verdict": "NO_PROMOTE",
     "runbook_version": "specialist-fleet-watch-v1",
-    "issued_at": "2026-09-01T21:18:41Z",
-    "expires_at": "2026-09-02T09:18:41Z",
+    "issued_at": "2026-10-20T14:47:42Z",
+    "expires_at": "2026-10-21T02:47:42Z",
     "verifier_source_sha256": "9aeeba57895902f839416eee64a2fe764084ad2601df60dedf1e41c939c00a61",
     "runtime_present": true,
     "telemetry_present": true,
@@ -59,12 +59,12 @@
     "canary_artifact": "agents-g3-canary.json",
     "verifier_artifact": "verify_agents_runtime_receipt.py",
     "artifact_sha256": {
-      "metric_artifact": "cad6a0ec94da2aa07f3ed93e6d6be5747d5c25d4e9833942a2d2f9488f4a493c",
-      "log_artifact": "b91e7ad150be5376f24907912e902bcc49ea2f07b385bd597cc73acad549ddd4",
-      "trace_artifact": "5f071caa25a62e5f413fcceafcccbfa52260e967cc34479b9b61301f1255b352",
-      "alert_artifact": "c025b6020661c8d0d7d0ecbdf9063e6f05a028e78005f41f7beeda7e705a27b0",
-      "runbook_drill_artifact": "5abad4225f79fdef7a4f3043160d4df598d6ec77d26a62ba27d7cd0b72d53cd1",
-      "canary_artifact": "a732e2179d023a70879abaf3b8e4eaf19311bb8ed4951570f86e7bcc1baf5d77",
+      "metric_artifact": "44519b098df24f12851bdbc7df22ffe140d49dda9b698ace9b14ff3261e5c43a",
+      "log_artifact": "a12aabafc68620778c5daf0e665e1675dbc0d155bf108e839969aea2b3107d96",
+      "trace_artifact": "7dbed4f5d96194aea2897e0773ac6893ab6dbe18bbb1408471116f081d370653",
+      "alert_artifact": "95cd9f494b84993e02455874f487cefd15b7718734cde8a4db47fef2fb78ec25",
+      "runbook_drill_artifact": "b36abc6b9a9eb9ff3b8b60ff449f4e56ac784461c59e8c19a111f07d53a8802d",
+      "canary_artifact": "a7c9ddd3e206e24575bc610e1f72bb054bd41a9417d334c913d38eb2b8e6139d",
       "verifier_artifact": "9aeeba57895902f839416eee64a2fe764084ad2601df60dedf1e41c939c00a61"
     }
   }
