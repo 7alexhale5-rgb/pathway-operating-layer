@@ -955,6 +955,16 @@ def test_security_corrections_regressions():
 
 def test_protocol_uses_canonical_work_identity():
     reset()
+    missing = "./missing-protocol-project"
+    missing_start, _ = run("work-start", ["--project", missing, "--goal", "Fix missing project", "--development-protocol"])
+    missing_id = missing_start["work_id"]
+    missing_status, _ = run("protocol-status", ["--work-id", missing_id])
+    check(missing_status.get("exists") is True and "error" not in missing_status,
+          "nonexistent relative project retains canonical protocol status identity")
+    missing_step, _ = run("protocol-step", ["--work-id", missing_id, "--step", missing_status["steps"][0]["step_id"], "--result", "running"])
+    check(missing_step.get("ok") is True,
+          "nonexistent relative project retains canonical protocol step identity")
+    reset()
     project = ROOT / "projects" / "identity-ui"
     write("projects/identity-ui/README.md", "# UI\n")
     goal = "Build a UI screen"
@@ -7079,9 +7089,9 @@ def test_approval_issue_guard_repeatable_verifier():
     check(summary.get("run_count") == 120, "approval guard verifier honors its run-count override")
     check(summary.get("settings_checked") == 3,
           "approval guard verifier reports all three settings files")
-    check(summary.get("symlinks_checked") == 2,
-          "approval guard verifier reports both installed links")
-    check(summary.get("blocked_fixtures") == 21 and summary.get("allowed_fixtures") == 12,
+    check(summary.get("symlinks_checked") == 4,
+          "approval guard verifier reports installed launcher and parser links")
+    check(summary.get("blocked_fixtures") == 24 and summary.get("allowed_fixtures") == 12,
           "approval guard verifier runs fixtures through source and both installed links")
     check(isinstance(summary.get("p95_ms"), (int, float)) and summary.get("p95_ms") < 50,
           "approval guard verifier reports p95 below 50ms")
@@ -7153,6 +7163,20 @@ def test_approval_issue_guard_repeatable_verifier():
 
     ledger.write_bytes(ledger_bytes)
     point_installed_links(APPROVAL_GUARD_LAUNCHER)
+
+    parser_link = codex_hook.with_suffix(".py")
+    parser_link.unlink()
+    parser_link.write_text(APPROVAL_GUARD.read_text())
+    detached_parser = verify()
+    check(detached_parser.returncode != 0 and "installed parser" in detached_parser.stdout,
+          "approval guard verifier rejects a detached parser copy")
+    parser_link.unlink()
+    parser_link.symlink_to(CLI)
+    wrong_parser = verify()
+    check(wrong_parser.returncode != 0 and "installed parser" in wrong_parser.stdout,
+          "approval guard verifier rejects an incorrectly targeted parser")
+    parser_link.unlink()
+    parser_link.symlink_to(APPROVAL_GUARD)
 
     codex_hook.unlink()
     codex_hook.symlink_to(CLI)

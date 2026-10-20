@@ -42,6 +42,7 @@ DENIAL = (
 
 BLOCKED_FIXTURES = (
     ("command", "operating-layer.py approval-issue --help"),
+    ("command", "operating-layer.py approv''al-issue --help"),
     ("cmd", "python3 scripts/operating-layer.py approval-issue --help"),
     ("command", "TEST_ONLY=1 operating-layer.py approval-issue --help"),
     ("command", "sh -c 'operating-layer.py approval-issue --help'"),
@@ -226,6 +227,11 @@ def main(argv: list[str] | None = None) -> int:
     codex_link_valid = check_symlink(
         codex_hook, repo_hook, "Codex installed hook", failures,
     )
+    parser_links_valid = True
+    for installed, label in ((claude_hook, "Claude"), (codex_hook, "Codex")):
+        valid = check_symlink(installed.with_suffix(".py"), DEFAULT_REPO_HOOK.with_suffix(".py"),
+                              f"{label} installed parser", failures)
+        parser_links_valid = valid and parser_links_valid
     check_settings(
         claude_settings,
         "Claude settings",
@@ -246,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     fixture_hooks = (repo_hook, claude_hook, codex_hook) if (
-        claude_link_valid and codex_link_valid
+        claude_link_valid and codex_link_valid and parser_links_valid
     ) else (repo_hook,)
     blocked_count, allowed_count = check_fixtures(fixture_hooks, failures)
 
@@ -283,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "fail" if failures else "pass",
         "run_count": args.runs,
         "settings_checked": 3,
-        "symlinks_checked": 2,
+        "symlinks_checked": 4,
         "blocked_fixtures": blocked_count,
         "allowed_fixtures": allowed_count,
         "p95_ms": round(p95_ms, 3) if p95_ms is not None else None,

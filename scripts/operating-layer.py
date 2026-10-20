@@ -8951,7 +8951,7 @@ def run_work_start(args, paths):
     # every downstream consumer (verify cwd, boundary checks, portfolio joins, stable_work_id)
     # treats this field as a path, and stable_work_id would otherwise hash it relative to the
     # invoking process's cwd, making the work_id unstable across invocation directories.
-    project_path = resolve_project_dir(args.project, paths.projects_root)
+    project_path = str(Path(resolve_project_dir(args.project, paths.projects_root)).resolve())
     work_id = stable_work_id(project_path, args.goal)
     context = current_work_context(paths, project_path)
     existing = next((w for w in read_ndjson(paths.work_items_path) if w.get("work_id") == work_id), None)
