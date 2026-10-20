@@ -4,6 +4,15 @@ work_id: W-20260817-pathway-operating-layer-block-agent-driven-bash--2064b8
 verified: 2026-08-17
 status: build proof passed; human trust and live sessions pending
 
+## Current launch contract
+
+The guard uses only the Python standard library. Configure each installed handler as
+`python3 -S <absolute-installed-hook-path>` with timeout 5. The verifier resolves
+`python3` from PATH and measures that same launch, including process startup.
+`-S` omits site initialization and user sitecustomize code; it does not skip guard checks.
+The verifier refuses a settings/measurement mismatch. The p95 limit remains 50ms.
+Earlier timings below are historical, not proof of the current host under load.
+
 ## Result
 
 The tracked guard is built and installed.

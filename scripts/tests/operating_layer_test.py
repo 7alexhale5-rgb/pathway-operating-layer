@@ -164,7 +164,7 @@ def run_approval_guard(payload, env=None, raw=False):
         hook_env.update(env)
     hook_input = payload if raw else json.dumps(payload)
     return subprocess.run(
-        [sys.executable, str(APPROVAL_GUARD)],
+        ["python3", "-S", str(APPROVAL_GUARD)],
         input=hook_input,
         capture_output=True,
         text=True,
@@ -6912,8 +6912,8 @@ def test_approval_issue_guard_repeatable_verifier():
             encoding="utf-8",
         )
 
-    claude_command = f"python3 {claude_hook}"
-    codex_command = f"python3 {codex_hook}"
+    claude_command = f"python3 -S {claude_hook}"
+    codex_command = f"python3 -S {codex_hook}"
     save_settings(claude_settings, claude_command)
     save_settings(codex_settings, codex_command)
     save_settings(isolated_settings, claude_command)
@@ -6994,6 +6994,23 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier reports the fake ledger line count")
     check(all(path.read_bytes() == before for path, before in settings_before.items()),
           "approval guard verifier leaves all settings bytes unchanged")
+
+    save_settings(codex_settings, f"python3 {codex_hook}")
+    old_launch = verify()
+    check(old_launch.returncode != 0 and "exact guard entry" in old_launch.stdout,
+          "approval guard verifier refuses configuration missing measured -S")
+    save_settings(codex_settings, codex_command)
+
+    # Observe the interpreter flag in a child, rather than trusting argv text.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("guard_launch_verifier", APPROVAL_GUARD_VERIFIER)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    launch_probe = ROOT / "guard-launch-probe.py"
+    launch_probe.write_text("import sys\nraise SystemExit(0 if sys.flags.no_site else 1)\n")
+    launch_result, _ = verifier.run_hook(launch_probe, "{}")
+    check(launch_result.returncode == 0,
+          "approval guard verifier actually launches Python without site initialization")
 
     save_settings(codex_settings, codex_command, after=True)
     not_last = verify()

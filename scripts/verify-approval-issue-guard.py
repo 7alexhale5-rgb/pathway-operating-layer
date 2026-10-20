@@ -145,9 +145,11 @@ def check_symlink(installed: Path, tracked: Path, label: str, failures: list[str
 
 
 def run_hook(hook: Path, raw_input: str) -> tuple[subprocess.CompletedProcess, float]:
+    # Match the registered command, including PATH-selected python3 and -S.
+    # This stdlib-only hook does not need site packages or startup customizations.
     started = time.perf_counter_ns()
     proc = subprocess.run(
-        [sys.executable, str(hook)],
+        ["python3", "-S", str(hook)],
         input=raw_input,
         capture_output=True,
         text=True,
@@ -228,19 +230,19 @@ def main(argv: list[str] | None = None) -> int:
     check_settings(
         claude_settings,
         "Claude settings",
-        f"python3 {claude_hook}",
+        f"python3 -S {claude_hook}",
         failures,
     )
     check_settings(
         codex_settings,
         "Codex settings",
-        f"python3 {codex_hook}",
+        f"python3 -S {codex_hook}",
         failures,
     )
     check_settings(
         isolated_settings,
         "isolated GLM/Kimi settings",
-        f"python3 {claude_hook}",
+        f"python3 -S {claude_hook}",
         failures,
     )
 
