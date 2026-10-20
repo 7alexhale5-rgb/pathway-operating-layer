@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import os
 import tempfile
 from pathlib import Path
 import sys
@@ -81,6 +82,15 @@ def main():
                     raise AssertionError("changed legacy identity accepted")
         d.start(store, "W-legacy-start", str(alias), "legacy goal")
         assert d.start(store, "W-legacy-start", str(root.resolve()), "legacy goal")["project"] == str(root.resolve())
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(root)
+            d.start(store, "W-relative", ".", "legacy goal")
+            d.status(store, "W-relative", (str(root.resolve()), "legacy goal"))
+            assert d.start(store, "W-relative", str(root.resolve()), "legacy goal")["project"] == str(root.resolve())
+            assert next(r for r in d.read(store) if r["work_id"] == "W-relative")["project"] == str(root.resolve())
+        finally:
+            os.chdir(original_cwd)
         for transition in ("running", "blocked", "pass"):
             wid = "W-reopen-" + transition
             proof = root / (wid + ".txt")

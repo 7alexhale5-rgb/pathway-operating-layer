@@ -17,6 +17,7 @@ import pwd
 import re
 import secrets
 import stat
+import subprocess
 import sys
 import unicodedata
 from pathlib import Path
@@ -420,6 +421,22 @@ def _relative_parts(path, anchor):
         raise AuthorityError("unsafe-path", "Authority path escapes its fixed security anchor.") from exc
 
 
+def _require_no_acl(path):
+    # This authority is macOS-only in production. Reject all extended ACLs,
+    # including inherited ones; POSIX mode bits alone cannot prove isolation.
+    if sys.platform != "darwin":
+        return
+    try:
+        result = subprocess.run(
+            ["/bin/ls", "-lde", str(path)], capture_output=True, text=True,
+            check=True, timeout=5, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AuthorityError("acl-unverified", "Cannot verify authority path ACLs.") from exc
+    if any(re.match(r"^\s*\d+:", line) for line in result.stdout.splitlines()[1:]):
+        raise AuthorityError("acl-refused", "Authority paths cannot carry extended ACLs.")
+
+
 def _require_secure_node(path, *, owner_uid, directory):
     try:
         metadata = os.lstat(path)
@@ -434,6 +451,7 @@ def _require_secure_node(path, *, owner_uid, directory):
         raise AuthorityError("unsafe-owner", "Authority paths must be owned by the authority account.")
     if metadata.st_mode & 0o022:
         raise AuthorityError("user-writable-authority", "Authority paths cannot be group or other writable.")
+    _require_no_acl(path)
     if not directory and metadata.st_nlink != 1:
         raise AuthorityError("hardlink-refused", "Authority files must have exactly one hard link.")
     return metadata

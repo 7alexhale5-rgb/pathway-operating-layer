@@ -194,7 +194,7 @@ def validate_identity(record, expected_identity):
         stored = Path(record["project"]).expanduser()
         expected = Path(project).expanduser()
         equivalent = record["project"] == str(project)
-        if not equivalent and stored.is_absolute() and expected.is_absolute():
+        if not equivalent and expected.is_absolute():
             equivalent = stored.resolve() == expected.resolve()
         if not equivalent or record["goal"] != goal:
             raise ValueError("protocol identity no longer matches canonical work item")

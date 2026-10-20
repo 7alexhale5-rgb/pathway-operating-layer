@@ -12,8 +12,8 @@
 #   /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/scripts/install-pathway-approval-authority.sh /private/var/root/pathway-approval-bootstrap/install.sh
 #   /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/security/pathway-approval /private/var/root/pathway-approval-bootstrap/pathway-approval
 #   /usr/bin/printf '%s  %s\n' '<INSTALLER_SHA256>' '/private/var/root/pathway-approval-bootstrap/install.sh' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-#   /usr/bin/printf '%s  %s\n' '01fd846bafe9cbf45831919cff9f40e2e774b69f77c7affb16e262cb0cb3762d' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-#   /usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 '<INSTALLER_SHA256>' --expected-helper-sha256 '01fd846bafe9cbf45831919cff9f40e2e774b69f77c7affb16e262cb0cb3762d'
+#   /usr/bin/printf '%s  %s\n' '9b33a208386aabdd8440edd0c163142399b77248c19d25ffade2bb035edda1f6' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
+#   /usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 '<INSTALLER_SHA256>' --expected-helper-sha256 '9b33a208386aabdd8440edd0c163142399b77248c19d25ffade2bb035edda1f6'
 #
 # No project-owned code executes as root before both staged hashes match. The
 # staged directory is preserved as a root-owned audit artifact. Steady-state OS
@@ -28,7 +28,7 @@ export PATH
 STAGE_DIR="/private/var/root/pathway-approval-bootstrap"
 STAGED_INSTALLER="$STAGE_DIR/install.sh"
 STAGED_HELPER="$STAGE_DIR/pathway-approval"
-PINNED_HELPER_SHA256="01fd846bafe9cbf45831919cff9f40e2e774b69f77c7affb16e262cb0cb3762d"
+PINNED_HELPER_SHA256="9b33a208386aabdd8440edd0c163142399b77248c19d25ffade2bb035edda1f6"
 INSTALL_DIR="/usr/local/libexec"
 INSTALL_HELPER="$INSTALL_DIR/pathway-approval"
 AUTHORITY_DIR="/Library/Application Support/Pathway"
@@ -47,12 +47,20 @@ digest_of() {
   /usr/bin/shasum -a 256 -- "$1" | /usr/bin/awk '{print $1}'
 }
 
+require_no_acl() {
+  acl_listing=$(/bin/ls -lde "$1") || fail "cannot inspect destination ACLs"
+  if printf '%s\n' "$acl_listing" | /usr/bin/awk 'NR > 1 && $1 ~ /^[0-9]+:$/ { found=1 } END { exit !found }'; then
+    fail "extended ACLs are not permitted on protected paths: $1"
+  fi
+}
+
 require_staged_file() {
   path=$1
   [ -f "$path" ] && [ ! -L "$path" ] || fail "staged trust file is missing, non-regular, or symlinked"
   [ "$(/usr/bin/stat -f '%u' -- "$path")" = "0" ] || fail "staged trust file must be root-owned"
   [ "$(/usr/bin/stat -f '%g' -- "$path")" = "0" ] || fail "staged trust file must be wheel-grouped"
   [ "$(/usr/bin/stat -f '%Lp' -- "$path")" = "500" ] || fail "staged trust file must be mode 0500"
+  require_no_acl "$path"
 }
 
 [ "$(/usr/bin/id -u)" -eq 0 ] || fail "run only the verified root-owned staged installer through sudo"
@@ -104,6 +112,7 @@ require_secure_dir() {
   [ "$(/usr/bin/stat -f '%u' -- "$secure_dir")" = "0" ] || fail "destination is not root-owned: $secure_dir"
   mode=$(/usr/bin/stat -f '%Lp' -- "$secure_dir")
   [ $((0$mode & 022)) -eq 0 ] || fail "destination is writable by non-root: $secure_dir"
+  require_no_acl "$secure_dir"
 }
 for path in / /private /private/var /private/var/root "$STAGE_DIR" /usr /Library /private/etc; do
   require_secure_dir "$path"
@@ -118,6 +127,8 @@ for path in /usr/local "$INSTALL_DIR" "/Library/Application Support" "$AUTHORITY
   require_secure_dir "$path"
 done
 [ ! -L "$INSTALL_HELPER" ] || fail "installed helper is symlinked"
+[ ! -e "$INSTALL_HELPER" ] || require_no_acl "$INSTALL_HELPER"
+[ ! -e "$SUDOERS_PATH" ] || require_no_acl "$SUDOERS_PATH"
 [ ! -L "$SUDOERS_PATH" ] || fail "sudoers destination is symlinked"
 umask 077
 /usr/bin/install -o root -g wheel -m 0755 "$STAGED_HELPER" "$INSTALL_HELPER"

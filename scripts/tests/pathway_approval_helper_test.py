@@ -15,6 +15,8 @@ import os
 import pwd
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -548,9 +550,10 @@ class RuntimeBoundaryTests(AuthorityFixture):
         )
         self.assertEqual(imports, {
             "argparse", "datetime", "fcntl", "hashlib", "json", "os", "pwd",
-            "re", "secrets", "stat", "sys", "unicodedata", "pathlib",
+            "re", "secrets", "stat", "subprocess", "sys", "unicodedata", "pathlib",
         })
-        self.assertNotIn("subprocess", source)
+        self.assertIn('["/bin/ls", "-lde", str(path)]', source)
+        self.assertNotIn("shell=True", source)
         self.assertNotIn("importlib", source)
         self.assertNotIn("sys.path", source)
         self.assertNotIn("/Users/", source)
@@ -588,6 +591,23 @@ class RuntimeBoundaryTests(AuthorityFixture):
         )
         for unsafe in ("$(dirname ", "$(id ", "$(mktemp ", "\ninstall ", "\nchmod ", "\n  rm "):
             self.assertNotIn(unsafe, source)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS ACL regression")
+class ACLIsolationTests(unittest.TestCase):
+    def test_posix_safe_directory_with_write_acl_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "libexec"
+            path.mkdir(mode=0o755)
+            subprocess.run(["/bin/chmod", "+a", "everyone allow add_file,delete_child", str(path)], check=True)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+            with self.assertRaises(authority.AuthorityError) as caught:
+                authority._require_secure_node(path, owner_uid=os.getuid(), directory=True)
+            self.assertEqual(caught.exception.code, "acl-refused")
+            source = INSTALLER.read_text()
+            function = source[source.index("require_no_acl() {"):source.index("require_staged_file() {")]
+            result = subprocess.run(["/bin/sh", "-c", 'fail() { exit 42; };\n' + function + '\nrequire_no_acl "$1"', "fixture", str(path)])
+            self.assertEqual(result.returncode, 42)
 
 
 if __name__ == "__main__":
