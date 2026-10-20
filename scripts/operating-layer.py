@@ -13639,7 +13639,7 @@ def main(argv=None):
         else:
             try:
                 project, goal = protocol_work_identity(paths, args.work_id)
-                if resolve_project_dir(args.project, paths.projects_root) != project or args.goal != goal:
+                if str(Path(resolve_project_dir(args.project, paths.projects_root)).resolve()) != project or args.goal != goal:
                     result = {"ok": False, "error": "protocol project and goal must match the canonical work item"}
                 else:
                     protocol = development_protocol.start(

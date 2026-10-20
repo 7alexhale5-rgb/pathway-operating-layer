@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser_links_valid = True
     for installed, label in ((claude_hook, "Claude"), (codex_hook, "Codex")):
-        valid = check_symlink(installed.with_suffix(".py"), DEFAULT_REPO_HOOK.with_suffix(".py"),
+        valid = check_symlink(installed.parent / "approval-issue-guard.py", repo_hook.resolve().parent / "approval-issue-guard.py",
                               f"{label} installed parser", failures)
         parser_links_valid = valid and parser_links_valid
     check_settings(

@@ -958,6 +958,8 @@ def test_protocol_uses_canonical_work_identity():
     missing = "./missing-protocol-project"
     missing_start, _ = run("work-start", ["--project", missing, "--goal", "Fix missing project", "--development-protocol"])
     missing_id = missing_start["work_id"]
+    explicit, _ = run("protocol-start", ["--work-id", missing_id, "--project", missing, "--goal", "Fix missing project"])
+    check(explicit.get("ok") is True, "explicit enrollment resolves nonexistent relative project identity")
     missing_status, _ = run("protocol-status", ["--work-id", missing_id])
     check(missing_status.get("exists") is True and "error" not in missing_status,
           "nonexistent relative project retains canonical protocol status identity")
@@ -7139,6 +7141,7 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects invalid settings JSON")
     save_settings(claude_settings, claude_command)
 
+    (ROOT / "approval-issue-guard.py").symlink_to(APPROVAL_GUARD)
     slow_hook = ROOT / "slow-approval-guard.sh"
     slow_hook.write_text(
         "sleep 0.06\n" + f"/bin/bash {shlex.quote(str(APPROVAL_GUARD_LAUNCHER))}\n",
@@ -7163,6 +7166,35 @@ def test_approval_issue_guard_repeatable_verifier():
 
     ledger.write_bytes(ledger_bytes)
     point_installed_links(APPROVAL_GUARD_LAUNCHER)
+
+    alternate_source = ROOT / "alternate-checkout" / "hooks"
+    alternate_source.mkdir(parents=True)
+    alternate_launcher = alternate_source / "approval-issue-guard.sh"
+    alternate_parser = alternate_source / "approval-issue-guard.py"
+    alternate_launcher.write_bytes(APPROVAL_GUARD_LAUNCHER.read_bytes())
+    alternate_parser.write_bytes(APPROVAL_GUARD.read_bytes())
+    point_installed_links(alternate_launcher)
+    for link in (claude_hook.with_suffix(".py"), codex_hook.with_suffix(".py")):
+        link.unlink()
+        link.symlink_to(alternate_parser)
+    alternate_checkout = verify_source(alternate_launcher)
+    check("tracked source" not in alternate_checkout.stdout
+          and verifier_json(alternate_checkout).get("blocked_fixtures") == 24,
+          "verifier binds parser to the selected alternate source checkout")
+    point_installed_links(APPROVAL_GUARD_LAUNCHER)
+    for link in (claude_hook.with_suffix(".py"), codex_hook.with_suffix(".py")):
+        link.unlink()
+        link.symlink_to(APPROVAL_GUARD)
+
+    alternate_hook = codex_hook.parent / "guard.sh"
+    alternate_hook.symlink_to(APPROVAL_GUARD_LAUNCHER)
+    save_settings(codex_settings, f"/bin/bash {alternate_hook}")
+    alternate_command = list(verifier_cmd)
+    alternate_command[alternate_command.index("--codex-hook") + 1] = str(alternate_hook)
+    alternate = subprocess.run(alternate_command, capture_output=True, text=True, timeout=240)
+    check("installed parser" not in alternate.stdout,
+          "alternate launcher basename checks its actual parser sibling")
+    save_settings(codex_settings, codex_command)
 
     parser_link = codex_hook.with_suffix(".py")
     parser_link.unlink()
