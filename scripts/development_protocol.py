@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -34,6 +35,19 @@ STEPS = [
     ("closeout", "/closeout-stack"),
 ]
 TERMINAL = {"passed", "not-applicable"}
+
+
+def run_argv(command, cwd):
+    """Run a verifier as an argument list with no shell; return (exit code, output sha256).
+    The CLI passes its own documented operator-trust runner so shell syntax keeps working there."""
+    try:
+        completed = subprocess.run(shlex.split(command), cwd=cwd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=60)
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except (OSError, ValueError):
+        return 127, ""
+    return completed.returncode, hashlib.sha256(completed.stdout).hexdigest()
 
 
 def now():
@@ -393,6 +407,7 @@ def step(
     verify_cmd="",
     reason="",
     instruments=(),
+    run_verifier=run_argv,
 ):
     with locked(path):
         records = read(path)
@@ -448,19 +463,7 @@ def step(
                     and target["dependencies"] == dependencies
                 ):
                     return dict(ok=True, idempotent=True, **summary(record, work_id))
-                try:
-                    completed = subprocess.run(
-                        verify_cmd,
-                        shell=True,
-                        cwd=record["project"],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        timeout=60,
-                    )
-                    code = completed.returncode
-                    output_hash = hashlib.sha256(completed.stdout).hexdigest()
-                except subprocess.TimeoutExpired:
-                    code, output_hash = 124, ""
+                code, output_hash = run_verifier(verify_cmd, record["project"])
                 stable = sha == digest(p) and all(
                     digest(q) == h for q, h in dependencies.items()
                 )

@@ -9238,24 +9238,50 @@ def test_protocol_explicit_lane_cli_preflight_and_reactivation():
           "missing required protocol is not silently recreated")
 
 
+def test_protocol_step_cli_keeps_operator_shell_verifier():
+    # The CLI hands protocol-step its documented operator-trust verifier runner, so shell
+    # syntax such as `cd X && cmd` keeps working there while the module itself runs no shell.
+    reset()
+    project = ROOT / "projects" / "protocol-shell-fixture"; project.mkdir(parents=True)
+    item, proc = run("work-start", ["--project", str(project), "--goal", "shell verifier fixture",
+                     "--development-protocol", "--protocol-lane", "small", "--protocol-ui", "no"])
+    check(proc.returncode == 0 and item.get("work_id"), "protocol work starts for shell verifier fixture")
+    if proc.returncode or not item.get("work_id"):
+        return
+    evidence = project / "proof.txt"; evidence.write_text("proof")
+    marker = project / "shell-ran"
+    step, proc = run("protocol-step", ["--work-id", item["work_id"], "--step", "pathway", "--result", "pass",
+                     "--evidence", str(evidence), "--verify-cmd", f"false || touch {marker}"])
+    check(proc.returncode == 0 and step.get("ok") and marker.exists(),
+          "CLI protocol-step runs operator shell syntax through the shared verifier runner")
+
+
 def test_protocol_first_write_gate_survives_checklist_io_failure():
     from types import SimpleNamespace
     from unittest.mock import patch
     mod = load_cli("first_write_gate")
-    for existing in (False, True):
+    # (existing work status, explicit lane): new work, unmarked active work, and an unmarked
+    # closed item reopened without a scope change (a scoped reopen is refused before any write).
+    for existing, lane in ((None, "normal"), ("active", "normal"), ("closed", None), ("closed", "normal")):
         reset()
         project = ROOT / "projects" / "gate-fixture"; project.mkdir()
         args = SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
             projects_root=str(ROOT / "projects"), output_root=str(ROOT / "out"),
             project=str(project), goal="ordinary protocol gate", work_id=None, tier=None,
-            development_protocol=True, protocol_lane="normal", protocol_ui="no")
+            development_protocol=True, protocol_lane=lane, protocol_ui=None if lane is None else "no")
         paths = mod.Paths(args); paths.operator_intel.mkdir(parents=True)
         wid = mod.stable_work_id(project, args.goal)
         if existing:
             mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project),
-                "goal": args.goal, "status": "closed", "proof_marker": "preserve"}])
+                "goal": args.goal, "status": existing, "proof_marker": "preserve"}])
+        before = paths.work_items_path.read_bytes() if existing else None
         with patch.object(mod.development_protocol, "write", side_effect=OSError("injected checklist write failure")):
             result = mod.run_work_start(args, paths)
+        if existing == "closed" and lane is not None:
+            check(result.get("ok") is False and paths.work_items_path.read_bytes() == before
+                  and not paths.development_protocol_path.exists(),
+                  "scoped reopen of closed work is refused before any write")
+            continue
         item = mod.read_ndjson(paths.work_items_path)[0]
         check(result.get("ok") is False and not paths.development_protocol_path.exists(),
               f"ordinary protocol start reports checklist failure existing={existing}")
@@ -9329,6 +9355,7 @@ def test_protocol_close_classification_lock_order():
 
 def main():
     tests = [
+        test_protocol_step_cli_keeps_operator_shell_verifier,
         test_protocol_first_write_gate_survives_checklist_io_failure,
         test_protocol_close_classification_lock_order,
         test_protocol_explicit_lane_cli_preflight_and_reactivation,

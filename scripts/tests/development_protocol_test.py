@@ -376,6 +376,12 @@ class LaneTests(unittest.TestCase):
         self.reject_unchanged(lambda: d.step(self.store, self.work["work_id"], "build", "pass", str(self.evidence), "true"))
         result = d.step(self.store, self.work["work_id"], "pathway", "pass", str(self.evidence), "false")
         self.assertFalse(result["ok"])
+        # The module's own runner uses no shell: `||` is an argument to `false`, so this still fails.
+        marker = self.root / "shell-ran"
+        result = d.step(self.store, self.work["work_id"], "pathway", "pass", str(self.evidence),
+                        f"false || touch {marker}")
+        self.assertFalse(result["ok"])
+        self.assertFalse(marker.exists())
         inst = self.root / "instrument.py"; inst.write_text("first")
         d.step(self.store, self.work["work_id"], "pathway", "pass", str(self.evidence), "true", instruments=(str(inst),))
         inst.write_text("changed")

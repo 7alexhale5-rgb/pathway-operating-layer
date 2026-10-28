@@ -13777,6 +13777,7 @@ def main(argv=None):
                 args.verify_cmd or "",
                 args.reason or "",
                 args.instrument,
+                run_verifier=lambda command, cwd: run_verifier_command(command, cwd, timeout=60)[:2],
             )
         except (OSError, ValueError, TypeError) as exc:
             result = {"ok": False, "error": str(exc)}
