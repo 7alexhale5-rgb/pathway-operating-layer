@@ -149,7 +149,7 @@ class LaneTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()  # work items store resolved paths
         self.store = self.root / "protocol.json"
         self.goal = "Normal feature with unchanged UI compatibility"
         self.work = {"work_id": "W-fixture", "project": str(self.root), "goal": self.goal, "status": "active"}
@@ -259,6 +259,43 @@ class LaneTests(unittest.TestCase):
         self.assertTrue(retry["idempotent"])
         self.assertEqual(frozen, set(retry["record"]["legacy_protected_required"]))
         self.assertTrue(all(s["status"] == "passed" for s in d.read(self.store)[0]["steps"]))
+
+    def test_new_checklist_persists_resolved_project(self):
+        original = Path.cwd()
+        try:
+            os.chdir(self.root)
+            d.start(self.store, "W-rel", "./not-yet-made", self.goal, lane="small", ui=False)
+        finally:
+            os.chdir(original)
+        stored = d.read(self.store)[0]["project"]
+        self.assertEqual(str((self.root / "not-yet-made").resolve()), stored)
+
+    def test_classify_parses_only_the_bytes_it_hashed(self):
+        self.start()
+        strict = self.scope("normal", False)
+        strict_bytes = strict.read_bytes()
+        weak = {k: v for k, v in json.loads(strict_bytes).items() if k != "review"}
+        weak["lane"] = "small"
+        review = self.root / "weak-review.json"
+        review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "fixture", "contract_sha256": d.object_digest(weak)}))
+        weak["review"] = {"path": str(review), "sha256": d.digest(review)}
+        real_bound, calls = d.bound_file, []
+        def swap(ref, deps):
+            # Another writer swaps in an approved weaker contract right after the scope hash,
+            # then restores the original bytes before the commit-boundary re-hash.
+            out = real_bound(ref, deps)
+            calls.append(1)
+            if len(calls) == 1:
+                strict.write_text(json.dumps(weak))
+            elif len(calls) == 3:
+                strict.write_bytes(strict_bytes)
+            return out
+        with patch.object(d, "bound_file", side_effect=swap):
+            try:
+                self.classify(strict, "small")
+            except ValueError:
+                pass
+        self.assertNotEqual("small", d.read(self.store)[0].get("lane"))
 
     def test_evidence_identity_and_replacement_never_restore_passes(self):
         self.start(lane="normal", ui=False)

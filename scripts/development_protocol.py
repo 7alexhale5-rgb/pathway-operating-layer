@@ -137,6 +137,7 @@ def scope_evidence_changed(dependencies):
 
 def prepare_start(records, work_id, project, goal, required=None, *, lane=None, ui=None):
     """Pure preflight: caller may hold both stores' locks before any mutation."""
+    project = str(Path(project).expanduser().resolve())
     extras = scope_inputs(lane, ui, required)
     matches = [r for r in records if r["work_id"] == work_id]
     if len(matches) > 1:
@@ -182,12 +183,20 @@ def bound_file(ref, dependencies):
     return p
 
 
-def reviewed_document(path, dependencies):
-    document = json.loads(path.read_text())
+def bound_bytes(ref, dependencies):
+    """Return exactly the bytes whose hash was bound, so parsing can never see other bytes."""
+    data = bound_file(ref, dependencies).read_bytes()
+    if hashlib.sha256(data).hexdigest() != ref["sha256"]:
+        raise ValueError("bound evidence changed while reading")
+    return data
+
+
+def reviewed_document(data, dependencies):
+    document = json.loads(data)
     if not isinstance(document, dict):
         raise ValueError("scope document must be an object")
     review_ref = document.get("review")
-    review = json.loads(bound_file(review_ref, dependencies).read_text())
+    review = json.loads(bound_bytes(review_ref, dependencies))
     contract = {k: v for k, v in document.items() if k != "review"}
     if (review.get("verdict") != "APPROVE" or not str(review.get("reviewer", "")).strip()
             or review.get("contract_sha256") != object_digest(contract)):
@@ -212,8 +221,7 @@ def classify(path, work, lane, ui, evidence, reason, expected):
             raise ValueError("stale protocol record digest")
         p = Path(evidence).expanduser()
         deps = {}
-        bound_file({"path": str(p), "sha256": digest(p)}, deps)
-        scope = reviewed_document(p, deps)
+        scope = reviewed_document(bound_bytes({"path": str(p), "sha256": digest(p)}, deps), deps)
         if (scope.get("work_id") != record["work_id"] or scope.get("project") != record["project"]
                 or scope.get("goal_sha256") != hashlib.sha256(record["goal"].encode()).hexdigest()
                 or scope.get("lane") != lane or scope.get("ui") is not ui or not str(scope.get("reason", "")).strip()):
