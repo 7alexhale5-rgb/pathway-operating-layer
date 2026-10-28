@@ -328,6 +328,12 @@ def refresh(record):
     """Read-time invalidation: altered evidence or instrument reopens descendants."""
     scope_changed = scope_evidence_changed(record.get("scope_dependencies", {}))
     if scope_changed:
+        if not record.get("scope_invalid"):
+            before = copy.deepcopy(record)
+            record.setdefault("history", []).append(dict(
+                kind="scope-evidence-invalidated", before=before, before_sha256=object_digest(before),
+                source_record_updated_at=before.get("updated_at", before.get("created_at")),
+            ))
         record["scope_invalid"] = True
         for row in record["steps"]:
             if row["status"] in TERMINAL:

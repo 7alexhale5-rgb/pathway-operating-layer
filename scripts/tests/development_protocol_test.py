@@ -329,6 +329,33 @@ class LaneTests(unittest.TestCase):
                 else:
                     self.reject_unchanged(lambda: self.classify(self.scope(provenance=ref)))
 
+    def test_scope_invalidation_preserves_na_reason_once(self):
+        self.start(lane="normal", ui=False)
+        self.classify(self.scope())
+        d.step(self.store, self.work["work_id"], "pathway", "pass", str(self.evidence), "true")
+        reason = "No research: the exact local module contract is already verified."
+        d.step(self.store, self.work["work_id"], "research", "na", reason=reason)
+        before = d.read(self.store)[0]
+        prior_row = next(row for row in before["steps"] if row["step_id"] == "research")
+        (self.root / "approved-plan.md").write_text("changed scope")
+        first = d.status(self.store, self.work["work_id"])
+        saved = d.read(self.store)[0]
+        events = [e for e in saved["history"] if e.get("kind") == "scope-evidence-invalidated"]
+        self.assertEqual(1, len(events))
+        self.assertEqual(before, events[0]["before"])
+        self.assertEqual(d.object_digest(before), events[0]["before_sha256"])
+        old_row = next(row for row in events[0]["before"]["steps"] if row["step_id"] == "research")
+        self.assertEqual(reason, old_row["exception_reason"])
+        self.assertEqual(prior_row["verified_at"], old_row["verified_at"])
+        bytes_before_second = self.store.read_bytes()
+        second = d.status(self.store, self.work["work_id"])
+        self.assertEqual(bytes_before_second, self.store.read_bytes())
+        self.assertEqual(first["record_sha256"], second["record_sha256"])
+        self.classify(self.scope())
+        (self.root / "approved-plan.md").write_text("changed again")
+        d.status(self.store, self.work["work_id"])
+        self.assertEqual(2, len([e for e in d.read(self.store)[0]["history"] if e.get("kind") == "scope-evidence-invalidated"]))
+
     def test_scope_missing_review_bad_binding_and_stale_writer(self):
         self.start(lane="normal", ui=False)
         old = d.status(self.store, self.work["work_id"])["record_sha256"]
