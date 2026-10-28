@@ -9095,12 +9095,12 @@ def _run_work_start_preflighted(args, paths, protocol_preflight=None):
         risk_overlays=contract["risk_overlays"],
         itinerary=itinerary,
         closeout_readiness="not_ready",
+        **({"development_protocol_required": True} if protocol_preflight is not None else {}),
     )
     if protocol_preflight is not None:
         records, protocol, created = protocol_preflight
         if created:
             development_protocol.write(paths.development_protocol_path, records + [protocol])
-        update_work_item(paths, work_id, development_protocol_required=True)
     dashboard = build_daily_dashboard(paths)
     return {"records": [item], "findings": [], "work_id": work_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
 

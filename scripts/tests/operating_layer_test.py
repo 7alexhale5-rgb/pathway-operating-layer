@@ -9238,6 +9238,40 @@ def test_protocol_explicit_lane_cli_preflight_and_reactivation():
           "missing required protocol is not silently recreated")
 
 
+def test_protocol_first_write_gate_survives_checklist_io_failure():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    mod = load_cli("first_write_gate")
+    for existing in (False, True):
+        reset()
+        project = ROOT / "projects" / "gate-fixture"; project.mkdir()
+        args = SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
+            projects_root=str(ROOT / "projects"), output_root=str(ROOT / "out"),
+            project=str(project), goal="ordinary protocol gate", work_id=None, tier=None,
+            development_protocol=True, protocol_lane="normal", protocol_ui="no")
+        paths = mod.Paths(args); paths.operator_intel.mkdir(parents=True)
+        wid = mod.stable_work_id(project, args.goal)
+        if existing:
+            mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project),
+                "goal": args.goal, "status": "closed", "proof_marker": "preserve"}])
+        with patch.object(mod.development_protocol, "write", side_effect=OSError("injected checklist write failure")):
+            result = mod.run_work_start(args, paths)
+        item = mod.read_ndjson(paths.work_items_path)[0]
+        check(result.get("ok") is False and not paths.development_protocol_path.exists(),
+              f"ordinary protocol start reports checklist failure existing={existing}")
+        check(item.get("development_protocol_required") is True,
+              f"first work write retains required gate existing={existing}")
+        if existing: check(item.get("proof_marker") == "preserve", "unmarked reopen preserves unrelated proof")
+        close_result = {}
+        with patch.object(mod, "work_status_summary", return_value={"work_item": item, "closeout_readiness": "ready"}), \
+             patch.object(mod, "build_daily_dashboard", return_value={}), \
+             patch.object(mod, "update_work_item", side_effect=AssertionError("unguarded closure")):
+            try: close_result = mod.run_work_close(SimpleNamespace(work_id=wid), paths)
+            except AssertionError: pass
+        check(close_result.get("closed") is False,
+              f"missing checklist refuses close despite otherwise-ready work existing={existing}")
+
+
 def test_protocol_close_classification_lock_order():
     import threading
     from types import SimpleNamespace
@@ -9295,6 +9329,7 @@ def test_protocol_close_classification_lock_order():
 
 def main():
     tests = [
+        test_protocol_first_write_gate_survives_checklist_io_failure,
         test_protocol_close_classification_lock_order,
         test_protocol_explicit_lane_cli_preflight_and_reactivation,
         test_design_findings_route_to_design_pathway,
