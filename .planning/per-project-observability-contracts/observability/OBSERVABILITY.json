@@ -18,9 +18,9 @@
     "authorized_stage": "NONE",
     "current_verdict": "NO_PROMOTE",
     "runbook_version": "specialist-fleet-watch-v1",
-    "issued_at": "2026-09-01T21:18:41Z",
-    "expires_at": "2026-09-02T09:18:41Z",
-    "verifier_source_sha256": "9aeeba57895902f839416eee64a2fe764084ad2601df60dedf1e41c939c00a61",
+    "issued_at": "2026-10-20T16:12:16Z",
+    "expires_at": "2026-10-21T04:12:16Z",
+    "verifier_source_sha256": "f5314499858aefc809cb5ce37068d564077233ec450107564ef3f527c84c596d",
     "runtime_present": true,
     "telemetry_present": true,
     "alerts_wired": true,
@@ -59,13 +59,13 @@
     "canary_artifact": "agents-g3-canary.json",
     "verifier_artifact": "verify_agents_runtime_receipt.py",
     "artifact_sha256": {
-      "metric_artifact": "cad6a0ec94da2aa07f3ed93e6d6be5747d5c25d4e9833942a2d2f9488f4a493c",
-      "log_artifact": "b91e7ad150be5376f24907912e902bcc49ea2f07b385bd597cc73acad549ddd4",
-      "trace_artifact": "5f071caa25a62e5f413fcceafcccbfa52260e967cc34479b9b61301f1255b352",
-      "alert_artifact": "c025b6020661c8d0d7d0ecbdf9063e6f05a028e78005f41f7beeda7e705a27b0",
-      "runbook_drill_artifact": "5abad4225f79fdef7a4f3043160d4df598d6ec77d26a62ba27d7cd0b72d53cd1",
-      "canary_artifact": "a732e2179d023a70879abaf3b8e4eaf19311bb8ed4951570f86e7bcc1baf5d77",
-      "verifier_artifact": "9aeeba57895902f839416eee64a2fe764084ad2601df60dedf1e41c939c00a61"
+      "metric_artifact": "f59ee4c1a640e37278748c37f7244be37989cea5a97aa1fbe06b04f82b44d4ca",
+      "log_artifact": "4c47c667d788c2e17ee2497de67cf94611dc1892c6668d0c4d234b7ffbb9a2ac",
+      "trace_artifact": "efacf20526de436c8b30b6d944e875c5b15b7a4f0f63aad2b9502a557103fdef",
+      "alert_artifact": "6d0b4f7b6ee89ffa1d7437b721b9929cab7a5fb6ad7d04cb0c1b69b9a3954b5f",
+      "runbook_drill_artifact": "ba73f9ce737592e91de42492e20d97a87136f92d26b296f858f024ebbb1ae4ed",
+      "canary_artifact": "46354dcf1d8ad216c965c2fd7c78d04c5af48b85391855a1c4abf6a362f82264",
+      "verifier_artifact": "f5314499858aefc809cb5ce37068d564077233ec450107564ef3f527c84c596d"
     }
   }
 }

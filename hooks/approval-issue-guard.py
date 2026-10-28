@@ -3,16 +3,17 @@
 
 The OS-owned helper and authority ledger are the identity boundary. This hook
 reduces accidental attempts on shells that actually invoke it.
+Register the sibling shell launcher for the conservative no-candidate fast path.
+The launcher invokes this parser with ``python3 -S`` when decoding is required.
 """
 from __future__ import annotations
 
-import json
 import sys
 
 
 DENIAL = (
-    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
-    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
 
 RESTRICTED_SUBCOMMANDS = frozenset({"approval-issue", "approval-invalidate"})
@@ -472,7 +473,16 @@ def command_changes_approval_authority(command: str, depth: int = 0) -> bool:
 
 def main() -> int:
     try:
-        data = json.load(sys.stdin)
+        raw_input = sys.stdin.read()
+        # Without JSON escapes, every string's contents occur verbatim in the
+        # payload. The same conservative prefilter used on decoded commands can
+        # therefore prove absence here. Any backslash forces full decoding, so
+        # Unicode escapes and escaped shell quotes cannot hide a command.
+        if "\\" not in raw_input and not _could_contain_restricted_subcommand(raw_input):
+            return 0
+        import json
+
+        data = json.loads(raw_input)
         if not isinstance(data, dict) or data.get("tool_name") not in BASH_TOOL_NAMES:
             return 0
         tool_input = data.get("tool_input")

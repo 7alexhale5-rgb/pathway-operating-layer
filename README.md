@@ -1,5 +1,11 @@
 # pathway-operating-layer
 
+verified: 2026-10-20T11:00:03-05:00
+
+**Approval feature incomplete:** protected release and waiver credit are held.
+Root-owned ledger history cannot establish fresh human consent. See
+[the authority hold](docs/pathway-proof-integrity.md#approval-authority-single-use-waivers-and-production-approvals).
+
 A single-file Python CLI that recommends the next-best engineering **pathway** for a
 project, tracks the work against one shared ID, and refuses to call an outcome done
 until every pathway it needs is proved — with proof the engine actually re-runs, not a

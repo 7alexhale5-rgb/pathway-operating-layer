@@ -12,8 +12,8 @@
 #   /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/scripts/install-pathway-approval-authority.sh /private/var/root/pathway-approval-bootstrap/install.sh
 #   /usr/bin/sudo /usr/bin/install -o root -g wheel -m 0500 /Users/alexhale/Projects/pathway-operating-layer/security/pathway-approval /private/var/root/pathway-approval-bootstrap/pathway-approval
 #   /usr/bin/printf '%s  %s\n' '<INSTALLER_SHA256>' '/private/var/root/pathway-approval-bootstrap/install.sh' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-#   /usr/bin/printf '%s  %s\n' '191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
-#   /usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 '<INSTALLER_SHA256>' --expected-helper-sha256 '191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6'
+#   /usr/bin/printf '%s  %s\n' '9b33a208386aabdd8440edd0c163142399b77248c19d25ffade2bb035edda1f6' '/private/var/root/pathway-approval-bootstrap/pathway-approval' | /usr/bin/sudo /usr/bin/shasum -a 256 -c -
+#   /usr/bin/sudo /private/var/root/pathway-approval-bootstrap/install.sh --expected-installer-sha256 '<INSTALLER_SHA256>' --expected-helper-sha256 '9b33a208386aabdd8440edd0c163142399b77248c19d25ffade2bb035edda1f6'
 #
 # No project-owned code executes as root before both staged hashes match. The
 # staged directory is preserved as a root-owned audit artifact. Steady-state OS
@@ -28,12 +28,12 @@ export PATH
 STAGE_DIR="/private/var/root/pathway-approval-bootstrap"
 STAGED_INSTALLER="$STAGE_DIR/install.sh"
 STAGED_HELPER="$STAGE_DIR/pathway-approval"
-PINNED_HELPER_SHA256="191fcb2f76db243f40dca7fca2054d5b922051a6483d1e09c3d55884c1d423d6"
+PINNED_HELPER_SHA256="9b33a208386aabdd8440edd0c163142399b77248c19d25ffade2bb035edda1f6"
 INSTALL_DIR="/usr/local/libexec"
 INSTALL_HELPER="$INSTALL_DIR/pathway-approval"
 AUTHORITY_DIR="/Library/Application Support/Pathway"
 AUTHORITY_LEDGER="$AUTHORITY_DIR/approval-authority.ndjson"
-SUDOERS_PATH="/etc/sudoers.d/pathway-approval"
+SUDOERS_PATH="/private/etc/sudoers.d/pathway-approval"
 LEGACY_LEDGER="/Users/alexhale/Projects/memory-vault/operator-intelligence/approvals.ndjson"
 LEGACY_SHA256="37b067ab41a9775769fce89ba1371171642a274c6cb6614a0f369a7636ba2a99"
 LEGACY_REJECT_REASON="Legacy user-owned approval history is audit evidence only; independent human authorization was not established."
@@ -47,12 +47,20 @@ digest_of() {
   /usr/bin/shasum -a 256 -- "$1" | /usr/bin/awk '{print $1}'
 }
 
+require_no_acl() {
+  acl_listing=$(/bin/ls -lde "$1") || fail "cannot inspect destination ACLs"
+  if printf '%s\n' "$acl_listing" | /usr/bin/awk 'NR > 1 && $1 ~ /^[0-9]+:$/ { found=1 } END { exit !found }'; then
+    fail "extended ACLs are not permitted on protected paths: $1"
+  fi
+}
+
 require_staged_file() {
   path=$1
   [ -f "$path" ] && [ ! -L "$path" ] || fail "staged trust file is missing, non-regular, or symlinked"
   [ "$(/usr/bin/stat -f '%u' -- "$path")" = "0" ] || fail "staged trust file must be root-owned"
   [ "$(/usr/bin/stat -f '%g' -- "$path")" = "0" ] || fail "staged trust file must be wheel-grouped"
   [ "$(/usr/bin/stat -f '%Lp' -- "$path")" = "500" ] || fail "staged trust file must be mode 0500"
+  require_no_acl "$path"
 }
 
 [ "$(/usr/bin/id -u)" -eq 0 ] || fail "run only the verified root-owned staged installer through sudo"
@@ -96,8 +104,33 @@ require_staged_file "$STAGED_HELPER"
 [ "$(digest_of "$STAGED_HELPER")" = "$EXPECTED_HELPER_SHA256" ] || fail "staged helper digest mismatch"
 [ -x /usr/sbin/visudo ] || fail "visudo is required"
 
-/usr/bin/install -d -o root -g wheel -m 0755 "$INSTALL_DIR"
-/usr/bin/install -d -o root -g wheel -m 0755 "$AUTHORITY_DIR"
+# Every ancestor must be immutable to the invoking user before any copy or
+# execution. Validate first; never repair a user-owned/symlinked chain in place.
+require_secure_dir() {
+  secure_dir=$1
+  [ -d "$secure_dir" ] && [ ! -L "$secure_dir" ] || fail "unsafe destination directory: $secure_dir"
+  [ "$(/usr/bin/stat -f '%u' -- "$secure_dir")" = "0" ] || fail "destination is not root-owned: $secure_dir"
+  mode=$(/usr/bin/stat -f '%Lp' -- "$secure_dir")
+  [ $((0$mode & 022)) -eq 0 ] || fail "destination is writable by non-root: $secure_dir"
+  require_no_acl "$secure_dir"
+}
+for path in / /private /private/var /private/var/root "$STAGE_DIR" /usr /Library /private/etc; do
+  require_secure_dir "$path"
+done
+umask 022
+for path in /usr/local "$INSTALL_DIR" "/Library/Application Support" "$AUTHORITY_DIR" /private/etc/sudoers.d; do
+  require_secure_dir "$(/usr/bin/dirname -- "$path")"
+  [ ! -L "$path" ] || fail "destination is symlinked: $path"
+  if [ ! -e "$path" ]; then
+    /usr/bin/install -d -o root -g wheel -m 0755 "$path"
+  fi
+  require_secure_dir "$path"
+done
+[ ! -L "$INSTALL_HELPER" ] || fail "installed helper is symlinked"
+[ ! -e "$INSTALL_HELPER" ] || require_no_acl "$INSTALL_HELPER"
+[ ! -e "$SUDOERS_PATH" ] || require_no_acl "$SUDOERS_PATH"
+[ ! -L "$SUDOERS_PATH" ] || fail "sudoers destination is symlinked"
+umask 077
 /usr/bin/install -o root -g wheel -m 0755 "$STAGED_HELPER" "$INSTALL_HELPER"
 [ "$(digest_of "$INSTALL_HELPER")" = "$EXPECTED_HELPER_SHA256" ] || fail "final installed helper digest mismatch"
 
@@ -138,6 +171,6 @@ trap cleanup EXIT HUP INT TERM
 /usr/bin/printf '%s\n' "Installed root-owned ledger: $AUTHORITY_LEDGER"
 /usr/bin/printf '%s\n' "Bootstrapped exact 41-row legacy ledger with every legacy issuance invalidated: $LEGACY_SHA256"
 /usr/bin/printf '%s\n' "Installed password-required sudo rule: $SUDOERS_PATH"
-/usr/bin/printf '%s\n' 'Every later authority action must start a fresh sudo authentication:'
+/usr/bin/printf '%s\n' 'Issue/invalidate remain BLOCKED until independent per-mutation authentication is implemented.'
 /usr/bin/printf '%s\n' '  /usr/bin/sudo -k; /usr/bin/sudo /usr/local/libexec/pathway-approval verify'
 /usr/bin/printf '%s\n' "Preserved root-owned bootstrap audit files: $STAGE_DIR"

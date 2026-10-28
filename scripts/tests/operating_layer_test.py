@@ -24,12 +24,13 @@ HERE = Path(__file__).resolve().parent
 CLI = (HERE / ".." / "operating-layer.py").resolve()
 REPO = HERE.parent.parent
 APPROVAL_GUARD = REPO / "hooks" / "approval-issue-guard.py"
+APPROVAL_GUARD_LAUNCHER = REPO / "hooks" / "approval-issue-guard.sh"
 APPROVAL_GUARD_VERIFIER = REPO / "scripts" / "verify-approval-issue-guard.py"
 APPROVAL_HELPER_SOURCE = REPO / "security" / "pathway-approval"
 INSTALLER = REPO / "install.sh"
 APPROVAL_GUARD_DENIAL = (
-    "DENIED: live approval authority is OS-owned. Review the exact helper command, "
-    "then run it with fresh sudo authentication in Alex's normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
 _TEST_ROOT_PARENT = Path("/private/tmp").resolve()
 ROOT = _TEST_ROOT_PARENT / f"operating-layer-test-{uuid.uuid4().hex}"
@@ -127,7 +128,7 @@ def touch_old(path, days=90):
 def base_cmd(subcommand, extra=None):
     cmd = [
         sys.executable,
-        str(CLI),
+        str(HERE / "operating_layer_test_harness.py"),
         subcommand,
         "--claude-home", str(ROOT / "claude"),
         "--codex-home", str(ROOT / "codex"),
@@ -164,7 +165,7 @@ def run_approval_guard(payload, env=None, raw=False):
         hook_env.update(env)
     hook_input = payload if raw else json.dumps(payload)
     return subprocess.run(
-        [sys.executable, str(APPROVAL_GUARD)],
+        ["/bin/bash", str(APPROVAL_GUARD_LAUNCHER)],
         input=hook_input,
         capture_output=True,
         text=True,
@@ -634,7 +635,9 @@ def test_agents_observability_contract_uses_generic_drill_envelope():
           "Rainman market-timestamp mutation cannot bypass the generic alias join")
 
     future_log = json.loads(json.dumps(log))
-    future_log["records"][0]["occurred_at"] = "2026-09-01T21:18:42Z"
+    future_log["records"][0]["occurred_at"] = (
+        observed_at + opl.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     future_log_path = write(
         "out/operator-artifacts/agents-g3-future-log.json",
         json.dumps(future_log) + "\n",
@@ -663,6 +666,8 @@ def load_cli(tag):
     spec = importlib.util.spec_from_file_location(f"opl_{tag}", CLI)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    from operating_layer_test_harness import approval_store_is_protected
+    mod.approval_store_is_protected = approval_store_is_protected
     return mod
 
 
@@ -933,6 +938,84 @@ def test_improve_and_compare_control_loop():
     summary = compare.get("summary", {})
     check(summary.get("added", 0) + summary.get("worsened", 0) > 0, "compare detects added or worsened findings")
     check(Path(compare["report"]).exists() and Path(compare["html"]).exists(), "compare writes markdown and html report")
+
+
+def test_security_corrections_regressions():
+    result = subprocess.run(
+        [sys.executable, str(HERE / "security_corrections_test.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    check(
+        result.returncode == 0,
+        "production authority and immutable observability regressions: "
+        + result.stderr,
+    )
+
+def test_protocol_uses_canonical_work_identity():
+    reset()
+    missing = "./missing-protocol-project"
+    missing_start, _ = run("work-start", ["--project", missing, "--goal", "Fix missing project", "--development-protocol"])
+    missing_id = missing_start["work_id"]
+    explicit, _ = run("protocol-start", ["--work-id", missing_id, "--project", missing, "--goal", "Fix missing project"])
+    check(explicit.get("ok") is True, "explicit enrollment resolves nonexistent relative project identity")
+    missing_status, _ = run("protocol-status", ["--work-id", missing_id])
+    check(missing_status.get("exists") is True and "error" not in missing_status,
+          "nonexistent relative project retains canonical protocol status identity")
+    missing_step, _ = run("protocol-step", ["--work-id", missing_id, "--step", missing_status["steps"][0]["step_id"], "--result", "running"])
+    check(missing_step.get("ok") is True,
+          "nonexistent relative project retains canonical protocol step identity")
+    reset()
+    project = ROOT / "projects" / "identity-ui"
+    write("projects/identity-ui/README.md", "# UI\n")
+    goal = "Build a UI screen"
+    start, _ = run("work-start", ["--project", str(project), "--goal", goal])
+    work_id = start["work_id"]
+    for supplied_project, supplied_goal in ((str(project), "typo"), (str(ROOT), goal)):
+        result, _ = run(
+            "protocol-start",
+            [
+                "--work-id",
+                work_id,
+                "--project",
+                supplied_project,
+                "--goal",
+                supplied_goal,
+            ],
+        )
+        check(
+            result.get("ok") is False,
+            "protocol enrollment rejects mismatched canonical identity",
+        )
+    result, _ = run(
+        "protocol-start",
+        ["--work-id", work_id, "--project", "identity-ui", "--goal", goal],
+    )
+    check(
+        result.get("ok") is True, "protocol enrollment resolves canonical project alias"
+    )
+    rows = result["protocol"]["steps"]
+    check(
+        next(row for row in rows if row["step_id"] == "design")["required"],
+        "canonical UI goal retains required design",
+    )
+    ledger = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    items = [json.loads(line) for line in ledger.read_text().splitlines() if line]
+    for item in items:
+        if item["work_id"] == work_id:
+            item["goal"] = "Changed UI scope"
+    ledger.write_text("".join(json.dumps(item) + "\n" for item in items))
+    result, _ = run("protocol-status", ["--work-id", work_id])
+    check(
+        result.get("ok") is False and "identity" in result.get("error", ""),
+        "later scope changes invalidate protocol identity",
+    )
+    result, _ = run("work-close", ["--work-id", work_id])
+    check(
+        "work-close-protocol-incomplete" in ids(result),
+        "closeout rejects changed protocol identity",
+    )
 
 
 def test_daily_work_envelope_and_pathway_cooperation():
@@ -1582,6 +1665,8 @@ def test_selected_work_scoring_regression_kills_aggregate_mutant():
         # operating-layer.py imports its sibling development_protocol at module load, so a mutant
         # copied alone cannot start and dies before any assertion can kill it.
         shutil.copy2(CLI.parent / "development_protocol.py", mutant_scripts / "development_protocol.py")
+        shutil.copy2(HERE / "operating_layer_test_harness.py",
+                     mutant_tests_dir / "operating_layer_test_harness.py")
 
         namespace = runpy.run_path(str(mutant_tests), run_name="selected_work_aggregate_mutant")
         mutant_test = namespace["test_pathway_next_scores_only_selected_active_work"]
@@ -5989,7 +6074,7 @@ def test_phase1_g1_verifier_rejects_ambiguous_receipts():
     verifier = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(verifier)
     receipt_path = (
-        REPO / ".planning/per-project-observability-contracts/quality/receipt-phase1-g1.json"
+        REPO / ".planning/per-project-observability-contracts/quality/receipt-phase1-g1-2026-10-20.json"
     )
     raw = receipt_path.read_text(encoding="utf-8")
     contract_sha256 = verifier.sha256_bytes(verifier.CONTRACT_PATH.read_bytes())
@@ -6026,6 +6111,31 @@ def test_phase1_g1_verifier_rejects_ambiguous_receipts():
           and verifier.validate_g1_receipt(missing_lineage_path, contract_sha256)
           and verifier.validate_g1_receipt(wrong_verification_path, contract_sha256),
           "malformed carry-forward, lineage, and verification fields cannot earn G1 credit")
+
+
+    # Exercise the entrypoints with temporary mutants, without changing tracked evidence.
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    contract = json.loads(verifier.CONTRACT_PATH.read_text())
+    contract["schema_version"] = True
+    mutant_contract = write("out/g1-mutants/bool-contract.json", json.dumps(contract))
+    with patch.object(verifier, "CONTRACT_PATH", mutant_contract), patch.object(sys, "argv", [str(verifier_path)]), contextlib.redirect_stdout(io.StringIO()):
+        check(verifier.main() == 1, "fidelity rejects boolean metadata in place of integer")
+
+    sys.path.insert(0, str(verifier_path.parent))
+    try:
+        runner_spec = importlib.util.spec_from_file_location("phase1_g1_runner", verifier_path.with_name("verify_phase1_g1.py"))
+        runner = importlib.util.module_from_spec(runner_spec)
+        runner_spec.loader.exec_module(runner)
+    finally:
+        sys.path.pop(0)
+    altered = json.loads(raw)
+    altered["verification"]["canonical_suite"] = "forged result"
+    altered_path = write("out/g1-mutants/altered-verification.json", json.dumps(altered))
+    with patch.object(runner, "RECEIPT_PATH", altered_path), patch.object(runner, "run", side_effect=AssertionError("altered receipt reached execution")), contextlib.redirect_stdout(io.StringIO()):
+        check(runner.main() == 1, "G1 command rejects altered verification before executing checks")
 
 
 def test_audit_proof_integrity_uses_active_outcomes_and_reports_history():
@@ -6807,6 +6917,34 @@ def test_approval_issue_guard_allows_non_issuance_text_and_fail_open_inputs():
         check(proc.stdout == "" and proc.stderr == "",
               f"approval guard is silent for {label}")
 
+    # The raw-input fast path must not hide JSON escapes or shell-joined names.
+    for subcommand in ("approval-issue", "approval-invalidate"):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {
+            "command": "operating-layer.py " + subcommand + " --help"}})
+        for index, char in enumerate(subcommand):
+            escaped = subcommand[:index] + "\\u%04x" % ord(char) + subcommand[index + 1:]
+            proc = run_approval_guard(payload.replace(subcommand, escaped), raw=True)
+            check(proc.returncode == 2 and proc.stderr == APPROVAL_GUARD_DENIAL,
+                  f"approval guard decodes escaped {subcommand} character {index}")
+        joined = subcommand[:3] + "'" + subcommand[3:7] + "'" + subcommand[7:]
+        proc = run_approval_guard({"tool_name": "Bash", "tool_input": {
+            "command": "operating-layer.py " + joined + " --help"}})
+        check(proc.returncode == 2 and proc.stderr == APPROVAL_GUARD_DENIAL,
+              f"approval guard keeps unescaped shell-joined {subcommand} blocked")
+
+    # A fresh interpreter proves the optimization removes imports, not timing
+    # samples or validation: ordinary commands never initialize the JSON stack.
+    probe = subprocess.run(
+        ["python3", "-S", "-c",
+         "import runpy, sys; "
+         f"guard=runpy.run_path({str(APPROVAL_GUARD)!r}); "
+         "assert guard['main']() == 0; assert 'json' not in sys.modules"],
+        input='{"tool_name":"Bash","tool_input":{"command":"true"}}',
+        capture_output=True, text=True, timeout=5,
+    )
+    check(probe.returncode == 0,
+          "approval guard skips JSON initialization only for proven noncandidate input")
+
     invalid = run_approval_guard("{not-json", raw=True)
     check(invalid.returncode == 0, "approval guard fails open on invalid JSON")
     check(invalid.stdout == "" and invalid.stderr == "",
@@ -6857,8 +6995,8 @@ def test_approval_issue_guard_repeatable_verifier():
     check(installed.returncode == 0,
           f"verifier fixture installs guard links ({installed.stderr.strip()})")
 
-    claude_hook = claude_home / "hooks" / "approval-issue-guard.py"
-    codex_hook = codex_home / "hooks" / "approval-issue-guard.py"
+    claude_hook = claude_home / "hooks" / "approval-issue-guard.sh"
+    codex_hook = codex_home / "hooks" / "approval-issue-guard.sh"
     claude_settings = claude_home / "settings.json"
     codex_settings = codex_home / "hooks.json"
 
@@ -6885,8 +7023,8 @@ def test_approval_issue_guard_repeatable_verifier():
             encoding="utf-8",
         )
 
-    claude_command = f"python3 {claude_hook}"
-    codex_command = f"python3 {codex_hook}"
+    claude_command = f"/bin/bash {claude_hook}"
+    codex_command = f"/bin/bash {codex_hook}"
     save_settings(claude_settings, claude_command)
     save_settings(codex_settings, codex_command)
     save_settings(isolated_settings, claude_command)
@@ -6898,7 +7036,7 @@ def test_approval_issue_guard_repeatable_verifier():
     verifier_cmd = [
         sys.executable,
         str(APPROVAL_GUARD_VERIFIER),
-        "--repo-hook", str(APPROVAL_GUARD),
+        "--repo-hook", str(APPROVAL_GUARD_LAUNCHER),
         "--claude-hook", str(claude_hook),
         "--codex-hook", str(codex_hook),
         "--claude-settings", str(claude_settings),
@@ -6953,9 +7091,9 @@ def test_approval_issue_guard_repeatable_verifier():
     check(summary.get("run_count") == 120, "approval guard verifier honors its run-count override")
     check(summary.get("settings_checked") == 3,
           "approval guard verifier reports all three settings files")
-    check(summary.get("symlinks_checked") == 2,
-          "approval guard verifier reports both installed links")
-    check(summary.get("blocked_fixtures") == 21 and summary.get("allowed_fixtures") == 12,
+    check(summary.get("symlinks_checked") == 4,
+          "approval guard verifier reports installed launcher and parser links")
+    check(summary.get("blocked_fixtures") == 24 and summary.get("allowed_fixtures") == 12,
           "approval guard verifier runs fixtures through source and both installed links")
     check(isinstance(summary.get("p95_ms"), (int, float)) and summary.get("p95_ms") < 50,
           "approval guard verifier reports p95 below 50ms")
@@ -6967,6 +7105,23 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier reports the fake ledger line count")
     check(all(path.read_bytes() == before for path, before in settings_before.items()),
           "approval guard verifier leaves all settings bytes unchanged")
+
+    save_settings(codex_settings, f"python3 {codex_hook}")
+    old_launch = verify()
+    check(old_launch.returncode != 0 and "exact guard entry" in old_launch.stdout,
+          "approval guard verifier refuses configuration missing measured shell entry point")
+    save_settings(codex_settings, codex_command)
+
+    # Observe the interpreter flag in a child, rather than trusting argv text.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("guard_launch_verifier", APPROVAL_GUARD_VERIFIER)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    launch_probe = ROOT / "guard-launch-probe.sh"
+    launch_probe.write_text("python3 -S -c 'import sys; raise SystemExit(0 if sys.flags.no_site else 1)'\n")
+    launch_result, _ = verifier.run_hook(launch_probe, "{}")
+    check(launch_result.returncode == 0,
+          "approval guard verifier actually launches Python without site initialization")
 
     save_settings(codex_settings, codex_command, after=True)
     not_last = verify()
@@ -6986,15 +7141,10 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects invalid settings JSON")
     save_settings(claude_settings, claude_command)
 
-    slow_hook = ROOT / "slow-approval-guard.py"
+    (ROOT / "approval-issue-guard.py").symlink_to(APPROVAL_GUARD)
+    slow_hook = ROOT / "slow-approval-guard.sh"
     slow_hook.write_text(
-        "import subprocess, sys, time\n"
-        "time.sleep(0.06)\n"
-        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
-        "input=sys.stdin.read(), capture_output=True, text=True)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "raise SystemExit(proc.returncode)\n",
+        "sleep 0.06\n" + f"/bin/bash {shlex.quote(str(APPROVAL_GUARD_LAUNCHER))}\n",
         encoding="utf-8",
     )
     point_installed_links(slow_hook)
@@ -7002,17 +7152,10 @@ def test_approval_issue_guard_repeatable_verifier():
     check(slow.returncode != 0 and "p95" in slow.stdout.lower(),
           "approval guard verifier rejects a hook at or above the p95 limit")
 
-    mutating_hook = ROOT / "mutating-approval-guard.py"
+    mutating_hook = ROOT / "mutating-approval-guard.sh"
     mutating_hook.write_text(
-        "import subprocess, sys\n"
-        "from pathlib import Path\n"
-        f"with Path({str(ledger)!r}).open('ab') as handle:\n"
-        "    handle.write(b'test-only-change\\n')\n"
-        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
-        "input=sys.stdin.read(), capture_output=True, text=True)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "raise SystemExit(proc.returncode)\n",
+        f"printf 'test-only-change\\n' >> {shlex.quote(str(ledger))}\n"
+        + f"/bin/bash {shlex.quote(str(APPROVAL_GUARD_LAUNCHER))}\n",
         encoding="utf-8",
     )
     point_installed_links(mutating_hook)
@@ -7022,7 +7165,50 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects any ledger mutation")
 
     ledger.write_bytes(ledger_bytes)
-    point_installed_links(APPROVAL_GUARD)
+    point_installed_links(APPROVAL_GUARD_LAUNCHER)
+
+    alternate_source = ROOT / "alternate-checkout" / "hooks"
+    alternate_source.mkdir(parents=True)
+    alternate_launcher = alternate_source / "approval-issue-guard.sh"
+    alternate_parser = alternate_source / "approval-issue-guard.py"
+    alternate_launcher.write_bytes(APPROVAL_GUARD_LAUNCHER.read_bytes())
+    alternate_parser.write_bytes(APPROVAL_GUARD.read_bytes())
+    point_installed_links(alternate_launcher)
+    for link in (claude_hook.with_suffix(".py"), codex_hook.with_suffix(".py")):
+        link.unlink()
+        link.symlink_to(alternate_parser)
+    alternate_checkout = verify_source(alternate_launcher)
+    check("tracked source" not in alternate_checkout.stdout
+          and verifier_json(alternate_checkout).get("blocked_fixtures") == 24,
+          "verifier binds parser to the selected alternate source checkout")
+    point_installed_links(APPROVAL_GUARD_LAUNCHER)
+    for link in (claude_hook.with_suffix(".py"), codex_hook.with_suffix(".py")):
+        link.unlink()
+        link.symlink_to(APPROVAL_GUARD)
+
+    alternate_hook = codex_hook.parent / "guard.sh"
+    alternate_hook.symlink_to(APPROVAL_GUARD_LAUNCHER)
+    save_settings(codex_settings, f"/bin/bash {alternate_hook}")
+    alternate_command = list(verifier_cmd)
+    alternate_command[alternate_command.index("--codex-hook") + 1] = str(alternate_hook)
+    alternate = subprocess.run(alternate_command, capture_output=True, text=True, timeout=240)
+    check("installed parser" not in alternate.stdout,
+          "alternate launcher basename checks its actual parser sibling")
+    save_settings(codex_settings, codex_command)
+
+    parser_link = codex_hook.with_suffix(".py")
+    parser_link.unlink()
+    parser_link.write_text(APPROVAL_GUARD.read_text())
+    detached_parser = verify()
+    check(detached_parser.returncode != 0 and "installed parser" in detached_parser.stdout,
+          "approval guard verifier rejects a detached parser copy")
+    parser_link.unlink()
+    parser_link.symlink_to(CLI)
+    wrong_parser = verify()
+    check(wrong_parser.returncode != 0 and "installed parser" in wrong_parser.stdout,
+          "approval guard verifier rejects an incorrectly targeted parser")
+    parser_link.unlink()
+    parser_link.symlink_to(APPROVAL_GUARD)
 
     codex_hook.unlink()
     codex_hook.symlink_to(CLI)
@@ -8269,8 +8455,8 @@ def test_approval_invalidation_revokes_exact_ticket_credit():
         "proofs_path": proofs_path,
         "carry_forward_path": carry_forward_path,
     })()
-    check(opl.latest_carry_forward_for_work(view_paths, wid).get("credits_pathway") is True,
-          "a currently corroborated release baton remains proved")
+    check(opl.latest_carry_forward_for_work(view_paths, wid).get("credits_pathway") is False,
+          "approval alone cannot credit a release baton without a complete verified proof")
     run("approval-invalidate", [
         "--ticket-id", release_ticket, "--reason", "release ticket came from an agent bypass",
     ])
@@ -9353,7 +9539,8 @@ def test_protocol_close_classification_lock_order():
     d.classify(store, work, "small", False, str(scope), "fixture", d.record_digest(record))
     for row in d.read(store)[0]["steps"]:
         d.step(store, "W-lock", row["step_id"], "pass" if row["required"] else "na", str(proof), "true", reason="fixture conditional")
-    paths = SimpleNamespace(work_items_path=works, development_protocol_path=store, daily_dashboard_path=ROOT / "dashboard.md")
+    paths = SimpleNamespace(work_items_path=works, development_protocol_path=store, daily_dashboard_path=ROOT / "dashboard.md",
+                            projects_root=ROOT)
     entered = threading.Event(); release = threading.Event(); attempting = threading.Event(); classified = threading.Event()
     result = {}; errors = []
     def status(*args):
@@ -9405,6 +9592,8 @@ def main():
         test_agent_cards_scope_excludes_helper_and_legacy_records,
         test_all_smoke_outputs_parse_and_redact,
         test_improve_and_compare_control_loop,
+        test_security_corrections_regressions,
+        test_protocol_uses_canonical_work_identity,
         test_daily_work_envelope_and_pathway_cooperation,
         test_daily_work_stale_measurement_detection,
         test_work_close_extracts_learning_candidate,

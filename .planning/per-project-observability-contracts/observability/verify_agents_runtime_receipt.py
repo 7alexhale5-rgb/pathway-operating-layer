@@ -176,6 +176,8 @@ def main():
     envelope = read_json(receipt_path)
     receipt = envelope.get("observability_receipt")
     require(isinstance(receipt, dict), "receipt envelope is missing observability_receipt")
+    require(receipt.get("claim_scope") == "runtime", "focused drill requires runtime claim_scope")
+    require(receipt.get("environment_class") == "test", "focused drill requires test environment_class")
     base = receipt_path.parent
 
     declared = receipt.get("artifact_sha256")

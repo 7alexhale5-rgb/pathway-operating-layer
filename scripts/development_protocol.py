@@ -142,16 +142,15 @@ def prepare_start(records, work_id, project, goal, required=None, *, lane=None, 
     if len(matches) > 1:
         raise ValueError("duplicate protocol work ID")
     if matches:
-        existing = matches[0]
-        if existing["project"] != str(project) or existing["goal"] != goal:
-            raise ValueError("work identity changed; reuse the original project and goal")
+        existing = copy.deepcopy(matches[0])
+        validate_identity(existing, (str(project), goal))
         if lane is not None and (existing.get("lane") != lane or existing.get("ui") != ui):
             raise ValueError("scope changed; use audited protocol-classify")
         if extras is not None and ("extra_required" not in existing or set(existing["extra_required"]) != extras):
             raise ValueError("extra requirements changed or unknown; use audited protocol-classify")
         if scope_evidence_changed(existing.get("scope_dependencies", {})):
             raise ValueError("scope evidence changed; use reviewed protocol-classify")
-        return copy.deepcopy(existing), False
+        return existing, False
     extras = extras or set()
     needed = requirements(goal, lane, ui, extras)
     record = dict(work_id=work_id, project=str(project), goal=goal, created_at=now(), steps=[],
@@ -276,6 +275,13 @@ def record_digest(record):
     return object_digest(clean)
 
 
+def invalidate_after(record, sequence):
+    for row in record["steps"][sequence:]:
+        if row["status"] in TERMINAL:
+            row["status"] = "pending"
+            row["exception_reason"] = "Earlier completion changed; repeat this step."
+
+
 def refresh(record):
     """Read-time invalidation: altered evidence or instrument reopens descendants."""
     scope_changed = scope_evidence_changed(record.get("scope_dependencies", {}))
@@ -292,6 +298,9 @@ def refresh(record):
                 row.update(status="pending", exception_reason="Scope evidence changed; reclassify and repeat.")
     invalid = False
     for step in record["steps"]:
+        if invalid and step["status"] in TERMINAL:
+            step["status"] = "pending"
+            step["exception_reason"] = "Earlier evidence changed; repeat this step."
         if step["status"] == "passed":
             changed = digest(step["evidence_path"]) != step["evidence_sha256"]
             changed |= any(digest(p) != sha for p, sha in step["dependencies"].items())
@@ -324,11 +333,31 @@ def summary(record, work_id):
     )
 
 
-def status(path, work_id):
+def validate_identity(record, expected_identity):
+    if record is not None and expected_identity is not None:
+        project, goal = expected_identity
+        stored = Path(record["project"]).expanduser()
+        expected = Path(project).expanduser()
+        equivalent = record["project"] == str(project)
+        if not equivalent and expected.is_absolute():
+            equivalent = stored.resolve() == expected.resolve()
+        if not equivalent or record["goal"] != goal:
+            raise ValueError("protocol identity no longer matches canonical work item")
+        if not stored.is_absolute():
+            # Old relative identities did not record their original cwd. Do not
+            # carry completion across an identity we can no longer establish.
+            for row in record["steps"]:
+                row["status"] = "pending"
+                row["exception_reason"] = "Legacy relative project has no recorded base; repeat this step."
+        record["project"] = str(project)
+
+
+def status(path, work_id, expected_identity=None):
     with locked(path):
         records = read(path)
         record = next((r for r in records if r["work_id"] == work_id), None)
         before = json.dumps(record, sort_keys=True) if record is not None else ""
+        validate_identity(record, expected_identity)
         result = summary(record, work_id)
         after = json.dumps(record, sort_keys=True) if record is not None else ""
         if record is not None and before != after:
@@ -346,12 +375,14 @@ def step(
     reason="",
     instruments=(),
     run_verifier=run_argv,
+    expected_identity=None,
 ):
     with locked(path):
         records = read(path)
         record = next((r for r in records if r["work_id"] == work_id), None)
         if record is None:
             raise ValueError("protocol work item does not exist")
+        validate_identity(record, expected_identity)
         refresh(record)
         if record.get("scope_invalid"):
             raise ValueError("scope evidence changed; reviewed classification required before proof")
@@ -361,6 +392,10 @@ def step(
         if result == "na":
             if target["required"] or not reason.strip():
                 raise ValueError("N/A requires a conditional step and a written reason")
+            if target["status"] in TERMINAL and (
+                target["status"] != "not-applicable" or target["exception_reason"] != reason.strip()
+            ):
+                invalidate_after(record, target["sequence"])
             target.update(
                 status="not-applicable",
                 exception_reason=reason.strip(),
@@ -375,6 +410,8 @@ def step(
                     "earlier checklist rows remain open, including conditional rows"
                 )
             if result != "pass":
+                if target["status"] in TERMINAL:
+                    invalidate_after(record, target["sequence"])
                 target.update(status=result, exception_reason=reason)
             else:
                 p = Path(evidence).expanduser()
@@ -396,11 +433,16 @@ def step(
                 sha = digest(p)
                 if (
                     target["status"] == "passed"
+                    and target["evidence_path"] == str(p)
                     and target["evidence_sha256"] == sha
                     and target["verify_command"] == verify_cmd
                     and target["dependencies"] == dependencies
                 ):
                     return dict(ok=True, idempotent=True, **summary(record, work_id))
+                if target["status"] in TERMINAL:
+                    invalidate_after(record, target["sequence"])
+                    target["status"] = "running"
+                    write(path, records)
                 code, output_hash = run_verifier(verify_cmd, record["project"])
                 stable = sha == digest(p) and all(
                     digest(q) == h for q, h in dependencies.items()
@@ -432,9 +474,9 @@ def step(
         return dict(ok=True, **summary(record, work_id))
 
 
-def enforce_close(path, work_id):
+def enforce_close(path, work_id, expected_identity=None):
     try:
-        current = status(path, work_id)
+        current = status(path, work_id, expected_identity)
         return (not current["exists"] or current["ready"]), current
     except (ValueError, KeyError, TypeError, OSError) as exc:
         return False, dict(ready=False, open=["invalid-protocol-store"], error=str(exc))
