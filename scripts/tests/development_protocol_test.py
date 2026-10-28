@@ -244,6 +244,22 @@ class LaneTests(unittest.TestCase):
         self.assertFalse(out["ready"])
         self.assertEqual(r["steps"], out["record"]["history"][0]["before"]["steps"])
 
+    def test_ambiguous_legacy_retry_keeps_frozen_protection_and_proof(self):
+        r = self.start()
+        r.pop("extra_required")
+        r.pop("scope_source", None)
+        d.write(self.store, [r])
+        frozen = self.required(r)
+        scope = self.scope("irreversible", False)
+        first = self.classify(scope, "irreversible")
+        self.assertEqual(frozen, set(first["record"]["legacy_protected_required"]))
+        for sid, _ in d.STEPS:
+            d.step(self.store, self.work["work_id"], sid, "pass", str(self.evidence), "true")
+        retry = self.classify(scope, "irreversible")
+        self.assertTrue(retry["idempotent"])
+        self.assertEqual(frozen, set(retry["record"]["legacy_protected_required"]))
+        self.assertTrue(all(s["status"] == "passed" for s in d.read(self.store)[0]["steps"]))
+
     def test_evidence_identity_and_replacement_never_restore_passes(self):
         self.start(lane="normal", ui=False)
         scope = self.scope()

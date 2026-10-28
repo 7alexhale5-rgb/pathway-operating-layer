@@ -9424,6 +9424,23 @@ def test_protocol_explicit_lane_cli_preflight_and_reactivation():
           "missing required protocol is not silently recreated")
 
 
+def test_protocol_work_id_with_dot_stays_selectable():
+    # stable_work_id keeps '.' from the goal slug, so every protocol path must accept it.
+    reset()
+    project = ROOT / "projects" / "protocol-dot-fixture"; project.mkdir(parents=True)
+    goal = "Ship 1.0 release notes"
+    flags = ["--project", str(project), "--goal", goal, "--development-protocol"]
+    item, proc = run("work-start", flags + ["--protocol-lane", "small", "--protocol-ui", "no"])
+    wid = (item or {}).get("work_id", "")
+    check(proc.returncode == 0 and "." in wid, "dotted goal yields a dotted work ID")
+    if proc.returncode or "." not in wid:
+        return
+    for command, args in [("work-start", flags), ("work-start", flags + ["--work-id", wid]),
+                          ("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])]:
+        out, proc = run(command, args)
+        check(proc.returncode == 0, "dotted work ID accepted by " + command + str(args[-2:]))
+
+
 def test_protocol_step_cli_keeps_operator_shell_verifier():
     # The CLI hands protocol-step its documented operator-trust verifier runner, so shell
     # syntax such as `cd X && cmd` keeps working there while the module itself runs no shell.
@@ -9579,6 +9596,7 @@ def main():
         test_protocol_first_write_gate_survives_checklist_io_failure,
         test_protocol_start_gate_survives_checklist_io_failure,
         test_protocol_close_classification_lock_order,
+        test_protocol_work_id_with_dot_stays_selectable,
         test_protocol_explicit_lane_cli_preflight_and_reactivation,
         test_design_findings_route_to_design_pathway,
         test_design_gate_is_derived_from_repo_not_goal_wording,

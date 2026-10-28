@@ -231,7 +231,8 @@ def classify(path, work, lane, ui, evidence, reason, expected):
         # them to, so they can never clear rows; unknown legacy extras stay protected.
         if scope.get("provenance"):
             raise ValueError("supplied provenance cannot clear protected rows")
-        if "extra_required" not in record or record.get("legacy_extras_unknown"):
+        # Freeze the ambiguous legacy set on first classification; retries reuse it verbatim.
+        if "extra_required" not in record:
             protected |= {s["step_id"] for s in record["steps"] if s["required"]}
         if not known <= extras:
             raise ValueError("extra required rows cannot be removed")

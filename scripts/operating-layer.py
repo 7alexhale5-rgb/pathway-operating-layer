@@ -8943,7 +8943,7 @@ def protocol_work_items(paths):
 
 def protocol_work_identity(items, work_id, project=None, goal=None):
     found = [w for w in items if w["work_id"] == work_id]
-    if not re.fullmatch(r"W-[A-Za-z0-9][A-Za-z0-9_-]*", work_id or "") or len(found) != 1:
+    if not re.fullmatch(r"W-[A-Za-z0-9][A-Za-z0-9_.-]*", work_id or "") or len(found) != 1:
         raise ValueError("one existing explicit work ID required")
     work = found[0]
     if (project is not None and work.get("project") != str(project)) or (goal is not None and work.get("goal") != goal):
