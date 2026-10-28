@@ -6,6 +6,8 @@ argument-hint: "<project> [ go | done | <goal> ] [--max] | pilot <projects> <goa
 
 # Pathway — next-best move for a project
 
+For product UI, follow `~/.claude/references/product-interface-standard.md`: build tasks with existing components, use literal labels, and verify rendered controls and copy before delivery. This overrides editorial/storytelling defaults for software screens.
+
 The single front door to the operating-layer pathway router and its work envelope.
 The user will never remember the CLI flags — you run them. Always keep output in
 plain English (names of real things, no jargon, no status icons).
