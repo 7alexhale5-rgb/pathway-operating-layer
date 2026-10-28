@@ -9590,12 +9590,46 @@ def test_protocol_close_classification_lock_order():
           "stale scope never becomes closed")
 
 
+def test_protocol_close_holds_checklist_lock_through_close_write():
+    # A protocol-step between the readiness read and the closed write must not slip in.
+    import fcntl
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_close_hold")
+    d = mod.development_protocol
+    store = ROOT / "protocol.json"; works = ROOT / "work-items.ndjson"
+    work = {"work_id": "W-hold", "project": str(ROOT), "goal": "fixture", "status": "active", "development_protocol_required": True}
+    works.write_text(json.dumps(work) + "\n")
+    proof = ROOT / "proof.md"; proof.write_text("verified fixture")
+    d.start(store, "W-hold", str(ROOT), "fixture", lane="small", ui=False)
+    for row in d.read(store)[0]["steps"]:
+        d.step(store, "W-hold", row["step_id"], "pass" if row["required"] else "na", str(proof), "true", reason="fixture conditional")
+    paths = SimpleNamespace(work_items_path=works, development_protocol_path=store, daily_dashboard_path=ROOT / "dashboard.md",
+                            projects_root=ROOT)
+    held = []
+    def update(*args, **kwargs):
+        with store.with_suffix(".lock").open("a") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(probe, fcntl.LOCK_UN); held.append(False)
+            except BlockingIOError:
+                held.append(True)
+        return dict(work, status="closed")
+    with patch.object(mod, "work_status_summary", return_value={"work_item": work, "closeout_readiness": "ready"}), \
+         patch.object(mod, "build_daily_dashboard", return_value={}), patch.object(mod, "update_work_item", side_effect=update), \
+         patch.object(mod, "extract_learning_candidate", return_value={}), \
+         patch.object(mod, "write_learning_candidate", return_value=([], ROOT / "l.md", ROOT / "l.html")):
+        result = mod.run_work_close(SimpleNamespace(work_id="W-hold"), paths)
+    check(result.get("closed") is True and held == [True], "close holds the checklist lock while it writes closed")
+
+
 def main():
     tests = [
         test_protocol_step_cli_keeps_operator_shell_verifier,
         test_protocol_first_write_gate_survives_checklist_io_failure,
         test_protocol_start_gate_survives_checklist_io_failure,
         test_protocol_close_classification_lock_order,
+        test_protocol_close_holds_checklist_lock_through_close_write,
         test_protocol_work_id_with_dot_stays_selectable,
         test_protocol_explicit_lane_cli_preflight_and_reactivation,
         test_design_findings_route_to_design_pathway,

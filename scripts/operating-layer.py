@@ -9819,8 +9819,9 @@ def protocol_expected_identity(paths, work_id):
 
 
 def run_work_close(args, paths):
-    # Match start/classify lock order; enforce_close acquires the protocol lock itself.
-    with development_protocol.locked(paths.work_items_path):
+    # Match start/classify lock order. Hold the protocol lock through the closed write so no
+    # protocol-step or scope invalidation lands between the readiness read and the close.
+    with development_protocol.locked(paths.work_items_path), development_protocol.locked(paths.development_protocol_path):
         return _run_work_close_locked(args, paths)
 
 
@@ -9845,6 +9846,7 @@ def _run_work_close_locked(args, paths):
         paths.development_protocol_path, args.work_id,
         (resolve_project_dir(summary["work_item"]["project"], paths.projects_root),
          summary["work_item"]["goal"]) if summary.get("work_item") else None,
+        lock=False,
     )
     if (summary.get("work_item") or {}).get("development_protocol_required") and not protocol_status.get("exists"):
         protocol_ready = False

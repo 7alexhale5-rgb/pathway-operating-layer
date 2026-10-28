@@ -353,8 +353,9 @@ def validate_identity(record, expected_identity):
         record["project"] = str(project)
 
 
-def status(path, work_id, expected_identity=None):
-    with locked(path):
+def status(path, work_id, expected_identity=None, lock=True):
+    # lock=False only for a caller that already holds this store's lock (flock is not reentrant).
+    with locked(path) if lock else contextlib.nullcontext():
         records = read(path)
         record = next((r for r in records if r["work_id"] == work_id), None)
         before = json.dumps(record, sort_keys=True) if record is not None else ""
@@ -475,9 +476,9 @@ def step(
         return dict(ok=True, **summary(record, work_id))
 
 
-def enforce_close(path, work_id, expected_identity=None):
+def enforce_close(path, work_id, expected_identity=None, lock=True):
     try:
-        current = status(path, work_id, expected_identity)
+        current = status(path, work_id, expected_identity, lock)
         return (not current["exists"] or current["ready"]), current
     except (ValueError, KeyError, TypeError, OSError) as exc:
         return False, dict(ready=False, open=["invalid-protocol-store"], error=str(exc))
