@@ -9262,7 +9262,8 @@ def test_protocol_first_write_gate_survives_checklist_io_failure():
     mod = load_cli("first_write_gate")
     # (existing work status, explicit lane): new work, unmarked active work, and an unmarked
     # closed item reopened without a scope change (a scoped reopen is refused before any write).
-    for existing, lane in ((None, "normal"), ("active", "normal"), ("closed", None), ("closed", "normal")):
+    for existing, lane, selected in ((None, "normal", False), ("active", "normal", False), ("closed", None, False),
+                                     ("closed", "normal", False), ("active", None, True)):
         reset()
         project = ROOT / "projects" / "gate-fixture"; project.mkdir()
         args = SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
@@ -9271,6 +9272,8 @@ def test_protocol_first_write_gate_survives_checklist_io_failure():
             development_protocol=True, protocol_lane=lane, protocol_ui=None if lane is None else "no")
         paths = mod.Paths(args); paths.operator_intel.mkdir(parents=True)
         wid = mod.stable_work_id(project, args.goal)
+        if selected:
+            args.work_id = wid
         if existing:
             mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project),
                 "goal": args.goal, "status": existing, "proof_marker": "preserve"}])
@@ -9284,9 +9287,9 @@ def test_protocol_first_write_gate_survives_checklist_io_failure():
             continue
         item = mod.read_ndjson(paths.work_items_path)[0]
         check(result.get("ok") is False and not paths.development_protocol_path.exists(),
-              f"ordinary protocol start reports checklist failure existing={existing}")
+              f"ordinary protocol start reports checklist failure existing={existing} selected={selected}")
         check(item.get("development_protocol_required") is True,
-              f"first work write retains required gate existing={existing}")
+              f"first work write retains required gate existing={existing} selected={selected}")
         if existing: check(item.get("proof_marker") == "preserve", "unmarked reopen preserves unrelated proof")
         close_result = {}
         with patch.object(mod, "work_status_summary", return_value={"work_item": item, "closeout_readiness": "ready"}), \
@@ -9295,7 +9298,37 @@ def test_protocol_first_write_gate_survives_checklist_io_failure():
             try: close_result = mod.run_work_close(SimpleNamespace(work_id=wid), paths)
             except AssertionError: pass
         check(close_result.get("closed") is False,
-              f"missing checklist refuses close despite otherwise-ready work existing={existing}")
+              f"missing checklist refuses close despite otherwise-ready work existing={existing} selected={selected}")
+
+
+def test_protocol_start_gate_survives_checklist_io_failure():
+    # protocol-start on active, unmarked work: a failed checklist write must still block close.
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_start_gate")
+    project = ROOT / "projects" / "start-gate-fixture"; project.mkdir()
+    goal = "ordinary protocol-start gate"
+    paths = mod.Paths(SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
+        projects_root=str(ROOT / "projects"), output_root=str(ROOT / "out")))
+    paths.operator_intel.mkdir(parents=True)
+    wid = mod.stable_work_id(project, goal)
+    mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project), "goal": goal, "status": "active"}])
+    argv = base_cmd("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])[2:]
+    with patch.object(mod.development_protocol, "write", side_effect=OSError("injected checklist write failure")), \
+         contextlib.redirect_stdout(io.StringIO()):
+        code = mod.main(argv)
+    item = mod.read_ndjson(paths.work_items_path)[0]
+    check(code != 0 and not paths.development_protocol_path.exists(), "protocol-start reports checklist write failure")
+    check(item.get("development_protocol_required") is True, "protocol-start keeps required gate after failed write")
+    with patch.object(mod, "work_status_summary", return_value={"work_item": item, "closeout_readiness": "ready"}), \
+         patch.object(mod, "build_daily_dashboard", return_value={}), \
+         patch.object(mod, "update_work_item", side_effect=AssertionError("unguarded closure")):
+        try: close_result = mod.run_work_close(SimpleNamespace(work_id=wid), paths)
+        except AssertionError: close_result = {}
+    check(close_result.get("closed") is False, "protocol-start failure leaves work unclosable")
 
 
 def test_protocol_close_classification_lock_order():
@@ -9357,6 +9390,7 @@ def main():
     tests = [
         test_protocol_step_cli_keeps_operator_shell_verifier,
         test_protocol_first_write_gate_survives_checklist_io_failure,
+        test_protocol_start_gate_survives_checklist_io_failure,
         test_protocol_close_classification_lock_order,
         test_protocol_explicit_lane_cli_preflight_and_reactivation,
         test_design_findings_route_to_design_pathway,

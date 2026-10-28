@@ -252,82 +252,29 @@ class LaneTests(unittest.TestCase):
         self.assertEqual("pending", rows["build"]["status"])
         self.assertTrue(result["record"]["history"])
 
-    def test_frozen_historical_api_receipt_and_unproved_reconstruction(self):
+    def test_supplied_provenance_never_clears_legacy_rows(self):
         record = self.start(required=("planning", "research"))
         record.pop("extra_required")
         d.write(self.store, [record])
-        module = self.root / "historical-module.py"; module.write_text("fixture historical source")
-        execution = self.root / "frozen-execution.json"
-        raw = {"kind": "completed-protocol-start", "caller": "api", "required": ["planning", "research"],
-               "result": {"ok": True, "protocol": record}, "execution_id": "original-fixture-execution",
-               "executed_source_versions": {"module_sha256": "edf83750d79ac87895b94e3bf816ff216e16475151490628a359416aa459eafb"}}
-        execution.write_text(json.dumps({"records": [raw]}))
-        version = "edf83750d79ac87895b94e3bf816ff216e16475151490628a359416aa459eafb"
-        provenance = {k: record[k] for k in ("work_id", "project", "goal", "created_at")}
-        provenance.update(execution_id="original-fixture-execution", source_module={"path": str(module), "sha256": version},
-                          execution={"path": str(execution), "sha256": d.digest(execution)}, locator=["records", 0])
-        proof = self.root / "provenance.json"; review = self.root / "provenance-review.json"
-        def save_provenance():
-            review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "independent-fixture",
-                                          "contract_sha256": d.object_digest(provenance)}))
-            proof.write_text(json.dumps(dict(provenance, review={"path": str(review), "sha256": d.digest(review)})))
-            return {"path": str(proof), "sha256": d.digest(proof)}
-        ref = save_provenance()
-        # Real hash mismatches are refused. Mock ONLY recognized source bytes for this structural fixture.
+        receipt = self.root / "provenance.json"; receipt.write_text(json.dumps({"required": []}))
+        ref = {"path": str(receipt), "sha256": d.digest(receipt)}
         self.reject_unchanged(lambda: self.classify(self.scope(extras=("planning", "research"), provenance=ref)))
-        real_digest = d.digest
-        with patch.object(d, "digest", side_effect=lambda p: version if Path(p) == module else real_digest(p)):
-            result = self.classify(self.scope(extras=("planning", "research"), provenance=ref))
-        self.assertFalse(result["record"]["legacy_extras_unknown"])
-        self.assertEqual(["planning", "research"], result["record"]["extra_required"])
-        self.assertEqual(d.NORMAL | {"research"}, self.required(result["record"]))
-        # Replay variants against the original legacy record. No proposed command or assurance substitutes.
-        for change in [{"required": None}, {"result": {"ok": False}}, {"kind": "proposed-command"},
-                       {"caller": "unknown"}, {"required": ["unknown"]},
-                       {"executed_source_versions": None}, {"executed_source_versions": {"module_sha256": "unrelated"}},
-                       {"execution_id": "unrelated-execution"}, {"execution_id": ""}]:
-            d.write(self.store, [record])
-            execution.write_text(json.dumps({"records": [dict(raw, **change)]}))
-            provenance["execution"]["sha256"] = real_digest(execution)
-            ref = save_provenance()
-            with patch.object(d, "digest", side_effect=lambda p: version if Path(p) == module else real_digest(p)):
-                self.reject_unchanged(lambda: self.classify(self.scope(extras=("planning", "research"), provenance=ref)))
+        result = self.classify(self.scope(extras=("planning", "research")))
+        self.assertTrue(result["record"]["legacy_extras_unknown"])
+        self.assertTrue({s["step_id"] for s in record["steps"] if s["required"]} <= self.required(result["record"]))
 
-    def test_frozen_cli_source_version_binding(self):
-        record = self.start(); record.pop("extra_required"); d.write(self.store, [record])
-        module = self.root / "original-module.py"; module.write_text("synthetic fixture module")
-        cli = self.root / "original-cli.py"; cli.write_text("development_protocol.start(path, wid, project, goal)")
-        module_sha = "edf83750d79ac87895b94e3bf816ff216e16475151490628a359416aa459eafb"
-        cli_sha = "022cb2a001fc5f0f5400901eb96937afe419f9f86de99dcafab582070b1ca9ed"
-        execution = self.root / "original-execution.json"
-        raw = {"kind": "completed-protocol-start", "caller": "cli", "execution_id": "fixture-original",
-            "executed_source_versions": {"module_sha256": module_sha, "cli_sha256": cli_sha},
-            "argv": ["python3", str(cli), "protocol-start", "--work-id", record["work_id"],
-                     "--project", record["project"], "--goal", record["goal"], "--json"],
-            "result": {"ok": True, "protocol": record}}
-        provenance = {k: record[k] for k in ("work_id", "project", "goal", "created_at")}
-        provenance.update(execution_id="fixture-original", source_module={"path": str(module), "sha256": module_sha},
-            source_cli={"path": str(cli), "sha256": cli_sha}, locator=["records", 0])
-        proof = self.root / "cli-provenance.json"; review = self.root / "cli-provenance-review.json"
-        real_digest = d.digest
-        # Synthetic source hashes isolate the binding parser; this never proves historical S9 code.
-        def fixture_digest(path):
-            return module_sha if Path(path) == module else cli_sha if Path(path) == cli else real_digest(path)
-        for versions in [raw["executed_source_versions"], {"module_sha256": module_sha},
-                         {"module_sha256": module_sha, "cli_sha256": "unrelated"}]:
-            d.write(self.store, [record])
-            execution.write_text(json.dumps({"records": [dict(raw, executed_source_versions=versions)]}))
-            provenance["execution"] = {"path": str(execution), "sha256": real_digest(execution)}
-            review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "independent fixture",
-                "contract_sha256": d.object_digest(provenance)}))
-            proof.write_text(json.dumps(dict(provenance, review={"path": str(review), "sha256": real_digest(review)})))
-            ref = {"path": str(proof), "sha256": real_digest(proof)}
-            with patch.object(d, "digest", side_effect=fixture_digest):
-                if versions == raw["executed_source_versions"]:
-                    result = self.classify(self.scope(provenance=ref))
-                    self.assertEqual(d.NORMAL, self.required(result["record"]))
-                else:
-                    self.reject_unchanged(lambda: self.classify(self.scope(provenance=ref)))
+    def test_history_entries_do_not_nest_earlier_history(self):
+        self.start(lane="small", ui=False)
+        for lane in ("normal", "irreversible"):
+            self.classify(self.scope(lane, False), lane)
+        for n in range(3):
+            (self.root / "approved-plan.md").write_text(f"changed scope {n}")
+            d.status(self.store, self.work["work_id"])
+            self.root.joinpath("approved-plan.md").write_text("approved scope")
+            self.classify(self.scope("irreversible", False), "irreversible")
+        history = d.read(self.store)[0]["history"]
+        self.assertGreaterEqual(len(history), 5)
+        self.assertTrue(all("history" not in entry["before"] for entry in history))
 
     def test_scope_invalidation_preserves_na_reason_once(self):
         self.start(lane="normal", ui=False)
@@ -335,7 +282,7 @@ class LaneTests(unittest.TestCase):
         d.step(self.store, self.work["work_id"], "pathway", "pass", str(self.evidence), "true")
         reason = "No research: the exact local module contract is already verified."
         d.step(self.store, self.work["work_id"], "research", "na", reason=reason)
-        before = d.read(self.store)[0]
+        before = d.snapshot(d.read(self.store)[0])
         prior_row = next(row for row in before["steps"] if row["step_id"] == "research")
         (self.root / "approved-plan.md").write_text("changed scope")
         first = d.status(self.store, self.work["work_id"])

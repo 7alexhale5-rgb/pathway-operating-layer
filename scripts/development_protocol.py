@@ -2,7 +2,6 @@
 
 import contextlib
 import copy
-import ast
 import fcntl
 import hashlib
 import json
@@ -197,72 +196,6 @@ def reviewed_document(path, dependencies):
     return document
 
 
-def historical_extras(ref, record, dependencies):
-    """Strict frozen JSON execution receipt, never execute supplied source/history."""
-    p = bound_file(ref, dependencies)
-    evidence = reviewed_document(p, dependencies)
-    if any(evidence.get(k) != record[k] for k in ("work_id", "project", "goal", "created_at")):
-        raise ValueError("historical provenance identity mismatch")
-    module = bound_file(evidence.get("source_module"), dependencies)
-    # Only the known legacy implementation's merged flags can be reconstructed here.
-    if digest(module) != "edf83750d79ac87895b94e3bf816ff216e16475151490628a359416aa459eafb":
-        raise ValueError("unknown historical module version; preserve required rows")
-    raw = json.loads(bound_file(evidence.get("execution"), dependencies).read_text())
-    locator = evidence.get("locator")
-    if not isinstance(locator, list) or not locator:
-        raise ValueError("exact frozen execution record locator required")
-    try:
-        for key in locator:
-            raw = raw[key]
-    except (KeyError, IndexError, TypeError):
-        raise ValueError("execution locator missing") from None
-    if not isinstance(raw, dict) or raw.get("kind") != "completed-protocol-start":
-        raise ValueError("actual completed execution receipt required")
-    execution_id = raw.get("execution_id")
-    versions = raw.get("executed_source_versions")
-    if (not isinstance(execution_id, str) or not execution_id.strip()
-            or evidence.get("execution_id") != execution_id
-            or not isinstance(versions, dict) or versions.get("module_sha256") != digest(module)):
-        raise ValueError("original execution does not bind the executed module version")
-    result = raw.get("result", {})
-    original = result.get("protocol", {})
-    if result.get("ok") is not True or any(original.get(k) != record[k] for k in ("work_id", "project", "goal", "created_at")):
-        raise ValueError("historical successful creation result mismatch")
-    if raw.get("caller") == "cli":
-        cli = bound_file(evidence.get("source_cli"), dependencies)
-        if digest(cli) != "022cb2a001fc5f0f5400901eb96937afe419f9f86de99dcafab582070b1ca9ed":
-            raise ValueError("unknown historical CLI version; preserve required rows")
-        if versions.get("cli_sha256") != digest(cli):
-            raise ValueError("original execution does not bind the executed CLI version")
-        tree = ast.parse(cli.read_text())
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                 and isinstance(n.func.value, ast.Name) and n.func.value.id == "development_protocol" and n.func.attr == "start"]
-        if not calls or any(len(n.args) != 4 or n.keywords for n in calls):
-            raise ValueError("historical CLI does not prove default extra requirements")
-        argv = raw.get("argv")
-        if not isinstance(argv, list) or not all(isinstance(v, str) for v in argv) or "protocol-start" not in argv:
-            raise ValueError("complete historical CLI argv required")
-        pos = argv.index("protocol-start")
-        rest = argv[pos + 1:]
-        allowed = {"--work-id": record["work_id"], "--project": record["project"], "--goal": record["goal"]}
-        found = {}
-        while rest:
-            key = rest.pop(0)
-            if key == "--json":
-                continue
-            if key not in allowed or key in found or not rest:
-                raise ValueError("unknown or incomplete historical CLI arguments")
-            found[key] = rest.pop(0)
-        if found != allowed:
-            raise ValueError("historical CLI identity mismatch")
-        extras = set()
-    elif raw.get("caller") == "api" and isinstance(raw.get("required"), list):
-        extras = scope_inputs(None, None, raw["required"])
-    else:
-        raise ValueError("historical extra arguments unknown")
-    return extras
-
-
 def classify(path, work, lane, ui, evidence, reason, expected):
     scope_inputs(lane, ui)
     if lane is None or not reason.strip() or work.get("status") == "closed":
@@ -295,13 +228,12 @@ def classify(path, work, lane, ui, evidence, reason, expected):
             raise ValueError("declared lane/UI cannot be lowered")
         known = set(record.get("extra_required", []))
         protected = set(record.get("legacy_protected_required", []))
+        # Provenance files are written by the caller and no recorded execution log exists to bind
+        # them to, so they can never clear rows; unknown legacy extras stay protected.
+        if scope.get("provenance"):
+            raise ValueError("supplied provenance cannot clear protected rows")
         if "extra_required" not in record or record.get("legacy_extras_unknown"):
             protected |= {s["step_id"] for s in record["steps"] if s["required"]}
-            if scope.get("provenance"):
-                known |= historical_extras(scope["provenance"], record, deps)
-                protected = set()
-        elif scope.get("provenance"):
-            raise ValueError("known explicit extras cannot be reconstructed away")
         if not known <= extras:
             raise ValueError("extra required rows cannot be removed")
         binding = dict(lane=lane, ui=ui, extra_required=sorted(extras), protected=sorted(protected),
@@ -310,8 +242,9 @@ def classify(path, work, lane, ui, evidence, reason, expected):
             return dict(ok=True, idempotent=True, record=record, **summary(record, record["work_id"]))
         needed = requirements(record["goal"], lane, ui, extras) | protected
         history = record.setdefault("history", [])
-        history.append(dict(timestamp=now(), reason=reason, before=copy.deepcopy(original),
-                            before_sha256=object_digest(original), scope_binding=binding))
+        before = snapshot(original)
+        history.append(dict(timestamp=now(), reason=reason, before=before,
+                            before_sha256=object_digest(before), scope_binding=binding))
         reopen = record.get("scope_binding") is not None
         for row in record["steps"]:
             if row["step_id"] in needed and not row["required"] and row["status"] == "not-applicable":
@@ -331,6 +264,11 @@ def classify(path, work, lane, ui, evidence, reason, expected):
         return dict(ok=True, record=record, **summary(record, record["work_id"]))
 
 
+def snapshot(record):
+    """Copy of a record without its history, so each history entry stays one record in size."""
+    return {k: copy.deepcopy(v) for k, v in record.items() if k != "history"}
+
+
 def record_digest(record):
     clean = copy.deepcopy(record)
     for step_row in clean["steps"]:
@@ -343,7 +281,7 @@ def refresh(record):
     scope_changed = scope_evidence_changed(record.get("scope_dependencies", {}))
     if scope_changed:
         if not record.get("scope_invalid"):
-            before = copy.deepcopy(record)
+            before = snapshot(record)
             record.setdefault("history", []).append(dict(
                 kind="scope-evidence-invalidated", before=before, before_sha256=object_digest(before),
                 source_record_updated_at=before.get("updated_at", before.get("created_at")),

@@ -9024,12 +9024,13 @@ def run_work_start(args, paths):
                 if args.tier is not None and args.tier != existing.get("tier"):
                     raise ValueError("explicit work selector cannot resize tier or itinerary")
                 # Only intentional reactivation fields change; preserve every earned proof and scope field.
-                if prepared is not None and created:
-                    development_protocol.write(paths.development_protocol_path, records + [prepared])
+                # Mark the gate before the checklist write so a failed write still blocks close.
                 updates = dict(status="active", mode="semi-automatic", closeout_readiness="not_ready")
                 if prepared is not None:
                     updates["development_protocol_required"] = True
                 item = update_work_item(paths, wid, **updates)
+                if prepared is not None and created:
+                    development_protocol.write(paths.development_protocol_path, records + [prepared])
                 return {"records": [item], "findings": [], "work_id": wid}
             return _run_work_start_preflighted(args, paths, (records, prepared, created) if prepared is not None else None)
     except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -13744,9 +13745,10 @@ def main(argv=None):
                 if work.get("development_protocol_required") and not any(r["work_id"] == args.work_id for r in records):
                     raise ValueError("required existing checklist missing; cannot recreate")
                 protocol, created = development_protocol.prepare_start(records, args.work_id, args.project, args.goal, lane=lane, ui=ui)
+                # Mark the gate before the checklist write so a failed write still blocks close.
+                update_work_item(paths, args.work_id, development_protocol_required=True)
                 if created:
                     development_protocol.write(paths.development_protocol_path, records + [protocol])
-                update_work_item(paths, args.work_id, development_protocol_required=True)
                 result = {"ok": True, "protocol": protocol, "work_id": args.work_id}
         except (OSError, ValueError, TypeError, KeyError) as exc:
             result = {"ok": False, "error": str(exc)}
