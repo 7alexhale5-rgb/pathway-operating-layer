@@ -259,11 +259,12 @@ class LaneTests(unittest.TestCase):
         module = self.root / "historical-module.py"; module.write_text("fixture historical source")
         execution = self.root / "frozen-execution.json"
         raw = {"kind": "completed-protocol-start", "caller": "api", "required": ["planning", "research"],
-               "result": {"ok": True, "protocol": record}}
+               "result": {"ok": True, "protocol": record}, "execution_id": "original-fixture-execution",
+               "executed_source_versions": {"module_sha256": "edf83750d79ac87895b94e3bf816ff216e16475151490628a359416aa459eafb"}}
         execution.write_text(json.dumps({"records": [raw]}))
         version = "edf83750d79ac87895b94e3bf816ff216e16475151490628a359416aa459eafb"
         provenance = {k: record[k] for k in ("work_id", "project", "goal", "created_at")}
-        provenance.update(source_module={"path": str(module), "sha256": version},
+        provenance.update(execution_id="original-fixture-execution", source_module={"path": str(module), "sha256": version},
                           execution={"path": str(execution), "sha256": d.digest(execution)}, locator=["records", 0])
         proof = self.root / "provenance.json"; review = self.root / "provenance-review.json"
         def save_provenance():
@@ -282,13 +283,51 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(d.NORMAL | {"research"}, self.required(result["record"]))
         # Replay variants against the original legacy record. No proposed command or assurance substitutes.
         for change in [{"required": None}, {"result": {"ok": False}}, {"kind": "proposed-command"},
-                       {"caller": "unknown"}, {"required": ["unknown"]}]:
+                       {"caller": "unknown"}, {"required": ["unknown"]},
+                       {"executed_source_versions": None}, {"executed_source_versions": {"module_sha256": "unrelated"}},
+                       {"execution_id": "unrelated-execution"}, {"execution_id": ""}]:
             d.write(self.store, [record])
             execution.write_text(json.dumps({"records": [dict(raw, **change)]}))
             provenance["execution"]["sha256"] = real_digest(execution)
             ref = save_provenance()
             with patch.object(d, "digest", side_effect=lambda p: version if Path(p) == module else real_digest(p)):
                 self.reject_unchanged(lambda: self.classify(self.scope(extras=("planning", "research"), provenance=ref)))
+
+    def test_frozen_cli_source_version_binding(self):
+        record = self.start(); record.pop("extra_required"); d.write(self.store, [record])
+        module = self.root / "original-module.py"; module.write_text("synthetic fixture module")
+        cli = self.root / "original-cli.py"; cli.write_text("development_protocol.start(path, wid, project, goal)")
+        module_sha = "edf83750d79ac87895b94e3bf816ff216e16475151490628a359416aa459eafb"
+        cli_sha = "022cb2a001fc5f0f5400901eb96937afe419f9f86de99dcafab582070b1ca9ed"
+        execution = self.root / "original-execution.json"
+        raw = {"kind": "completed-protocol-start", "caller": "cli", "execution_id": "fixture-original",
+            "executed_source_versions": {"module_sha256": module_sha, "cli_sha256": cli_sha},
+            "argv": ["python3", str(cli), "protocol-start", "--work-id", record["work_id"],
+                     "--project", record["project"], "--goal", record["goal"], "--json"],
+            "result": {"ok": True, "protocol": record}}
+        provenance = {k: record[k] for k in ("work_id", "project", "goal", "created_at")}
+        provenance.update(execution_id="fixture-original", source_module={"path": str(module), "sha256": module_sha},
+            source_cli={"path": str(cli), "sha256": cli_sha}, locator=["records", 0])
+        proof = self.root / "cli-provenance.json"; review = self.root / "cli-provenance-review.json"
+        real_digest = d.digest
+        # Synthetic source hashes isolate the binding parser; this never proves historical S9 code.
+        def fixture_digest(path):
+            return module_sha if Path(path) == module else cli_sha if Path(path) == cli else real_digest(path)
+        for versions in [raw["executed_source_versions"], {"module_sha256": module_sha},
+                         {"module_sha256": module_sha, "cli_sha256": "unrelated"}]:
+            d.write(self.store, [record])
+            execution.write_text(json.dumps({"records": [dict(raw, executed_source_versions=versions)]}))
+            provenance["execution"] = {"path": str(execution), "sha256": real_digest(execution)}
+            review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "independent fixture",
+                "contract_sha256": d.object_digest(provenance)}))
+            proof.write_text(json.dumps(dict(provenance, review={"path": str(review), "sha256": real_digest(review)})))
+            ref = {"path": str(proof), "sha256": real_digest(proof)}
+            with patch.object(d, "digest", side_effect=fixture_digest):
+                if versions == raw["executed_source_versions"]:
+                    result = self.classify(self.scope(provenance=ref))
+                    self.assertEqual(d.NORMAL, self.required(result["record"]))
+                else:
+                    self.reject_unchanged(lambda: self.classify(self.scope(provenance=ref)))
 
     def test_scope_missing_review_bad_binding_and_stale_writer(self):
         self.start(lane="normal", ui=False)

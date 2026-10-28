@@ -204,6 +204,12 @@ def historical_extras(ref, record, dependencies):
         raise ValueError("execution locator missing") from None
     if not isinstance(raw, dict) or raw.get("kind") != "completed-protocol-start":
         raise ValueError("actual completed execution receipt required")
+    execution_id = raw.get("execution_id")
+    versions = raw.get("executed_source_versions")
+    if (not isinstance(execution_id, str) or not execution_id.strip()
+            or evidence.get("execution_id") != execution_id
+            or not isinstance(versions, dict) or versions.get("module_sha256") != digest(module)):
+        raise ValueError("original execution does not bind the executed module version")
     result = raw.get("result", {})
     original = result.get("protocol", {})
     if result.get("ok") is not True or any(original.get(k) != record[k] for k in ("work_id", "project", "goal", "created_at")):
@@ -212,6 +218,8 @@ def historical_extras(ref, record, dependencies):
         cli = bound_file(evidence.get("source_cli"), dependencies)
         if digest(cli) != "022cb2a001fc5f0f5400901eb96937afe419f9f86de99dcafab582070b1ca9ed":
             raise ValueError("unknown historical CLI version; preserve required rows")
+        if versions.get("cli_sha256") != digest(cli):
+            raise ValueError("original execution does not bind the executed CLI version")
         tree = ast.parse(cli.read_text())
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and isinstance(n.func.value, ast.Name) and n.func.value.id == "development_protocol" and n.func.attr == "start"]
