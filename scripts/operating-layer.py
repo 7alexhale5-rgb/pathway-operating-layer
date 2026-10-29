@@ -8986,7 +8986,9 @@ def run_work_start(args, paths):
             if getattr(args, "development_protocol", False) or matches:
                 if existing and existing.get("status") == "closed" and lane is not None:
                     raise ValueError("reactivate without scope changes, then classify separately")
-                prepared, created = development_protocol.prepare_start(records, wid, project, args.goal, lane=lane, ui=ui)
+                # The checklist stores the work item's exact project: as selected, or as new work will store it.
+                checklist_project = project if selected else str(Path(project).resolve())
+                prepared, created = development_protocol.prepare_start(records, wid, checklist_project, args.goal, lane=lane, ui=ui)
             if selected:
                 if args.tier is not None and args.tier != existing.get("tier"):
                     raise ValueError("explicit work selector cannot resize tier or itinerary")
@@ -13734,7 +13736,7 @@ def main(argv=None):
                 records = development_protocol.read(paths.development_protocol_path)
                 if work.get("development_protocol_required") and not any(r["work_id"] == args.work_id for r in records):
                     raise ValueError("required existing checklist missing; cannot recreate")
-                protocol, created = development_protocol.prepare_start(records, args.work_id, project, args.goal, lane=lane, ui=ui)
+                protocol, created = development_protocol.prepare_start(records, args.work_id, work["project"], args.goal, lane=lane, ui=ui)
                 # Mark the gate before the checklist write so a failed write still blocks close.
                 update_work_item(paths, args.work_id, development_protocol_required=True)
                 if created:

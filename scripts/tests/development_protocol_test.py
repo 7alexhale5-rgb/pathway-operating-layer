@@ -260,26 +260,17 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(frozen, set(retry["record"]["legacy_protected_required"]))
         self.assertTrue(all(s["status"] == "passed" for s in d.read(self.store)[0]["steps"]))
 
-    def test_new_checklist_persists_resolved_project(self):
+    def test_new_checklist_stores_project_verbatim(self):
+        # Callers pass the work item's exact project string; the checklist must never re-derive it
+        # from cwd, or the pair diverges (Grok r7 ca4f, r8 8750, r9 eefe). Shapes from every caller.
         original = Path.cwd()
         try:
             os.chdir(self.root)
-            d.start(self.store, "W-rel", "./not-yet-made", self.goal, lane="small", ui=False)
+            for i, project in enumerate(("client", ".client", "./not-yet-made", "a/b", str(self.root))):
+                d.start(self.store, f"W-shape{i}", project, self.goal, lane="small", ui=False)
+                self.assertEqual(project, d.read(self.store)[-1]["project"])
         finally:
             os.chdir(original)
-        stored = d.read(self.store)[0]["project"]
-        self.assertEqual(str((self.root / "not-yet-made").resolve()), stored)
-
-    def test_new_checklist_keeps_bare_project_name(self):
-        # A bare name is a project name, never cwd-relative (resolve_project_dir's rule), so the
-        # checklist must store it byte-for-byte to stay equal to the work item (Grok r8 8750).
-        original = Path.cwd()
-        try:
-            os.chdir(self.root)
-            d.start(self.store, "W-bare", "client", self.goal, lane="small", ui=False)
-        finally:
-            os.chdir(original)
-        self.assertEqual("client", d.read(self.store)[0]["project"])
 
     def test_classify_parses_only_the_bytes_it_hashed(self):
         self.start()

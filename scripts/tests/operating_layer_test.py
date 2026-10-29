@@ -953,6 +953,39 @@ def test_security_corrections_regressions():
         + result.stderr,
     )
 
+def test_protocol_checklist_project_equals_work_item():
+    # Grok r8 8750 + r9 eefe: the checklist stores the work item's project string exactly,
+    # whatever its shape, so identity checks never compare a cwd guess with the canonical value.
+    reset()
+    ledger = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    checklist = ROOT / "out" / "operator-intelligence" / "development-protocol.json"
+
+    def pair(wid):
+        item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == wid)
+        record = next(r for r in read_json(checklist) if r["work_id"] == wid)
+        return item["project"], record["project"]
+
+    goal = "Fix a project that does not exist yet"
+    fresh, _ = run("work-start", ["--project", "never-made-c29", "--goal", goal, "--development-protocol"])
+    work_proj, list_proj = pair(fresh["work_id"])
+    check(work_proj == list_proj, f"new bare name: checklist {list_proj!r} equals work item {work_proj!r}")
+    for legacy in (".client-c29", "missing-c29/sub"):
+        reset()
+        start, _ = run("work-start", ["--project", str(ROOT / "projects"), "--goal", goal])
+        wid = start["work_id"]
+        items = [json.loads(l) for l in ledger.read_text().splitlines() if l]
+        for item in items:
+            if item["work_id"] == wid:
+                item["project"] = legacy
+        ledger.write_text("".join(json.dumps(i) + "\n" for i in items))
+        started, _ = run("protocol-start", ["--work-id", wid, "--project", legacy, "--goal", goal])
+        check(started.get("ok") is True, f"legacy {legacy!r} protocol-start accepted: {started}")
+        work_proj, list_proj = pair(wid)
+        check(work_proj == list_proj == legacy, f"legacy {legacy!r}: checklist {list_proj!r} equals work item")
+        again, _ = run("work-start", ["--work-id", wid, "--project", legacy, "--goal", goal, "--development-protocol"])
+        check(again.get("ok", True) is not False, f"legacy {legacy!r} selected re-start keeps identity: {again}")
+
+
 def test_protocol_uses_canonical_work_identity():
     reset()
     missing = "./missing-protocol-project"
@@ -9645,6 +9678,7 @@ def main():
         test_all_smoke_outputs_parse_and_redact,
         test_improve_and_compare_control_loop,
         test_security_corrections_regressions,
+        test_protocol_checklist_project_equals_work_item,
         test_protocol_uses_canonical_work_identity,
         test_daily_work_envelope_and_pathway_cooperation,
         test_daily_work_stale_measurement_detection,
