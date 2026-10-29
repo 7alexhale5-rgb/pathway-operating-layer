@@ -8932,7 +8932,86 @@ def write_compare_artifacts(paths, trend):
     return md_path, html_path
 
 
+def protocol_work_items(paths):
+    """Strict read for protocol mutations; never silently discard malformed work rows."""
+    p = paths.work_items_path
+    rows = [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
+    if any(not isinstance(r, dict) or not r.get("work_id") for r in rows):
+        raise ValueError("invalid work item store")
+    return rows
+
+
+def protocol_work_identity(items, work_id, project=None, goal=None):
+    found = [w for w in items if w["work_id"] == work_id]
+    if not re.fullmatch(r"W-[A-Za-z0-9][A-Za-z0-9_.-]*", work_id or "") or len(found) != 1:
+        raise ValueError("one existing explicit work ID required")
+    work = found[0]
+    if (project is not None and work.get("project") != str(project)) or (goal is not None and work.get("goal") != goal):
+        raise ValueError("original work project and goal must match exactly")
+    return work
+
+
+def protocol_scope(args):
+    lane = getattr(args, "protocol_lane", None)
+    raw_ui = getattr(args, "protocol_ui", None)
+    ui = None if raw_ui is None else raw_ui == "yes"
+    development_protocol.scope_inputs(lane, ui)
+    return lane, ui
+
+
 def run_work_start(args, paths):
+    """Preflight both stores under a consistent lock order before any work mutation."""
+    try:
+        lane, ui = protocol_scope(args)
+        if lane is not None and not getattr(args, "development_protocol", False):
+            raise ValueError("explicit protocol scope requires --development-protocol")
+        if not args.project or not args.goal:
+            return _run_work_start_preflighted(args, paths)
+        project = resolve_project_dir(args.project, paths.projects_root)
+        with development_protocol.locked(paths.work_items_path), development_protocol.locked(paths.development_protocol_path):
+            items = protocol_work_items(paths)
+            selected = getattr(args, "work_id", None)
+            wid = selected or stable_work_id(project, args.goal)
+            candidates = [w for w in items if w["work_id"] == wid]
+            existing = protocol_work_identity(items, wid, project, args.goal) if selected or candidates else None
+            records = development_protocol.read(paths.development_protocol_path)
+            matches = [r for r in records if r["work_id"] == wid]
+            if len(matches) > 1:
+                raise ValueError("duplicate protocol record")
+            if existing and existing.get("development_protocol_required") and not matches:
+                raise ValueError("required existing checklist missing; cannot recreate")
+            if matches and existing is None:
+                raise ValueError("protocol has no matching work item")
+            prepared = None
+            if getattr(args, "development_protocol", False) or matches:
+                if existing and existing.get("status") == "closed" and lane is not None:
+                    raise ValueError("reactivate without scope changes, then classify separately")
+                # The checklist stores the project later checks expect: the selected item's, or new work's.
+                # A bare name for new work must bind under the projects root, never via the cwd fallback.
+                raw = str(args.project).strip()
+                if not selected and os.sep not in raw and not raw.startswith("."):
+                    protocol_project_dir(raw, paths.projects_root)
+                checklist_project = (protocol_expected_identity(paths, wid)[0] if selected
+                                     else str(Path(project).resolve()))
+                prepared, created = development_protocol.prepare_start(records, wid, checklist_project, args.goal, lane=lane, ui=ui)
+            if selected:
+                if args.tier is not None and args.tier != existing.get("tier"):
+                    raise ValueError("explicit work selector cannot resize tier or itinerary")
+                # Only intentional reactivation fields change; preserve every earned proof and scope field.
+                # Mark the gate before the checklist write so a failed write still blocks close.
+                updates = dict(status="active", mode="semi-automatic", closeout_readiness="not_ready")
+                if prepared is not None:
+                    updates.update(development_protocol_required=True, project=checklist_project)
+                item = update_work_item(paths, wid, **updates)
+                if prepared is not None and created:
+                    development_protocol.write(paths.development_protocol_path, records + [prepared])
+                return {"records": [item], "findings": [], "work_id": wid}
+            return _run_work_start_preflighted(args, paths, (records, prepared, created) if prepared is not None else None)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _run_work_start_preflighted(args, paths, protocol_preflight=None):
     if not args.project or not args.goal:
         return {
             "findings": [finding(
@@ -8991,10 +9070,12 @@ def run_work_start(args, paths):
         risk_overlays=contract["risk_overlays"],
         itinerary=itinerary,
         closeout_readiness="not_ready",
+        **({"development_protocol_required": True} if protocol_preflight is not None else {}),
     )
-    if getattr(args, "development_protocol", False):
-        development_protocol.start(paths.development_protocol_path, work_id, project_path, args.goal)
-        update_work_item(paths, work_id, development_protocol_required=True)
+    if protocol_preflight is not None:
+        records, protocol, created = protocol_preflight
+        if created:
+            development_protocol.write(paths.development_protocol_path, records + [protocol])
     dashboard = build_daily_dashboard(paths)
     return {"records": [item], "findings": [], "work_id": work_id, "dashboard": str(paths.daily_dashboard_path), "daily": dashboard}
 
@@ -9736,15 +9817,37 @@ def run_work_log(args, paths):
     }
 
 
-def protocol_work_identity(paths, work_id):
+def protocol_expected_identity(paths, work_id):
     item = next((row for row in read_ndjson(paths.work_items_path)
                  if row.get("work_id") == work_id), None)
     if not item or not item.get("project") or not item.get("goal"):
         raise ValueError("protocol requires an existing canonical work item")
-    return resolve_project_dir(item["project"], paths.projects_root), item["goal"]
+    return protocol_project_dir(item["project"], paths.projects_root), item["goal"]
+
+
+def protocol_project_dir(raw, projects_root):
+    """The one absolute project a checklist is bound to; refuse anything that depends on cwd."""
+    raw = str(raw)
+    if Path(raw).is_absolute():
+        return resolve_project_dir(raw, projects_root)
+    if os.sep in raw or raw.startswith("."):
+        raise ValueError("work item project is a relative path; restart work with an absolute --project")
+    found = resolve_project_dir(raw, projects_root)
+    root = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser().resolve()
+    # Bare names bind only through the projects root; resolve_project_dir's last-resort cwd match is a guess.
+    if not Path(found).is_absolute() or not Path(found).is_relative_to(root):
+        raise ValueError("project name not found under the projects root; restart work with an absolute --project")
+    return found
 
 
 def run_work_close(args, paths):
+    # Match start/classify lock order. Hold the protocol lock through the closed write so no
+    # protocol-step or scope invalidation lands between the readiness read and the close.
+    with development_protocol.locked(paths.work_items_path), development_protocol.locked(paths.development_protocol_path):
+        return _run_work_close_locked(args, paths)
+
+
+def _run_work_close_locked(args, paths):
     if not args.work_id:
         return {
             "findings": [finding(
@@ -9761,11 +9864,20 @@ def run_work_close(args, paths):
         }
     summary = work_status_summary(paths, args.work_id)
     findings = []
-    protocol_ready, protocol_status = development_protocol.enforce_close(
-        paths.development_protocol_path, args.work_id,
-        (resolve_project_dir(summary["work_item"]["project"], paths.projects_root),
-         summary["work_item"]["goal"]) if summary.get("work_item") else None,
-    )
+    work = summary.get("work_item")
+    try:
+        # Same binding rule as protocol-status/step; never fall back to a cwd match.
+        identity = (protocol_project_dir(work["project"], paths.projects_root), work["goal"]) if work else None
+    except ValueError as exc:
+        try:
+            has_checklist = any(r["work_id"] == args.work_id for r in development_protocol.read(paths.development_protocol_path))
+        except (ValueError, KeyError, TypeError, OSError):
+            has_checklist = True  # an unreadable store fails closed, as enforce_close does
+        protocol_ready = not has_checklist
+        protocol_status = dict(exists=has_checklist, ready=False, open=["invalid-protocol-identity"], error=str(exc))
+    else:
+        protocol_ready, protocol_status = development_protocol.enforce_close(
+            paths.development_protocol_path, args.work_id, identity, lock=False)
     if (summary.get("work_item") or {}).get("development_protocol_required") and not protocol_status.get("exists"):
         protocol_ready = False
     if not protocol_ready:
@@ -13500,7 +13612,7 @@ def build_parser():
         "improve", "compare", "portfolio-next", "rule-map", "cockpit", "pfos-cockpit", "work-start", "work-status", "work-log", "work-close", "work-cover", "work-daily", "approval-issue", "approval-invalidate",
         "proof-add", "proof-report", "pathway-trust", "pathway-next", "pathway-run",
         "pathway-pilot", "pathway-decision", "ingest-review", "pathway-metric", "pathway-audit", "tier-calibrate", "pathway-evaluate",
-        "protocol-start", "protocol-status", "protocol-step", "all"
+        "protocol-start", "protocol-status", "protocol-step", "protocol-classify", "all"
     ])
     parser.add_argument("--claude-home", default=str(DEFAULT_CLAUDE_HOME))
     parser.add_argument("--codex-home", default=str(DEFAULT_CODEX_HOME))
@@ -13552,6 +13664,9 @@ def build_parser():
     parser.add_argument("--consumer", help="approval-issue: exact root-bound consumer for a live release ticket.")
     parser.add_argument("--step", help="development protocol step id.")
     parser.add_argument("--development-protocol", action="store_true")
+    parser.add_argument("--protocol-lane", choices=["small", "normal", "irreversible"], help="Paired with --protocol-ui. Omit both to preserve conservative legacy behavior.")
+    parser.add_argument("--protocol-ui", choices=["yes", "no"], help="Explicit UI scope; requires --protocol-lane.")
+    parser.add_argument("--expected-record-sha", help="protocol-classify: digest from status; reviewed scope evidence and reason required. Closed work must first use work-start with the original --work-id.")
     parser.add_argument("--instrument", action="append", default=[], help="Hash a prompt, rubric, scorer, or verifier dependency.")
     return parser
 
@@ -13559,6 +13674,10 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if (args.protocol_lane is not None or args.protocol_ui is not None) and args.subcommand not in {"work-start", "protocol-start", "protocol-classify"}:
+        parser.error("protocol scope flags apply only to work-start, protocol-start or protocol-classify")
+    if args.expected_record_sha is not None and args.subcommand != "protocol-classify":
+        parser.error("--expected-record-sha applies only to protocol-classify")
     paths = Paths(args)
     if args.subcommand == "boundary" and args.check_write:
         scan_boundary(args, paths, write_outputs=False)
@@ -13631,33 +13750,45 @@ def main(argv=None):
     elif args.subcommand == "pathway-evaluate":
         result = run_pathway_evaluate(args, paths)
     elif args.subcommand == "protocol-start":
-        if not args.work_id or not args.project or not args.goal:
-            result = {
-                "ok": False,
-                "error": "protocol-start requires --work-id, --project, and --goal",
-            }
-        else:
-            try:
-                project, goal = protocol_work_identity(paths, args.work_id)
-                if str(Path(resolve_project_dir(args.project, paths.projects_root)).resolve()) != project or args.goal != goal:
-                    result = {"ok": False, "error": "protocol project and goal must match the canonical work item"}
-                else:
-                    protocol = development_protocol.start(
-                        paths.development_protocol_path, args.work_id, project, goal,
-                    )
-                    update_work_item(paths, args.work_id, development_protocol_required=True)
-                    result = {
-                        "ok": True,
-                        "protocol": protocol,
-                        "work_id": args.work_id,
-                    }
-            except (OSError, ValueError, TypeError) as exc:
-                result = {"ok": False, "error": str(exc)}
+        try:
+            lane, ui = protocol_scope(args)
+            if not args.work_id or not args.project or not args.goal:
+                raise ValueError("protocol-start requires --work-id, --project, and --goal")
+            with development_protocol.locked(paths.work_items_path), development_protocol.locked(paths.development_protocol_path):
+                work = protocol_work_identity(protocol_work_items(paths), args.work_id, goal=args.goal)
+                project, _ = protocol_expected_identity(paths, args.work_id)
+                if str(Path(resolve_project_dir(args.project, paths.projects_root)).resolve()) != str(Path(project).resolve()):
+                    raise ValueError("protocol project and goal must match the canonical work item")
+                if work.get("status") == "closed":
+                    raise ValueError("reactivate original work explicitly before protocol-start")
+                records = development_protocol.read(paths.development_protocol_path)
+                if work.get("development_protocol_required") and not any(r["work_id"] == args.work_id for r in records):
+                    raise ValueError("required existing checklist missing; cannot recreate")
+                protocol, created = development_protocol.prepare_start(records, args.work_id, project, args.goal, lane=lane, ui=ui)
+                # Mark the gate before the checklist write so a failed write still blocks close.
+                # Pin the work item to the checklist's absolute project so every later compare agrees.
+                update_work_item(paths, args.work_id, development_protocol_required=True, project=project)
+                if created:
+                    development_protocol.write(paths.development_protocol_path, records + [protocol])
+                result = {"ok": True, "protocol": protocol, "work_id": args.work_id}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            result = {"ok": False, "error": str(exc)}
+    elif args.subcommand == "protocol-classify":
+        try:
+            lane, ui = protocol_scope(args)
+            if not args.work_id or not args.evidence or not args.reason or not args.expected_record_sha:
+                raise ValueError("classification requires work ID, reviewed evidence, reason and expected digest")
+            with development_protocol.locked(paths.work_items_path):
+                work = protocol_work_identity(protocol_work_items(paths), args.work_id)
+                result = development_protocol.classify(paths.development_protocol_path, work, lane, ui,
+                    args.evidence, args.reason, args.expected_record_sha)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            result = {"ok": False, "error": str(exc)}
     elif args.subcommand == "protocol-status":
         try:
             result = development_protocol.status(
                 paths.development_protocol_path, args.work_id or "",
-                protocol_work_identity(paths, args.work_id or ""),
+                protocol_expected_identity(paths, args.work_id or ""),
             )
         except (OSError, ValueError, TypeError) as exc:
             result = {"ok": False, "error": str(exc)}
@@ -13672,14 +13803,15 @@ def main(argv=None):
                 args.verify_cmd or "",
                 args.reason or "",
                 args.instrument,
-                expected_identity=protocol_work_identity(paths, args.work_id or ""),
+                run_verifier=lambda command, cwd: run_verifier_command(command, cwd, timeout=60)[:2],
+                expected_identity=protocol_expected_identity(paths, args.work_id or ""),
             )
         except (OSError, ValueError, TypeError) as exc:
             result = {"ok": False, "error": str(exc)}
     else:
         result = run_all(args, paths)
     print_result(result, args.json)
-    if args.subcommand.startswith("protocol-") and result.get("ok") is False:
+    if (args.subcommand.startswith("protocol-") or args.subcommand == "work-start") and result.get("ok") is False:
         return 1
     if args.subcommand in APPROVAL_MUTATION_SUBCOMMANDS:
         records = result.get("records") if isinstance(result, dict) else None

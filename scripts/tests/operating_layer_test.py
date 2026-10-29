@@ -953,6 +953,82 @@ def test_security_corrections_regressions():
         + result.stderr,
     )
 
+def test_protocol_checklist_project_equals_work_item():
+    # Grok r8 8750, r9 eefe, r10 dd87: the checklist stores the absolute project that later
+    # status/step/close checks expect, never a cwd guess; with no absolute project it refuses.
+    reset()
+    ledger = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    checklist = ROOT / "out" / "operator-intelligence" / "development-protocol.json"
+    goal = "Fix a project that does not exist yet"
+
+    def record(wid):
+        rows = read_json(checklist) if checklist.exists() else []
+        return next((r for r in rows if r["work_id"] == wid), None)
+
+    def legacy_item(project):
+        reset()
+        start, _ = run("work-start", ["--project", str(ROOT / "projects"), "--goal", goal])
+        items = [json.loads(l) for l in ledger.read_text().splitlines() if l]
+        for item in items:
+            if item["work_id"] == start["work_id"]:
+                item["project"] = project
+        ledger.write_text("".join(json.dumps(i) + "\n" for i in items))
+        return start["work_id"]
+
+    # New protocol work: a bare name binds only under the projects root (r12 44b0); a path binds as typed.
+    fresh, _ = run("work-start", ["--project", "never-made-c29", "--goal", goal, "--development-protocol"])
+    check(fresh.get("ok") is False and not checklist.exists(), f"new missing bare name refuses protocol work: {fresh}")
+    (ROOT / "job" / "cwd-new-c29").mkdir(parents=True)
+    argv = base_cmd("work-start", ["--project", "cwd-new-c29", "--goal", goal, "--development-protocol"])
+    out = json.loads(subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job").stdout or "{}")
+    check(out.get("ok") is False and not checklist.exists(), f"new bare name found only in cwd refuses protocol work: {out}")
+    argv = base_cmd("work-start", ["--project", "./cwd-new-c29", "--goal", goal, "--development-protocol"])
+    out = json.loads(subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job").stdout or "{}")
+    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == out["work_id"])
+    check(item["project"] == str((ROOT / "job" / "cwd-new-c29").resolve()) == record(out["work_id"])["project"],
+          "new explicit relative path binds as typed in work item and checklist")
+    # A legacy bare name that resolves under the projects root keeps its earned rows.
+    wid = legacy_item("legacy-c29")
+    write("projects/legacy-c29/README.md", "# legacy\n")
+    started, _ = run("protocol-start", ["--work-id", wid, "--project", "legacy-c29", "--goal", goal])
+    check(started.get("ok") is True, f"legacy existing bare name enrolls: {started}")
+    first = record(wid)["steps"][0]["step_id"]
+    run("protocol-step", ["--work-id", wid, "--step", first, "--result", "running"])
+    status, _ = run("protocol-status", ["--work-id", wid])
+    kept = next(s for s in status.get("steps", []) if s["step_id"] == first)
+    check(kept["status"] == "running" and Path(record(wid)["project"]).is_absolute(),
+          f"legacy bare name keeps step rows across status: {kept}")
+    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == wid)
+    check(item["project"] == record(wid)["project"],
+          "legacy bare name: enrollment pins the work item to the checklist's absolute project (classify compares them)")
+    # A bare name found only in the caller's cwd is a guess, not the project: refuse it.
+    wid = legacy_item("cwd-only-c29")
+    (ROOT / "job" / "cwd-only-c29").mkdir(parents=True)
+    argv = base_cmd("protocol-start", ["--work-id", wid, "--project", "cwd-only-c29", "--goal", goal])
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job")
+    out = json.loads(proc.stdout or "{}")
+    check(out.get("ok") is False and record(wid) is None, f"bare name found only in cwd refuses enrollment: {out}")
+    # Grok r12 44b0: close must apply the same binding rule as status, never a cwd-only match.
+    sys.path.insert(0, str(CLI.parent))
+    import development_protocol as dp
+    bound, _ = dp.prepare_start([], wid, str((ROOT / "job" / "cwd-only-c29").resolve()), goal, lane="small", ui=False)
+    for row in bound["steps"]:
+        row.update(status="not-applicable", exception_reason="fixture")
+    checklist.write_text(json.dumps([bound]))
+    argv = base_cmd("work-close", ["--work-id", wid])
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job")
+    closed = json.loads(proc.stdout or "{}")
+    check("work-close-protocol-incomplete" in ids(closed),
+          f"close refuses a checklist bound to a cwd-only bare name: {ids(closed)}")
+    # Without a knowable absolute directory, enrollment refuses instead of storing a guess.
+    for legacy in ("missing-bare-c29", ".client-c29", "missing-c29/sub"):
+        wid = legacy_item(legacy)
+        started, _ = run("protocol-start", ["--work-id", wid, "--project", legacy, "--goal", goal])
+        again, _ = run("work-start", ["--work-id", wid, "--project", legacy, "--goal", goal, "--development-protocol"])
+        check(started.get("ok") is False and again.get("ok") is False and record(wid) is None,
+              f"legacy {legacy!r} with no absolute project refuses enrollment: {started} {again}")
+
+
 def test_protocol_uses_canonical_work_identity():
     reset()
     missing = "./missing-protocol-project"
@@ -9304,8 +9380,334 @@ def test_research_focus_map_derivation_and_addendum_verifier():
           "no focus key still returns None")
 
 
+
+def test_protocol_explicit_lane_cli_preflight_and_reactivation():
+    reset()
+    project = ROOT / "projects" / "protocol-fixture"
+    project.mkdir(parents=True)
+    goal = "Normal feature with unchanged UI compatibility"
+    flags = ["--project", str(project), "--goal", goal, "--development-protocol"]
+    item, proc = run("work-start", flags + ["--protocol-lane", "normal", "--protocol-ui", "no"])
+    check(proc.returncode == 0 and item and item.get("work_id"), "explicit protocol work-start accepts paired scope")
+    if proc.returncode or not item or not item.get("work_id"):
+        return
+    wid = item["work_id"]
+    store = ROOT / "out" / "operator-intelligence" / "development-protocol.json"
+    works = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    record = read_json(store)[0]
+    check(sum(r["required"] for r in record["steps"]) == 9, "explicit non-UI CLI ignores UI goal word")
+    baseline = (store.read_bytes(), works.read_bytes())
+    for command, args in [
+        ("work-start", flags + ["--protocol-lane", "normal"]),
+        ("work-start", flags + ["--work-id", "not-an-id"]),
+        ("work-start", flags + ["--work-id", "W-unknown"]),
+        ("work-start", flags + ["--work-id", wid, "--protocol-lane", "small", "--protocol-ui", "no"]),
+        ("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", "wrong goal"]),
+        ("protocol-status", ["--work-id", wid, "--protocol-lane", "normal", "--protocol-ui", "no"]),
+    ]:
+        _, rejected = run(command, args)
+        check(rejected.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+              "protocol preflight rejection preserves both stores: " + command + str(args[-2:]))
+    rows = [json.loads(l) for l in works.read_text().splitlines()]
+    original = rows[0]
+    original.update(status="closed", proof_marker="keep", tier="live")
+    # Distinct historical ID proves explicit selection does not use today's date-derived ID.
+    older = dict(original, work_id="W-20000101-protocol-fixture-old", status="closed")
+    works.write_text("\n".join(json.dumps(x) for x in [original, older]) + "\n")
+    prior = read_json(store)[0]
+    older_protocol = dict(prior, work_id=older["work_id"])
+    store.write_text(json.dumps([prior, older_protocol]))
+    before_store = store.read_bytes()
+    closed_baseline = (before_store, works.read_bytes())
+    _, rejected = run("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])
+    check(rejected.returncode != 0 and (store.read_bytes(), works.read_bytes()) == closed_baseline,
+          "closed protocol-start does not reactivate or mutate")
+    resumed, proc = run("work-start", flags + ["--work-id", older["work_id"]])
+    after = [json.loads(l) for l in works.read_text().splitlines()]
+    selected = next(x for x in after if x["work_id"] == older["work_id"])
+    check(proc.returncode == 0 and resumed.get("work_id") == older["work_id"] and selected["status"] == "active",
+          "explicit cross-day original ID reactivates")
+    check(store.read_bytes() == before_store, "reactivation preserves exact checklist bytes")
+    check(all(selected.get(k) == older.get(k) for k in ("tier", "itinerary", "outcome_profile", "risk_overlays", "proof_marker")),
+          "explicit reactivation preserves scope itinerary and proof")
+    check(next(x for x in after if x["work_id"] == wid)["status"] == "closed", "same-goal sibling remains closed")
+    baseline = (store.read_bytes(), works.read_bytes())
+    _, rejected = run("work-start", flags + ["--work-id", older["work_id"], "--tier", "prototype"])
+    check(rejected.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+          "explicit selector cannot retier")
+    # Same-day selection and omitted selection must never choose an older sibling.
+    resumed, proc = run("work-start", flags + ["--work-id", wid])
+    check(proc.returncode == 0 and resumed.get("work_id") == wid and store.read_bytes() == before_store,
+          "explicit same-day ID reopens without checklist edits")
+    resumed, proc = run("work-start", flags)
+    check(proc.returncode == 0 and resumed.get("work_id") == wid,
+          "omitted ID retains today's derived identity")
+    baseline = (store.read_bytes(), works.read_bytes())
+    for change in [["--work-id", wid, "--goal", "foreign"], ["--work-id", wid, "--project", str(project.parent)],
+                   ["--work-id", wid, "--protocol-lane", "normal"]]:
+        _, proc = run("work-start", flags + change)
+        check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+              "identity and partial scope failures preserve both stores " + str(change[-2:]))
+    works.write_bytes(baseline[1] + baseline[1].splitlines(keepends=True)[0])
+    duplicate = (store.read_bytes(), works.read_bytes())
+    _, proc = run("work-start", flags + ["--work-id", wid])
+    check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == duplicate,
+          "duplicate explicit work identity refuses unchanged")
+    works.write_bytes(baseline[1])
+    for malformed, destination in [(b"{broken", store), (b"{broken", works)]:
+        destination.write_bytes(malformed)
+        corrupt = (store.read_bytes(), works.read_bytes())
+        _, proc = run("work-start", flags + ["--work-id", wid])
+        check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == corrupt,
+              "malformed store refuses without work activation")
+        store.write_bytes(baseline[0]); works.write_bytes(baseline[1])
+    # protocol-start agrees with work-start on scope and cannot silently change it.
+    started, proc = run("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal,
+                        "--protocol-lane", "normal", "--protocol-ui", "no"])
+    check(proc.returncode == 0 and sum(r["required"] for r in started["protocol"]["steps"]) == 9,
+          "protocol-start uses identical explicit applicability")
+    # Exercise the actual recovery CLI with an independently reviewed frozen scope fixture.
+    scope = project / "scope.json"; plan = project / "plan.md"; review = project / "review.json"
+    plan.write_text("fixture reviewed plan")
+    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    body = {"work_id": wid, "project": str(project), "goal_sha256": hashlib.sha256(goal.encode()).hexdigest(),
+            "lane": "normal", "ui": False, "extra_required": [], "reason": "fixture review",
+            "approved_plan": {"path": str(plan), "sha256": sha(plan)}}
+    contract_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "independent fixture", "contract_sha256": contract_hash}))
+    body["review"] = {"path": str(review), "sha256": sha(review)}; scope.write_text(json.dumps(body))
+    status, _ = run("protocol-status", ["--work-id", wid])
+    classify_args = ["--work-id", wid, "--protocol-lane", "normal", "--protocol-ui", "no", "--evidence", str(scope),
+                     "--reason", "fixture reviewed classification", "--expected-record-sha", status["record_sha256"]]
+    classified, proc = run("protocol-classify", classify_args)
+    check(proc.returncode == 0 and classified.get("ok") and not classified.get("ready"),
+          "actual CLI classification keeps pending gates")
+    baseline = (store.read_bytes(), works.read_bytes())
+    _, proc = run("protocol-classify", classify_args)
+    check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+          "stale CLI classification leaves both stores unchanged")
+    plan.write_text("changed approved plan")
+    baseline = (store.read_bytes(), works.read_bytes())
+    _, proc = run("work-start", flags + ["--work-id", wid])
+    check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+          "stale evidence preflight cannot activate or write status")
+    status, _ = run("protocol-status", ["--work-id", wid])
+    check(status.get("scope_invalid") and not status.get("ready"), "changed scope cannot pass closeout")
+    store.unlink()
+    before_work = works.read_bytes()
+    _, rejected = run("work-start", flags + ["--work-id", older["work_id"]])
+    check(rejected.returncode != 0 and not store.exists() and works.read_bytes() == before_work,
+          "missing required protocol is not silently recreated")
+
+
+def test_protocol_work_id_with_dot_stays_selectable():
+    # stable_work_id keeps '.' from the goal slug, so every protocol path must accept it.
+    reset()
+    project = ROOT / "projects" / "protocol-dot-fixture"; project.mkdir(parents=True)
+    goal = "Ship 1.0 release notes"
+    flags = ["--project", str(project), "--goal", goal, "--development-protocol"]
+    item, proc = run("work-start", flags + ["--protocol-lane", "small", "--protocol-ui", "no"])
+    wid = (item or {}).get("work_id", "")
+    check(proc.returncode == 0 and "." in wid, "dotted goal yields a dotted work ID")
+    if proc.returncode or "." not in wid:
+        return
+    for command, args in [("work-start", flags), ("work-start", flags + ["--work-id", wid]),
+                          ("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])]:
+        out, proc = run(command, args)
+        check(proc.returncode == 0, "dotted work ID accepted by " + command + str(args[-2:]))
+
+
+def test_protocol_step_cli_keeps_operator_shell_verifier():
+    # The CLI hands protocol-step its documented operator-trust verifier runner, so shell
+    # syntax such as `cd X && cmd` keeps working there while the module itself runs no shell.
+    reset()
+    project = ROOT / "projects" / "protocol-shell-fixture"; project.mkdir(parents=True)
+    item, proc = run("work-start", ["--project", str(project), "--goal", "shell verifier fixture",
+                     "--development-protocol", "--protocol-lane", "small", "--protocol-ui", "no"])
+    check(proc.returncode == 0 and item.get("work_id"), "protocol work starts for shell verifier fixture")
+    if proc.returncode or not item.get("work_id"):
+        return
+    evidence = project / "proof.txt"; evidence.write_text("proof")
+    marker = project / "shell-ran"
+    step, proc = run("protocol-step", ["--work-id", item["work_id"], "--step", "pathway", "--result", "pass",
+                     "--evidence", str(evidence), "--verify-cmd", f"false || touch {marker}"])
+    check(proc.returncode == 0 and step.get("ok") and marker.exists(),
+          "CLI protocol-step runs operator shell syntax through the shared verifier runner")
+
+
+def test_protocol_first_write_gate_survives_checklist_io_failure():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    mod = load_cli("first_write_gate")
+    # (existing work status, explicit lane): new work, unmarked active work, and an unmarked
+    # closed item reopened without a scope change (a scoped reopen is refused before any write).
+    for existing, lane, selected in ((None, "normal", False), ("active", "normal", False), ("closed", None, False),
+                                     ("closed", "normal", False), ("active", None, True)):
+        reset()
+        project = ROOT / "projects" / "gate-fixture"; project.mkdir()
+        args = SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
+            projects_root=str(ROOT / "projects"), output_root=str(ROOT / "out"),
+            project=str(project), goal="ordinary protocol gate", work_id=None, tier=None,
+            development_protocol=True, protocol_lane=lane, protocol_ui=None if lane is None else "no")
+        paths = mod.Paths(args); paths.operator_intel.mkdir(parents=True)
+        wid = mod.stable_work_id(project, args.goal)
+        if selected:
+            args.work_id = wid
+        if existing:
+            mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project),
+                "goal": args.goal, "status": existing, "proof_marker": "preserve"}])
+        before = paths.work_items_path.read_bytes() if existing else None
+        with patch.object(mod.development_protocol, "write", side_effect=OSError("injected checklist write failure")):
+            result = mod.run_work_start(args, paths)
+        if existing == "closed" and lane is not None:
+            check(result.get("ok") is False and paths.work_items_path.read_bytes() == before
+                  and not paths.development_protocol_path.exists(),
+                  "scoped reopen of closed work is refused before any write")
+            continue
+        item = mod.read_ndjson(paths.work_items_path)[0]
+        check(result.get("ok") is False and not paths.development_protocol_path.exists(),
+              f"ordinary protocol start reports checklist failure existing={existing} selected={selected}")
+        check(item.get("development_protocol_required") is True,
+              f"first work write retains required gate existing={existing} selected={selected}")
+        if existing: check(item.get("proof_marker") == "preserve", "unmarked reopen preserves unrelated proof")
+        close_result = {}
+        with patch.object(mod, "work_status_summary", return_value={"work_item": item, "closeout_readiness": "ready"}), \
+             patch.object(mod, "build_daily_dashboard", return_value={}), \
+             patch.object(mod, "update_work_item", side_effect=AssertionError("unguarded closure")):
+            try: close_result = mod.run_work_close(SimpleNamespace(work_id=wid), paths)
+            except AssertionError: pass
+        check(close_result.get("closed") is False,
+              f"missing checklist refuses close despite otherwise-ready work existing={existing} selected={selected}")
+
+
+def test_protocol_start_gate_survives_checklist_io_failure():
+    # protocol-start on active, unmarked work: a failed checklist write must still block close.
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_start_gate")
+    project = ROOT / "projects" / "start-gate-fixture"; project.mkdir()
+    goal = "ordinary protocol-start gate"
+    paths = mod.Paths(SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
+        projects_root=str(ROOT / "projects"), output_root=str(ROOT / "out")))
+    paths.operator_intel.mkdir(parents=True)
+    wid = mod.stable_work_id(project, goal)
+    mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project), "goal": goal, "status": "active"}])
+    argv = base_cmd("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])[2:]
+    with patch.object(mod.development_protocol, "write", side_effect=OSError("injected checklist write failure")), \
+         contextlib.redirect_stdout(io.StringIO()):
+        code = mod.main(argv)
+    item = mod.read_ndjson(paths.work_items_path)[0]
+    check(code != 0 and not paths.development_protocol_path.exists(), "protocol-start reports checklist write failure")
+    check(item.get("development_protocol_required") is True, "protocol-start keeps required gate after failed write")
+    with patch.object(mod, "work_status_summary", return_value={"work_item": item, "closeout_readiness": "ready"}), \
+         patch.object(mod, "build_daily_dashboard", return_value={}), \
+         patch.object(mod, "update_work_item", side_effect=AssertionError("unguarded closure")):
+        try: close_result = mod.run_work_close(SimpleNamespace(work_id=wid), paths)
+        except AssertionError: close_result = {}
+    check(close_result.get("closed") is False, "protocol-start failure leaves work unclosable")
+
+
+def test_protocol_close_classification_lock_order():
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_close_lock")
+    d = mod.development_protocol
+    store = ROOT / "protocol.json"; works = ROOT / "work-items.ndjson"
+    work = {"work_id": "W-lock", "project": str(ROOT), "goal": "fixture", "status": "active", "development_protocol_required": True}
+    works.write_text(json.dumps(work) + "\n")
+    proof = ROOT / "proof.md"; proof.write_text("verified fixture")
+    plan = ROOT / "plan.md"; plan.write_text("reviewed fixture plan")
+    scope = ROOT / "scope.json"; review = ROOT / "scope-review.json"
+    body = {"work_id": "W-lock", "project": str(ROOT), "goal_sha256": hashlib.sha256(b"fixture").hexdigest(),
+            "lane": "small", "ui": False, "extra_required": [], "reason": "fixture",
+            "approved_plan": {"path": str(plan), "sha256": d.digest(plan)}}
+    review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "independent fixture", "contract_sha256": d.object_digest(body)}))
+    body["review"] = {"path": str(review), "sha256": d.digest(review)}; scope.write_text(json.dumps(body))
+    record = d.start(store, "W-lock", str(ROOT), "fixture", lane="small", ui=False)
+    d.classify(store, work, "small", False, str(scope), "fixture", d.record_digest(record))
+    for row in d.read(store)[0]["steps"]:
+        d.step(store, "W-lock", row["step_id"], "pass" if row["required"] else "na", str(proof), "true", reason="fixture conditional")
+    paths = SimpleNamespace(work_items_path=works, development_protocol_path=store, daily_dashboard_path=ROOT / "dashboard.md",
+                            projects_root=ROOT)
+    entered = threading.Event(); release = threading.Event(); attempting = threading.Event(); classified = threading.Event()
+    result = {}; errors = []
+    def status(*args):
+        entered.set()
+        if not release.wait(5): raise RuntimeError("fixture close barrier timeout")
+        return {"work_item": work, "closeout_readiness": "ready"}
+    def close():
+        try: result.update(mod.run_work_close(SimpleNamespace(work_id="W-lock"), paths))
+        except Exception as exc: errors.append(str(exc))
+    def classify():
+        attempting.set()
+        try:
+            with d.locked(works):
+                classified.set()
+                record = d.read(store)[0]
+                d.classify(store, work, "small", False, str(scope), "fixture", d.record_digest(d.refresh(record)))
+        except ValueError: result["stale_classify_rejected"] = True
+        except Exception as exc: errors.append(str(exc))
+    with patch.object(mod, "work_status_summary", side_effect=status), patch.object(mod, "build_daily_dashboard", return_value={}):
+        a = threading.Thread(target=close); a.start()
+        check(entered.wait(5), "close reaches controlled readiness barrier")
+        b = threading.Thread(target=classify); b.start()
+        check(attempting.wait(5) and not classified.wait(0.1), "classification cannot enter while close owns work lock")
+        plan.write_text("changed while close is paused")
+        release.set(); a.join(5); b.join(5)
+    check(not a.is_alive() and not b.is_alive() and not errors, "close and classification serialize without deadlock")
+    check(result.get("closed") is False and result.get("stale_classify_rejected") is True,
+          "stale evidence blocks both close and classification")
+    check(json.loads(works.read_text())["status"] == "active" and d.status(store, "W-lock")["scope_invalid"],
+          "stale scope never becomes closed")
+
+
+def test_protocol_close_holds_checklist_lock_through_close_write():
+    # A protocol-step between the readiness read and the closed write must not slip in.
+    import fcntl
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_close_hold")
+    d = mod.development_protocol
+    store = ROOT / "protocol.json"; works = ROOT / "work-items.ndjson"
+    work = {"work_id": "W-hold", "project": str(ROOT), "goal": "fixture", "status": "active", "development_protocol_required": True}
+    works.write_text(json.dumps(work) + "\n")
+    proof = ROOT / "proof.md"; proof.write_text("verified fixture")
+    d.start(store, "W-hold", str(ROOT), "fixture", lane="small", ui=False)
+    for row in d.read(store)[0]["steps"]:
+        d.step(store, "W-hold", row["step_id"], "pass" if row["required"] else "na", str(proof), "true", reason="fixture conditional")
+    paths = SimpleNamespace(work_items_path=works, development_protocol_path=store, daily_dashboard_path=ROOT / "dashboard.md",
+                            projects_root=ROOT)
+    held = []
+    def update(*args, **kwargs):
+        with store.with_suffix(".lock").open("a") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(probe, fcntl.LOCK_UN); held.append(False)
+            except BlockingIOError:
+                held.append(True)
+        return dict(work, status="closed")
+    with patch.object(mod, "work_status_summary", return_value={"work_item": work, "closeout_readiness": "ready"}), \
+         patch.object(mod, "build_daily_dashboard", return_value={}), patch.object(mod, "update_work_item", side_effect=update), \
+         patch.object(mod, "extract_learning_candidate", return_value={}), \
+         patch.object(mod, "write_learning_candidate", return_value=([], ROOT / "l.md", ROOT / "l.html")):
+        result = mod.run_work_close(SimpleNamespace(work_id="W-hold"), paths)
+    check(result.get("closed") is True and held == [True], "close holds the checklist lock while it writes closed")
+
+
 def main():
     tests = [
+        test_protocol_step_cli_keeps_operator_shell_verifier,
+        test_protocol_first_write_gate_survives_checklist_io_failure,
+        test_protocol_start_gate_survives_checklist_io_failure,
+        test_protocol_close_classification_lock_order,
+        test_protocol_close_holds_checklist_lock_through_close_write,
+        test_protocol_work_id_with_dot_stays_selectable,
+        test_protocol_explicit_lane_cli_preflight_and_reactivation,
         test_design_findings_route_to_design_pathway,
         test_design_gate_is_derived_from_repo_not_goal_wording,
         test_resolve_project_dir_nesting_and_unverified_proof_loudness,
@@ -9319,6 +9721,7 @@ def main():
         test_all_smoke_outputs_parse_and_redact,
         test_improve_and_compare_control_loop,
         test_security_corrections_regressions,
+        test_protocol_checklist_project_equals_work_item,
         test_protocol_uses_canonical_work_identity,
         test_daily_work_envelope_and_pathway_cooperation,
         test_daily_work_stale_measurement_detection,
