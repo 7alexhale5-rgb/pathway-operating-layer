@@ -1,0 +1,14 @@
+{
+  "base_commit": "9ecedb620169fdcd5919e5cd7f3fd26d9ac67387",
+  "base_engine_sha256": "0f77ec3726e50809373102a3f3450f3b9ab44edef8c453bb2c75e0a076a1de45",
+  "contract_key_count": 27,
+  "contract_path": "contracts/observability/rainman-thorp.json",
+  "contract_sha256": "1ad3ebe7c5d2f580af955b34ccca8f209d824da6ea352157a699a111aaaf522e",
+  "derived_constant_count": 1,
+  "extracted_constant_count": 23,
+  "matched_constant_count": 24,
+  "metadata_key_count": 4,
+  "mismatches": [],
+  "result": "PASS",
+  "verification": "phase1-observability-contract-ast-fidelity"
+}

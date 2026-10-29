@@ -1,0 +1,385 @@
+{
+ "schema_version": 1,
+ "contract_type": "observability_evidence_contract",
+ "project_key": "rainman-thorp",
+ "extracted_from": "operating-layer.py constants, verbatim, 2026-08-30",
+ "metric_names": [
+  "tradebot_component_heartbeat_age_seconds",
+  "tradebot_drawdown_ratio",
+  "tradebot_market_data_age_seconds",
+  "tradebot_order_ack_latency_seconds",
+  "tradebot_policy_violations_total",
+  "tradebot_reconciliation_mismatches_total",
+  "tradebot_risk_decisions_total"
+ ],
+ "metric_label_values": {
+  "tradebot_component_heartbeat_age_seconds": {
+   "component": [
+    "AUDIT_LEDGER",
+    "DETERMINISTIC_EVALUATOR",
+    "EXECUTION_ADAPTER",
+    "MARKET_DATA",
+    "RECONCILER",
+    "RISK_ENGINE",
+    "TELEMETRY_EXPORTER"
+   ]
+  },
+  "tradebot_drawdown_ratio": {
+   "mode": [
+    "OBSERVE_ONLY",
+    "SIMULATE_ONLY"
+   ]
+  },
+  "tradebot_market_data_age_seconds": {
+   "asset": [
+    "BTC-USD",
+    "ETH-USD"
+   ],
+   "source": [
+    "SOURCE_UNSELECTED"
+   ]
+  },
+  "tradebot_order_ack_latency_seconds": {
+   "venue": [
+    "VENUE_UNSELECTED"
+   ]
+  },
+  "tradebot_policy_violations_total": {
+   "type": [
+    "ARTIFACT",
+    "AUTHORITY",
+    "ORDER_STATE",
+    "RISK",
+    "SIGNATURE",
+    "STAGE"
+   ]
+  },
+  "tradebot_reconciliation_mismatches_total": {
+   "asset": [
+    "BTC-USD",
+    "ETH-USD"
+   ],
+   "class": [
+    "BALANCE",
+    "ORDER",
+    "POSITION",
+    "RESERVATION",
+    "SEQUENCE"
+   ]
+  },
+  "tradebot_risk_decisions_total": {
+   "decision": [
+    "ABSTAIN",
+    "APPROVE",
+    "DENY"
+   ],
+   "reason": [
+    "AMBIGUOUS_SUBMIT",
+    "POLICY_PASS",
+    "POLICY_VIOLATION",
+    "RECONCILIATION_MISMATCH",
+    "STAGE_DENIED",
+    "STALE_DATA",
+    "UNKNOWN_STATE",
+    "UNRESOLVED_PARTIAL_FILL"
+   ]
+  }
+ },
+ "metric_domains": {
+  "tradebot_component_heartbeat_age_seconds": [
+   0,
+   null
+  ],
+  "tradebot_drawdown_ratio": [
+   0,
+   1
+  ],
+  "tradebot_market_data_age_seconds": [
+   0,
+   null
+  ],
+  "tradebot_order_ack_latency_seconds": [
+   0,
+   null
+  ],
+  "tradebot_policy_violations_total": [
+   0,
+   null
+  ],
+  "tradebot_reconciliation_mismatches_total": [
+   0,
+   null
+  ],
+  "tradebot_risk_decisions_total": [
+   0,
+   null
+  ]
+ },
+ "event_names": [
+  "tradebot.audit.checkpoint_signed",
+  "tradebot.halt.latched",
+  "tradebot.halt.release_approved",
+  "tradebot.halt.release_denied",
+  "tradebot.halt.release_requested",
+  "tradebot.kill_switch.activated",
+  "tradebot.order.state_changed",
+  "tradebot.order.submit_ambiguous",
+  "tradebot.proposal.created",
+  "tradebot.proposal.rejected",
+  "tradebot.reconciliation.completed",
+  "tradebot.risk.decision",
+  "tradebot.rollback.completed",
+  "tradebot.rollback.failed",
+  "tradebot.rollback.started",
+  "tradebot.stage.transition.approved",
+  "tradebot.stage.transition.denied",
+  "tradebot.stage.transition_requested",
+  "tradebot.telemetry.gap_detected"
+ ],
+ "correlation_fields": [
+  "account_snapshot_seq",
+  "asset",
+  "client_order_id",
+  "cycle_id",
+  "data_snapshot_hash",
+  "decision_id",
+  "event_id",
+  "intent_id",
+  "manifest_hash",
+  "market_event_ts",
+  "mode",
+  "observed_at",
+  "occurred_at",
+  "payload_hash",
+  "previous_digest",
+  "producer_id",
+  "producer_key_id",
+  "reason_code",
+  "risk_decision",
+  "risk_policy_hash",
+  "sequence",
+  "strategy_hash",
+  "trace_id"
+ ],
+ "correlation_hash_fields": [
+  "data_snapshot_hash",
+  "manifest_hash",
+  "payload_hash",
+  "previous_digest",
+  "risk_policy_hash",
+  "strategy_hash"
+ ],
+ "correlation_timestamp_fields": [
+  "market_event_ts",
+  "observed_at",
+  "occurred_at"
+ ],
+ "correlation_sequence_fields": [
+  "account_snapshot_seq",
+  "sequence"
+ ],
+ "allowed_assets": [
+  "BTC-USD",
+  "ETH-USD"
+ ],
+ "allowed_modes": [
+  "OBSERVE_ONLY",
+  "SIMULATE_ONLY"
+ ],
+ "allowed_risk_decisions": [
+  "ABSTAIN",
+  "APPROVE",
+  "DENY"
+ ],
+ "allowed_reason_codes": [
+  "AMBIGUOUS_SUBMIT",
+  "POLICY_PASS",
+  "POLICY_VIOLATION",
+  "RECONCILIATION_MISMATCH",
+  "STAGE_DENIED",
+  "STALE_DATA",
+  "UNKNOWN_STATE",
+  "UNRESOLVED_PARTIAL_FILL"
+ ],
+ "drill_incident": {
+  "event_name": "tradebot.halt.latched",
+  "asset": "BTC-USD",
+  "mode": "SIMULATE_ONLY",
+  "risk_decision": "DENY",
+  "reason_code": "STALE_DATA"
+ },
+ "drill_trace_name": "halt.activate",
+ "drill_alert": {
+  "alert_id": "stale-feed",
+  "condition": "market data absent",
+  "status": "FIRED",
+  "safe_action": "HALT_ENTRIES_RECONCILE_ONLY"
+ },
+ "runbook_question_ids": [
+  "CURRENT_AUTHORIZED_STAGE_AND_MODE",
+  "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS",
+  "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING",
+  "HUMAN_DISPOSITION_REQUIRED_NEXT",
+  "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS",
+  "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE",
+  "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE",
+  "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES",
+  "WHY_HALT_ENTRIES_LATCHED",
+  "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED"
+ ],
+ "runbook_evidence_fields": [
+  "alert_artifact",
+  "canary_artifact",
+  "log_artifact",
+  "metric_artifact",
+  "trace_artifact"
+ ],
+ "runbook_dispositions": [
+  "ESCALATE_AND_RETAIN_HALT",
+  "RETAIN_HALT_AND_RECONCILE"
+ ],
+ "runbook_answer_codes": {
+  "CURRENT_AUTHORIZED_STAGE_AND_MODE": "AUTHORITY_CONFIRMED_NO_RUNTIME",
+  "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS": "CORRELATION_IDENTIFIERS_RECONSTRUCTED",
+  "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING": "MISSING_RECONCILIATION_EVIDENCE_IDENTIFIED",
+  "HUMAN_DISPOSITION_REQUIRED_NEXT": "HUMAN_RECONCILIATION_REQUIRED",
+  "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS": "TRUSTED_TIMESTAMPS_RECONSTRUCTED",
+  "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE": "VENUE_ACKNOWLEDGEMENT_REMAINS_UNCERTAIN",
+  "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE": "WORST_CASE_RESERVATION_RETAINED",
+  "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES": "AUTHORITATIVE_HASHES_RECONSTRUCTED",
+  "WHY_HALT_ENTRIES_LATCHED": "HALT_LATCH_CONFIRMED",
+  "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED": "PROHIBITED_ACTIONS_CONFIRMED"
+ },
+ "runbook_enum_values": {
+  "exposure_state": [
+   "OPEN_SYNTHETIC_BTC_EXPOSURE"
+  ],
+  "halt_reason": [
+   "STALE_MARKET_DATA_AND_UNCERTAIN_VENUE_ACK"
+  ],
+  "human_disposition": [
+   "RETAIN_HALT_AND_RECONCILE"
+  ],
+  "last_venue_evidence": [
+   "NO_TERMINAL_VENUE_EVIDENCE"
+  ],
+  "ledger_mismatch_state": [
+   "LEDGER_VENUE_MISMATCH_UNRESOLVED"
+  ],
+  "next_action": [
+   "RECONCILE_BY_CLIENT_ORDER_ID"
+  ],
+  "order_uncertainty": [
+   "ACKNOWLEDGEMENT_UNCERTAIN"
+  ],
+  "reservation_state": [
+   "WORST_CASE_RESERVATION_RETAINED"
+  ]
+ },
+ "runbook_missing_evidence": [
+  "AUTHORITATIVE_VENUE_ORDER_STATE"
+ ],
+ "runbook_answer_contract": {
+  "CURRENT_AUTHORIZED_STAGE_AND_MODE": {
+   "fields": {
+    "authorized_stage": "stage",
+    "mode": "mode"
+   },
+   "evidence": [
+    "log_artifact"
+   ]
+  },
+  "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS": {
+   "fields": {
+    "decision_id": "identifier",
+    "cycle_id": "identifier",
+    "intent_id": "identifier",
+    "client_order_id": "identifier"
+   },
+   "evidence": [
+    "log_artifact"
+   ]
+  },
+  "EXACT_RECONCILIATION_EVIDENCE_STILL_MISSING": {
+   "fields": {
+    "missing_reconciliation_evidence": "evidence_list"
+   },
+   "evidence": [
+    "log_artifact",
+    "metric_artifact"
+   ]
+  },
+  "HUMAN_DISPOSITION_REQUIRED_NEXT": {
+   "fields": {
+    "human_disposition": "enum",
+    "next_action": "enum"
+   },
+   "evidence": [
+    "alert_artifact"
+   ]
+  },
+  "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS": {
+   "fields": {
+    "market_timestamp": "timestamp",
+    "private_feed_timestamp": "timestamp"
+   },
+   "evidence": [
+    "log_artifact",
+    "metric_artifact"
+   ]
+  },
+  "ORDER_UNCERTAINTY_AND_LAST_VENUE_EVIDENCE": {
+   "fields": {
+    "order_uncertainty": "enum",
+    "last_venue_evidence": "enum"
+   },
+   "evidence": [
+    "log_artifact",
+    "trace_artifact"
+   ]
+  },
+  "RESERVATION_EXPOSURE_AND_LEDGER_MISMATCH_STATE": {
+   "fields": {
+    "reservation_state": "enum",
+    "exposure_state": "enum",
+    "ledger_mismatch_state": "enum"
+   },
+   "evidence": [
+    "log_artifact",
+    "metric_artifact"
+   ]
+  },
+  "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES": {
+   "fields": {
+    "strategy_hash": "sha256",
+    "data_snapshot_hash": "sha256",
+    "risk_policy_hash": "sha256",
+    "manifest_hash": "sha256"
+   },
+   "evidence": [
+    "log_artifact"
+   ]
+  },
+  "WHY_HALT_ENTRIES_LATCHED": {
+   "fields": {
+    "halt_reason": "enum",
+    "halt_latched": "true"
+   },
+   "evidence": [
+    "alert_artifact",
+    "log_artifact"
+   ]
+  },
+  "WHY_RETRY_FLATTEN_AND_HALT_RELEASE_ARE_PROHIBITED": {
+   "fields": {
+    "retry_prohibited": "true",
+    "flatten_prohibited": "true",
+    "halt_release_prohibited": "true"
+   },
+   "evidence": [
+    "alert_artifact"
+   ]
+  }
+ },
+ "trusted_verifier_sha256": []
+}

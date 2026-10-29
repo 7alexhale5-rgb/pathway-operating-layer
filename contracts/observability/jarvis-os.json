@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "contract_type": "observability_evidence_contract",
+  "project_key": "jarvis-os",
+  "evidence_source": "Jarvis OS local runtime: refused agent tokens, the wired alert, and the drill that fires it",
+  "metric_names": [
+    "jarvis_drill_refusals_total",
+    "jarvis_signal_alerts_total",
+    "jarvis_local_runtime_tests_total"
+  ],
+  "metric_label_values": {
+    "jarvis_drill_refusals_total": {
+      "reason": [
+        "expired"
+      ],
+      "source": [
+        "DRILL"
+      ]
+    },
+    "jarvis_signal_alerts_total": {
+      "signal": [
+        "auth_refused"
+      ],
+      "status": [
+        "FIRED"
+      ]
+    },
+    "jarvis_local_runtime_tests_total": {
+      "suite": [
+        "OBSERVABILITY_RUNTIME"
+      ],
+      "status": [
+        "PASS"
+      ]
+    }
+  },
+  "metric_domains": {
+    "jarvis_drill_refusals_total": [
+      0,
+      null
+    ],
+    "jarvis_signal_alerts_total": [
+      0,
+      null
+    ],
+    "jarvis_local_runtime_tests_total": [
+      0,
+      null
+    ]
+  },
+  "event_names": [
+    "jarvis.auth.refused_repeated",
+    "jarvis.health.alert_fired",
+    "jarvis.observability.measured"
+  ],
+  "correlation_fields": [
+    "check_digest",
+    "component",
+    "environment_class",
+    "event_id",
+    "mode",
+    "observed_at",
+    "occurred_at",
+    "reason_code",
+    "risk_decision",
+    "runtime_digest",
+    "sequence",
+    "suite_run_id",
+    "trace_id"
+  ],
+  "correlation_hash_fields": [
+    "check_digest",
+    "runtime_digest"
+  ],
+  "correlation_timestamp_fields": [
+    "observed_at",
+    "occurred_at"
+  ],
+  "correlation_timestamp_order": [
+    "occurred_at",
+    "observed_at"
+  ],
+  "correlation_sequence_fields": [
+    "sequence"
+  ],
+  "correlation_enum_values": {
+    "component": [
+      "AGENT_TOKEN_AUTH"
+    ],
+    "environment_class": [
+      "LOCAL"
+    ],
+    "mode": [
+      "SAFE_TEST"
+    ],
+    "reason_code": [
+      "AUTH_REFUSED_REPEATED"
+    ],
+    "risk_decision": [
+      "DENY"
+    ]
+  },
+  "drill_incident": {
+    "event_name": "jarvis.auth.refused_repeated",
+    "component": "AGENT_TOKEN_AUTH",
+    "environment_class": "LOCAL",
+    "mode": "SAFE_TEST",
+    "reason_code": "AUTH_REFUSED_REPEATED",
+    "risk_decision": "DENY"
+  },
+  "drill_trace_name": "jarvis.health.auth_refused_alert",
+  "drill_alert": {
+    "alert_id": "auth-refused-repeated",
+    "condition": "three or more refused bearer tokens in 24 hours on the local runtime",
+    "status": "FIRED",
+    "safe_action": "KEEP_LOCAL_NO_PROMOTE"
+  },
+  "runbook_question_ids": [
+    "CONFIRM_AUTH_REFUSAL_SIGNAL",
+    "CONFIRM_LOCAL_RUNTIME_PROOF",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION",
+    "CONFIRM_TRACE_AND_CHECK_BINDING"
+  ],
+  "runbook_evidence_fields": [
+    "alert_artifact",
+    "canary_artifact",
+    "log_artifact",
+    "metric_artifact",
+    "trace_artifact"
+  ],
+  "runbook_dispositions": [
+    "KEEP_LOCAL_NO_PROMOTE"
+  ],
+  "runbook_answer_codes": {
+    "CONFIRM_AUTH_REFUSAL_SIGNAL": "AUTH_REFUSAL_SIGNAL_CONFIRMED",
+    "CONFIRM_LOCAL_RUNTIME_PROOF": "LOCAL_RUNTIME_PROOF_CONFIRMED",
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": "SAFE_LOCAL_DISPOSITION_CONFIRMED",
+    "CONFIRM_TRACE_AND_CHECK_BINDING": "TRACE_AND_CHECK_BINDING_CONFIRMED"
+  },
+  "runbook_enum_values": {
+    "operator_disposition": [
+      "KEEP_LOCAL_NO_PROMOTE"
+    ],
+    "reason_code": [
+      "AUTH_REFUSED_REPEATED"
+    ],
+    "risk_decision": [
+      "DENY"
+    ]
+  },
+  "runbook_missing_evidence": [
+    "HOSTED_ALERT_DESTINATION_RECEIPT"
+  ],
+  "runbook_answer_contract": {
+    "CONFIRM_AUTH_REFUSAL_SIGNAL": {
+      "fields": {
+        "component": "identifier",
+        "reason_code": "enum",
+        "risk_decision": "enum"
+      },
+      "evidence": [
+        "alert_artifact",
+        "log_artifact"
+      ]
+    },
+    "CONFIRM_LOCAL_RUNTIME_PROOF": {
+      "fields": {
+        "observed_at": "timestamp",
+        "runtime_digest": "sha256",
+        "suite_run_id": "identifier"
+      },
+      "evidence": [
+        "log_artifact",
+        "metric_artifact"
+      ]
+    },
+    "CONFIRM_SAFE_OPERATOR_DISPOSITION": {
+      "fields": {
+        "operator_disposition": "enum",
+        "safe_action": "identifier",
+        "authorized_stage": "stage"
+      },
+      "evidence": [
+        "alert_artifact",
+        "canary_artifact"
+      ]
+    },
+    "CONFIRM_TRACE_AND_CHECK_BINDING": {
+      "fields": {
+        "trace_id": "identifier",
+        "check_digest": "sha256"
+      },
+      "evidence": [
+        "log_artifact",
+        "trace_artifact"
+      ]
+    }
+  },
+  "trusted_verifier_sha256": [
+    "00156377fcac7059294f257544e619a6775abc4d97a0467566dab1ae508702e4"
+  ]
+}

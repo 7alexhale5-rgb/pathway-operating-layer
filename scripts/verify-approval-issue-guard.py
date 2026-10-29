@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify approval-issue guard wiring without invoking the approval CLI."""
+"""Verify defense-in-depth approval guard wiring without invoking authority."""
 from __future__ import annotations
 
 import argparse
@@ -14,9 +14,9 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_REPO_HOOK = REPO / "hooks" / "approval-issue-guard.py"
-DEFAULT_CLAUDE_HOOK = Path.home() / ".claude" / "hooks" / "approval-issue-guard.py"
-DEFAULT_CODEX_HOOK = Path.home() / ".codex" / "hooks" / "approval-issue-guard.py"
+DEFAULT_REPO_HOOK = REPO / "hooks" / "approval-issue-guard.sh"
+DEFAULT_CLAUDE_HOOK = Path.home() / ".claude" / "hooks" / "approval-issue-guard.sh"
+DEFAULT_CODEX_HOOK = Path.home() / ".codex" / "hooks" / "approval-issue-guard.sh"
 DEFAULT_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 DEFAULT_CODEX_SETTINGS = Path.home() / ".codex" / "hooks.json"
 DEFAULT_ISOLATED_SETTINGS = (
@@ -36,12 +36,13 @@ def default_output_root() -> Path:
 
 DEFAULT_LEDGER = default_output_root() / "operator-intelligence" / "approvals.ndjson"
 DENIAL = (
-    "DENIED: approval-issue is reserved for Alex. "
-    "Review the exact command, then run it in a normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
 
 BLOCKED_FIXTURES = (
     ("command", "operating-layer.py approval-issue --help"),
+    ("command", "operating-layer.py approv''al-issue --help"),
     ("cmd", "python3 scripts/operating-layer.py approval-issue --help"),
     ("command", "TEST_ONLY=1 operating-layer.py approval-issue --help"),
     ("command", "sh -c 'operating-layer.py approval-issue --help'"),
@@ -49,6 +50,12 @@ BLOCKED_FIXTURES = (
         "command",
         "python3 --check-hash-based-pycs always "
         "scripts/operating-layer.py approval-issue --help",
+    ),
+    ("command", "operating-layer.py approval-invalidate --ticket-id AT-000000000000 --reason audit"),
+    (
+        "command",
+        "APPROVAL_ISSUE_CHAT_OVERRIDE=1 operating-layer.py approval-invalidate "
+        "--ticket-id AT-000000000000 --reason audit",
     ),
 )
 ALLOWED_FIXTURES = (
@@ -139,9 +146,10 @@ def check_symlink(installed: Path, tracked: Path, label: str, failures: list[str
 
 
 def run_hook(hook: Path, raw_input: str) -> tuple[subprocess.CompletedProcess, float]:
+    # Match the registered shell entry point, including its conservative fast path.
     started = time.perf_counter_ns()
     proc = subprocess.run(
-        [sys.executable, str(hook)],
+        ["/bin/bash", str(hook)],
         input=raw_input,
         capture_output=True,
         text=True,
@@ -219,27 +227,32 @@ def main(argv: list[str] | None = None) -> int:
     codex_link_valid = check_symlink(
         codex_hook, repo_hook, "Codex installed hook", failures,
     )
+    parser_links_valid = True
+    for installed, label in ((claude_hook, "Claude"), (codex_hook, "Codex")):
+        valid = check_symlink(installed.parent / "approval-issue-guard.py", repo_hook.resolve().parent / "approval-issue-guard.py",
+                              f"{label} installed parser", failures)
+        parser_links_valid = valid and parser_links_valid
     check_settings(
         claude_settings,
         "Claude settings",
-        f"python3 {claude_hook}",
+        f"/bin/bash {claude_hook}",
         failures,
     )
     check_settings(
         codex_settings,
         "Codex settings",
-        f"python3 {codex_hook}",
+        f"/bin/bash {codex_hook}",
         failures,
     )
     check_settings(
         isolated_settings,
         "isolated GLM/Kimi settings",
-        f"python3 {claude_hook}",
+        f"/bin/bash {claude_hook}",
         failures,
     )
 
     fixture_hooks = (repo_hook, claude_hook, codex_hook) if (
-        claude_link_valid and codex_link_valid
+        claude_link_valid and codex_link_valid and parser_links_valid
     ) else (repo_hook,)
     blocked_count, allowed_count = check_fixtures(fixture_hooks, failures)
 
@@ -276,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "fail" if failures else "pass",
         "run_count": args.runs,
         "settings_checked": 3,
-        "symlinks_checked": 2,
+        "symlinks_checked": 4,
         "blocked_fixtures": blocked_count,
         "allowed_fixtures": allowed_count,
         "p95_ms": round(p95_ms, 3) if p95_ms is not None else None,

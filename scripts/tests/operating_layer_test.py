@@ -24,11 +24,13 @@ HERE = Path(__file__).resolve().parent
 CLI = (HERE / ".." / "operating-layer.py").resolve()
 REPO = HERE.parent.parent
 APPROVAL_GUARD = REPO / "hooks" / "approval-issue-guard.py"
+APPROVAL_GUARD_LAUNCHER = REPO / "hooks" / "approval-issue-guard.sh"
 APPROVAL_GUARD_VERIFIER = REPO / "scripts" / "verify-approval-issue-guard.py"
+APPROVAL_HELPER_SOURCE = REPO / "security" / "pathway-approval"
 INSTALLER = REPO / "install.sh"
 APPROVAL_GUARD_DENIAL = (
-    "DENIED: approval-issue is reserved for Alex. "
-    "Review the exact command, then run it in a normal Terminal.\n"
+    "DENIED: protected approval mutations are unavailable until independent "
+    "per-mutation human authentication is implemented and verified.\n"
 )
 _TEST_ROOT_PARENT = Path("/private/tmp").resolve()
 ROOT = _TEST_ROOT_PARENT / f"operating-layer-test-{uuid.uuid4().hex}"
@@ -61,6 +63,7 @@ def reset():
     if ROOT.exists():
         shutil.rmtree(ROOT)
     (ROOT / "claude").mkdir(parents=True)
+    ROOT.chmod(0o700)
     (ROOT / "codex").mkdir(parents=True)
     (ROOT / "projects").mkdir(parents=True)
     (ROOT / "out").mkdir(parents=True)
@@ -125,7 +128,7 @@ def touch_old(path, days=90):
 def base_cmd(subcommand, extra=None):
     cmd = [
         sys.executable,
-        str(CLI),
+        str(HERE / "operating_layer_test_harness.py"),
         subcommand,
         "--claude-home", str(ROOT / "claude"),
         "--codex-home", str(ROOT / "codex"),
@@ -162,7 +165,7 @@ def run_approval_guard(payload, env=None, raw=False):
         hook_env.update(env)
     hook_input = payload if raw else json.dumps(payload)
     return subprocess.run(
-        [sys.executable, str(APPROVAL_GUARD)],
+        ["/bin/bash", str(APPROVAL_GUARD_LAUNCHER)],
         input=hook_input,
         capture_output=True,
         text=True,
@@ -174,6 +177,476 @@ def run_approval_guard(payload, env=None, raw=False):
 def assert_no_secret_output(text, label):
     lowered = text.lower()
     check("sk-proj-" not in text and "password=hunter2" not in lowered and "api_key=abc" not in lowered, label)
+
+
+
+def test_observability_contract_loader_fails_closed_and_gates_schema():
+    reset()
+    opl = load_cli("observability_contract_loader")
+    contracts_dir = opl.observability_contracts_dir()
+    check(contracts_dir is not None and contracts_dir.is_dir(),
+          "the engine resolves a contained contracts/observability directory")
+    check(opl.OBSERVABILITY_DEFAULT_CONTRACT_ERRORS == [],
+          "the shipped rainman-thorp contract passes the schema gate")
+    contract, errors = opl.load_observability_contract_file(contracts_dir / "rainman-thorp.json")
+    check(not errors and contract.get("project_key") == "rainman-thorp",
+          "the rainman-thorp contract loads with its project_key intact")
+    check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE == "TRUSTED_VERIFIER_NOT_CONFIGURED"
+          and opl.OBSERVABILITY_TRUSTED_VERIFIER_SHA256 == frozenset(),
+          "an empty trusted-sha list derives the unconfigured trust state")
+
+    _, errors = opl.load_observability_contract_file(ROOT / "projects" / "absent-contract.json")
+    check(errors == ["observability_contract_not_registered"],
+          "a missing contract file refuses with the registration error")
+
+    def gate(mutated):
+        return opl.validate_observability_contract(mutated)
+
+    mutated = dict(contract); mutated.pop("metric_names")
+    check(any("missing required key metric_names" in error for error in gate(mutated)),
+          "a contract missing a required enum key is refused (no .get defaults)")
+    mutated = dict(contract); mutated["schema_version"] = 1.0
+    check(any("schema_version must be integer 1" in error for error in gate(mutated)),
+          "a numerically equal float cannot satisfy the integer schema version")
+    mutated = dict(contract); mutated["metric_names"] = []
+    check(any("needs at least" in error for error in gate(mutated)),
+          "an empty required enum fails the cardinality floor")
+    mutated = dict(contract); mutated["event_names"] = ["*", "abc", "tradebot.ok.event"]
+    check(any("quality gate" in error for error in gate(mutated)),
+          "glob or members shorter than four characters fail the member quality gate")
+    mutated = dict(contract)
+    mutated["event_names"] = list(contract["event_names"]) + [contract["event_names"][0]]
+    check(any("must not contain duplicates" in error for error in gate(mutated)),
+          "duplicate enum members are refused")
+    mutated = dict(contract); mutated["trusted_verifier_sha256"] = ["not-a-digest"]
+    check(any("trusted_verifier_sha256" in error for error in gate(mutated)),
+          "a malformed trusted-verifier digest is refused")
+    mutated = dict(contract); mutated["correlation_hash_fields"] = ["field_outside_set"]
+    check(any("subset of correlation_fields" in error for error in gate(mutated)),
+          "hash fields outside correlation_fields are refused")
+
+    mutated = dict(contract); mutated["allowed_modes"] = "SIMULATE_ONLY"
+    check(any("allowed_modes must be a list of strings" in error for error in gate(mutated)),
+          "a scalar enum list is refused without crashing the schema gate")
+    mutated = dict(contract); mutated["event_names"] = [["unhashable"], "tradebot.ok.event"]
+    check(any("event_names must be a list of strings" in error for error in gate(mutated)),
+          "an unhashable enum member is refused without crashing the schema gate")
+
+    qid = "CURRENT_AUTHORIZED_STAGE_AND_MODE"
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_answer_contract"][qid]["fields"]["mode"] = "unchecked_kind"
+    check(any("runbook_answer_contract" in error for error in gate(mutated)),
+          "an unknown runbook fact kind fails closed")
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_evidence_fields"].append("phantom_artifact")
+    mutated["runbook_answer_contract"][qid]["evidence"] = ["phantom_artifact"]
+    check(any("artifact inventory" in error for error in gate(mutated)),
+          "a phantom runbook evidence field outside the receipt inventory is refused")
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_answer_contract"][qid]["evidence"] = ["log_artifact", "log_artifact"]
+    check(any("runbook_answer_contract" in error for error in gate(mutated)),
+          "duplicate runbook evidence references are refused")
+    mutated = json.loads(json.dumps(contract))
+    mutated["runbook_enum_values"].pop("next_action")
+    check(any("enum facts" in error for error in gate(mutated)),
+          "every enum fact is bound to an exact runbook_enum_values entry")
+
+    mutated = json.loads(json.dumps(contract))
+    mutated["drill_incident"] = {"unrelated": None}
+    check(any("three contract correlation fields" in error for error in gate(mutated)),
+          "a nullable unrelated field cannot erase the drill predicate")
+    for field, malformed in (("event_name", []), ("asset", {})):
+        mutated = json.loads(json.dumps(contract))
+        mutated["drill_incident"][field] = malformed
+        check(any("three contract correlation fields" in error for error in gate(mutated)),
+              f"an unhashable nested drill {field} is refused without crashing")
+    mutated = json.loads(json.dumps(contract))
+    mutated["drill_incident"] = {
+        "event_name": contract["drill_incident"]["event_name"],
+        "asset": contract["drill_incident"]["asset"],
+        "mode": contract["drill_incident"]["mode"],
+    }
+    check(any("three contract correlation fields" in error for error in gate(mutated)),
+          "event_name plus only two correlation fields cannot satisfy the drill floor")
+    mutated = json.loads(json.dumps(contract)); mutated["drill_alert"]["status"] = "OPEN"
+    check(any("drill_alert" in error for error in gate(mutated)),
+          "FIRED remains an engine-required alert invariant")
+
+    for label, bounds in (
+        ("null lower bound", [None, 1]),
+        ("boolean lower bound", [False, 1]),
+        ("boolean upper bound", [0, True]),
+        ("reversed bounds", [2, 1]),
+    ):
+        mutated = json.loads(json.dumps(contract))
+        mutated["metric_domains"]["tradebot_drawdown_ratio"] = bounds
+        check(any("metric_domains" in error for error in gate(mutated)),
+              f"{label} is refused before metric sample validation")
+
+    oversized = write("projects/oversized-contract.json",
+                      json.dumps(contract) + " " * (opl.OBSERVABILITY_CONTRACT_MAX_BYTES + 1))
+    _, errors = opl.load_observability_contract_file(oversized)
+    check(any("byte limit" in error for error in errors),
+          "an oversized contract file is refused before parsing")
+
+    real = write("projects/real-contract.json", json.dumps(contract))
+    link = ROOT / "projects" / "link-contract.json"
+    link.symlink_to(real)
+    _, errors = opl.load_observability_contract_file(link)
+    check(errors == ["observability contract must not be a symlink"],
+          "a symlinked contract file is refused")
+
+    opl.OBSERVABILITY_DEFAULT_CONTRACT_ERRORS = ["induced load failure"]
+    refusal = opl.validate_observability_runtime_receipt({"schema_version": 1})
+    check(bool(refusal) and refusal[0].startswith("observability_contract_not_registered"),
+          "a broken default contract makes receipt validation refuse outright")
+    refusal = opl._validate_observability_json_artifact(
+        "metric_artifact", ROOT / "projects" / "absent.json", {}
+    )
+    check(bool(refusal) and refusal[0].startswith("observability_contract_not_registered"),
+          "a broken default contract makes artifact validation refuse outright")
+
+
+def test_observability_contract_resolution_g2_and_identity_guards():
+    reset()
+    opl = load_cli("observability_contract_resolution_g2")
+    projects_root = ROOT / "projects"
+    contract_root = ROOT / "contract-fixtures" / "resolver"
+    contract_root.mkdir(parents=True)
+    owner_a = projects_root / "owner-a" / "shared"
+    owner_b = projects_root / "owner-b" / "shared"
+    dotted = projects_root / "owner-a" / "foo.v2"
+    for project in (owner_a, owner_b, dotted):
+        project.mkdir(parents=True, exist_ok=True)
+
+    first = opl.resolve_observability_contract(owner_a, projects_root, contract_root)
+    second = opl.resolve_observability_contract(owner_b, projects_root, contract_root)
+    dotted_state = opl.resolve_observability_contract(dotted, projects_root, contract_root)
+    check(first["key"] == "owner-a/shared" and second["key"] == "owner-b/shared",
+          "owner-family path remains part of the contract identity")
+    check(first["path"] != second["path"],
+          "same-basename projects in different owner families cannot collide")
+    check(dotted_state["path"].endswith("owner-a/foo.v2.json"),
+          "dotted project names append .json without dropping the dotted suffix")
+    check(first["errors"] == ("observability_contract_not_registered",),
+          "G2 refuses a non-Rainman project with the exact registration reason")
+    try:
+        first["key"] = "receipt-selected"
+        immutable = False
+    except TypeError:
+        immutable = True
+    check(immutable, "the resolved contract snapshot is immutable")
+
+    dotted_contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    dotted_contract["project_key"] = "owner-a/foo.v2"
+    dotted_path = contract_root / "owner-a" / "foo.v2.json"
+    dotted_path.parent.mkdir(parents=True)
+    dotted_path.write_text(json.dumps(dotted_contract) + "\n", encoding="utf-8")
+    collision_contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    collision_contract["project_key"] = "owner-a/foo"
+    collision_path = contract_root / "owner-a" / "foo.json"
+    collision_path.write_text(json.dumps(collision_contract) + "\n", encoding="utf-8")
+    dotted_loaded = opl.resolve_observability_contract(
+        dotted, projects_root, contract_root)
+    check(not dotted_loaded["errors"]
+          and dotted_loaded["key"] == "owner-a/foo.v2"
+          and dotted_loaded["path"] != str(collision_path),
+          "dotted project resolution loads its exact contract without colliding with foo.json")
+    dotted_path.unlink()
+    collision_path.unlink()
+
+    snapshot_contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    snapshot_contract["project_key"] = "snapshot-original"
+    snapshot_path = contract_root / "snapshot.json"
+    snapshot_path.write_text(json.dumps(snapshot_contract) + "\n", encoding="utf-8")
+    original_bytes = snapshot_path.read_bytes()
+    original_parser = opl._parse_strict_json_object_bytes
+
+    def mutate_after_capture(raw, label="observability contract", max_bytes=None):
+        replacement = json.loads(json.dumps(snapshot_contract))
+        replacement["project_key"] = "snapshot-replacement"
+        snapshot_path.write_text(json.dumps(replacement) + "\n", encoding="utf-8")
+        return original_parser(raw, label, max_bytes)
+
+    opl._parse_strict_json_object_bytes = mutate_after_capture
+    loaded_snapshot, snapshot_errors, snapshot_sha256 = (
+        opl.load_observability_contract_snapshot(snapshot_path))
+    opl._parse_strict_json_object_bytes = original_parser
+    check(not snapshot_errors
+          and loaded_snapshot["project_key"] == "snapshot-original"
+          and snapshot_sha256 == hashlib.sha256(original_bytes).hexdigest()
+          and snapshot_sha256 != opl.sha256_file(snapshot_path),
+          "contract semantics and digest come from one exact captured byte snapshot")
+    snapshot_path.unlink()
+
+    contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    contract["project_key"] = "owner-b/shared"
+    mismatch_path = contract_root / "owner-a" / "shared.json"
+    mismatch_path.parent.mkdir(parents=True, exist_ok=True)
+    mismatch_path.write_text(json.dumps(contract) + "\n", encoding="utf-8")
+    mismatch = opl.resolve_observability_contract(owner_a, projects_root, contract_root)
+    check(any("project_key does not match" in error for error in mismatch["errors"]),
+          "a contract cannot claim a different canonical project identity")
+    mismatch_path.unlink()
+    mismatch_path.parent.rmdir()
+
+    target_dir = contract_root / "resolver-target"
+    target_dir.mkdir()
+    symlink_dir = contract_root / "owner-a"
+    symlink_dir.symlink_to(target_dir, target_is_directory=True)
+    symlinked = opl.resolve_observability_contract(
+        owner_a, projects_root, contract_root)
+    check(any("symlink directories" in error for error in symlinked["errors"]),
+          "an in-root cross-family symlink cannot redirect contract identity")
+    symlink_dir.unlink()
+    target_dir.rmdir()
+
+    tradebot = projects_root / "tradebot"
+    native_rainman = projects_root / "rainman-thorp"
+    tradebot.mkdir()
+    native_rainman.mkdir()
+    tradebot_state = opl.resolve_observability_contract(tradebot, projects_root)
+    native_state = opl.resolve_observability_contract(native_rainman, projects_root)
+    check(not tradebot_state["errors"]
+          and tradebot_state["project_key"] == "tradebot"
+          and tradebot_state["key"] == "rainman-thorp"
+          and tradebot_state["path"].endswith("rainman-thorp.json"),
+          "the live tradebot identity selects the frozen Rainman contract via an engine alias")
+    check(any("reserved for an explicit compatibility alias" in error
+              for error in native_state["errors"]),
+          "the distinct native rainman-thorp project cannot silently share Tradebot's alias")
+
+    nested_tradebot = projects_root / "owner-a" / "tradebot"
+    nested_rainman = projects_root / "owner-a" / "rainman-thorp"
+    nested_tradebot.mkdir(parents=True)
+    nested_rainman.mkdir(parents=True)
+    nested_tradebot_state = opl.resolve_observability_contract(
+        nested_tradebot, projects_root, contract_root)
+    nested_rainman_state = opl.resolve_observability_contract(
+        nested_rainman, projects_root, contract_root)
+    check(nested_tradebot_state["key"] == "owner-a/tradebot"
+          and nested_tradebot_state["errors"] == (
+              "observability_contract_not_registered",)
+          and nested_rainman_state["key"] == "owner-a/rainman-thorp"
+          and nested_rainman_state["errors"] == (
+              "observability_contract_not_registered",),
+          "legacy aliases and reserved targets apply only to exact canonical project keys")
+
+    evidence = write("out/operator-artifacts/unknown-observability.md", "proof\n")
+    unknown_sentinel = ROOT / "out" / "unknown-observability-executed"
+    unknown_verifier = write(
+        "out/operator-artifacts/unknown-observability-verifier.py",
+        f"from pathlib import Path\nPath({str(unknown_sentinel)!r}).write_text('ran')\n"
+        "print('UNKNOWN_OBSERVABILITY=RAN')\n",
+    )
+    unknown_command = f"{sys.executable} {unknown_verifier}"
+    before_unknown_commands = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in ROOT.rglob("*") if path.is_file()
+    }
+    logged, _ = run("work-log", [
+        "--work-id", "W-unknown-observability", "--pathway", "observability",
+        "--kind", "verify", "--evidence", str(evidence), "--proof-type", "artifact",
+        "--verify-cmd", unknown_command,
+    ])
+    after_unknown_work_log = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in ROOT.rglob("*") if path.is_file()
+    }
+    check(logged.get("records") == [] and "work-log-unlinked-work-id" in ids(logged),
+          "observability work-log hard-refuses an unknown work ID before writing a run")
+    added, _ = run("proof-add", [
+        "--work-id", "W-unknown-observability", "--pathway", "observability",
+        "--kind", "verify", "--evidence", str(evidence), "--proof-type", "artifact",
+        "--verify-cmd", unknown_command,
+    ])
+    after_unknown_proof_add = {
+        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in ROOT.rglob("*") if path.is_file()
+    }
+    check(added.get("records") == []
+          and "proof-add-unlinked-observability-work-id" in ids(added),
+          "observability proof-add hard-refuses an unknown work ID before proof construction")
+    check(not unknown_sentinel.exists(),
+          "unknown observability work IDs cannot trigger verifier side effects")
+    check(before_unknown_commands == after_unknown_work_log == after_unknown_proof_add,
+          "unknown observability work IDs cannot mutate any run, proof, measurement, or carry-forward ledger")
+
+
+_G3_FAKE_PERF = """import sys
+ledger = open(sys.argv[sys.argv.index('--ledger') + 1], encoding='utf-8').read()
+if ledger.count('pathway-g3-drill') >= 3:
+    print('pathway-g3-drill FIRE-REVIEW')
+    sys.exit(3)
+print('clean')
+"""
+
+_G3_FAKE_WATCH = """#!/bin/bash
+set -u
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+INBOX="$REPO/_inbox/ops-lead"
+REPORT="$(python3 "$REPO/scripts/subagent-perf.py" report --ledger "$2" 2>&1)"
+RC=$?
+__GUARD__
+mkdir -p "$INBOX"
+ALERT="$INBOX/t-$$-subagent-perf-alert.md"
+{ echo "source: scripts/subagent-perf-watch.sh"; echo "severity: FIRE-REVIEW fail-streak"; echo "$REPORT"; } > "$ALERT"
+echo "subagent-perf-watch: ALERT rc=$RC -> $ALERT"
+exit $RC
+"""
+
+
+def test_agents_g3_verifier_executes_negative_canaries():
+    reset()
+    import importlib.util
+    path = (REPO / ".planning" / "per-project-observability-contracts"
+            / "observability" / "verify_agents_runtime_receipt.py")
+    spec = importlib.util.spec_from_file_location("agents_g3_verifier", path)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    check(hasattr(verifier, "negative_canaries"),
+          "the focused Agents verifier executes its own negative canaries")
+    if not hasattr(verifier, "negative_canaries"):
+        return
+    work = ROOT / "agents-g3-canaries"
+    work.mkdir(parents=True, exist_ok=True)
+    perf = work / "subagent-perf.py"
+    perf.write_text(_G3_FAKE_PERF, encoding="utf-8")
+    clean = '{"subagent":"a","result":"pass"}\n'
+    drill = clean + '{"subagent":"pathway-g3-drill","result":"fail"}\n' * 3
+    expected = {"disabled_alert": "FAILED_AS_EXPECTED", "missing_signal": "FAILED_AS_EXPECTED"}
+    for name, guard, want in (
+        ("honest", 'if [ $RC -eq 0 ]; then echo "subagent-perf-watch: clean (rc 0)"; exit 0; fi',
+         expected),
+        ("always-alerts", ":", {"disabled_alert": "FAILED_AS_EXPECTED",
+                                "missing_signal": "PASSED_UNEXPECTEDLY"}),
+    ):
+        folder = work / name
+        folder.mkdir(exist_ok=True)
+        watch = folder / "subagent-perf-watch.sh"
+        watch.write_text(_G3_FAKE_WATCH.replace("__GUARD__", guard), encoding="utf-8")
+        results = verifier.negative_canaries(perf, watch, clean, drill, folder, "pathway-g3-drill")
+        check(results == want,
+              f"G3 negative canaries are executed, not self-attested ({name}: {results})")
+
+
+def test_agents_observability_contract_uses_generic_drill_envelope():
+    reset()
+    opl = load_cli("agents_observability_contract")
+    contract_path = REPO / "contracts" / "observability" / "agents.json"
+    contract, errors, contract_sha256 = opl.load_observability_contract_snapshot(contract_path)
+    check(not errors and len(contract_sha256) == 64,
+          "the shipped Agents observability contract passes the schema gate")
+    verifier = (
+        REPO / ".planning" / "per-project-observability-contracts"
+        / "observability" / "verify_agents_runtime_receipt.py"
+    )
+    check(opl.sha256_file(verifier) in set(contract.get("trusted_verifier_sha256") or []),
+          "the Agents contract registers the exact focused runtime verifier digest")
+    legacy_questions = {
+        "CURRENT_AUTHORIZED_STAGE_AND_MODE",
+        "DECISION_CYCLE_INTENT_AND_CLIENT_ORDER_IDENTIFIERS",
+        "STRATEGY_DATA_POLICY_AND_MANIFEST_HASHES",
+        "LAST_TRUSTED_MARKET_AND_PRIVATE_FEED_TIMESTAMPS",
+        "HUMAN_DISPOSITION_REQUIRED_NEXT",
+    }
+    check(not legacy_questions.intersection(contract["runbook_question_ids"])
+          and "market_event_ts" not in contract["correlation_fields"],
+          "the Agents contract has no Tradebot question or market timestamp compatibility names")
+    malformed_order = json.loads(json.dumps(contract))
+    malformed_order["correlation_timestamp_order"] = ["occurred_at"]
+    check(any("correlation_timestamp_order" in error
+              for error in opl.validate_observability_contract(malformed_order)),
+          "a timestamp order omitting a contract clock is refused")
+
+    state = opl._observability_contract_state(
+        contract, path=str(contract_path), key="agents", digest=contract_sha256,
+        project_key="agents")
+    check(state["correlation_timestamp_order"] == ("occurred_at", "observed_at"),
+          "the Agents contract, not the engine, declares its timestamp order")
+    evidence_dir = verifier.parent
+    envelope = json.loads((evidence_dir / "OBSERVABILITY.json").read_text(encoding="utf-8"))
+    receipt = envelope["observability_receipt"]
+    expected = {
+        "work_id": receipt["work_id"],
+        "recommendation_id": receipt["recommendation_id"],
+        "project": "agents",
+        "target_project": "/Users/alexhale/Projects/agents",
+    }
+    observed_at = opl.parse_ts(receipt["issued_at"])
+    receipt_errors = opl.validate_observability_runtime_receipt(
+        receipt, evidence_dir, expected, now=observed_at, contract_state=state)
+    check(not receipt_errors,
+          f"the complete Agents receipt validates without Tradebot hardcodes ({receipt_errors})")
+
+    violating = json.loads(json.dumps(receipt))
+    violating["metric_names"][0] = "undeclared_specialist_metric"
+    check(any("exact canonical metric_names" in error
+              for error in opl.validate_observability_runtime_receipt(
+                  violating, evidence_dir, expected, now=observed_at,
+                  contract_state=state)),
+          "a receipt violating the Agents metric contract is refused")
+
+    runbook = json.loads(
+        (evidence_dir / receipt["runbook_drill_artifact"]).read_text(encoding="utf-8"))
+    log = json.loads(
+        (evidence_dir / receipt["log_artifact"]).read_text(encoding="utf-8"))
+    trace = json.loads(
+        (evidence_dir / receipt["trace_artifact"]).read_text(encoding="utf-8"))
+    alert = json.loads(
+        (evidence_dir / receipt["alert_artifact"]).read_text(encoding="utf-8"))
+    check(not opl._validate_observability_drill_correlations(
+              runbook, log, trace, alert, receipt, state),
+          "generic drill correlation accepts the contract-declared Agents incident")
+    tampered_log = json.loads(json.dumps(log))
+    tampered_log["records"][0]["failure_mode"] = "TWO_FAILURES_ONLY"
+    check(bool(opl._validate_observability_drill_correlations(
+              runbook, tampered_log, trace, alert, receipt, state)),
+          "generic drill correlation refuses a non-contract Agents failure mode")
+
+    (_rainman_evidence, rainman_receipt_path, rainman_receipt_data,
+     _rainman_metric, _rainman_verifier) = _observability_runtime_fixture(
+        opl, ROOT / "projects" / "rainman-alias-fixture",
+        "W-rainman-alias-fixture", "REC-rainman-alias-fixture",
+        "rainman-alias-fixture",
+    )
+    rainman_state = opl._OBSERVABILITY_DEFAULT_STATE
+    rainman_base = rainman_receipt_path.parent
+    rainman_runbook_data = json.loads(
+        (rainman_base / rainman_receipt_data["runbook_drill_artifact"]).read_text(
+            encoding="utf-8"))
+    rainman_log_data = json.loads(
+        (rainman_base / rainman_receipt_data["log_artifact"]).read_text(encoding="utf-8"))
+    rainman_trace_data = json.loads(
+        (rainman_base / rainman_receipt_data["trace_artifact"]).read_text(encoding="utf-8"))
+    rainman_alert_data = json.loads(
+        (rainman_base / rainman_receipt_data["alert_artifact"]).read_text(encoding="utf-8"))
+    check(not opl._validate_observability_drill_correlations(
+              rainman_runbook_data, rainman_log_data, rainman_trace_data,
+              rainman_alert_data, rainman_receipt_data, rainman_state),
+          "contract-derived timestamp alias preserves Rainman market correlation")
+    rainman_log_data["records"][0]["market_event_ts"] = (
+        opl.parse_ts(rainman_log_data["records"][0]["market_event_ts"])
+        - opl.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    check(bool(opl._validate_observability_drill_correlations(
+              rainman_runbook_data, rainman_log_data, rainman_trace_data,
+              rainman_alert_data, rainman_receipt_data, rainman_state)),
+          "Rainman market-timestamp mutation cannot bypass the generic alias join")
+
+    future_log = json.loads(json.dumps(log))
+    future_log["records"][0]["occurred_at"] = (
+        observed_at + opl.timedelta(seconds=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    future_log_path = write(
+        "out/operator-artifacts/agents-g3-future-log.json",
+        json.dumps(future_log) + "\n",
+    )
+    check(any("correlated structured log records" in error
+              for error in opl._validate_observability_json_artifact(
+                  "log_artifact", future_log_path, receipt,
+                  now=observed_at, contract_state=state)),
+          "generic timestamp ordering refuses occurrence after observation without market_event_ts")
 
 
 def _unregistered_test_names(namespace, tests):
@@ -193,6 +666,8 @@ def load_cli(tag):
     spec = importlib.util.spec_from_file_location(f"opl_{tag}", CLI)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    from operating_layer_test_harness import approval_store_is_protected
+    mod.approval_store_is_protected = approval_store_is_protected
     return mod
 
 
@@ -277,7 +752,7 @@ def append_ndjson(path, rows):
 def test_intel_detection_and_clean():
     reset()
     write(
-        "claude/hooks/ingest.log",
+        "claude/logs/hook-ingest.log",
         "\n".join([
             "2026-06-27T10:00:00Z [track] stop: ingest http=500 cwd=/tmp/app session=s1 password=hunter2",
             "2026-06-27T10:01:00Z [track] stop: ingest http=400 invalid_payload cwd=/tmp/app session=s2",
@@ -413,7 +888,7 @@ def test_agent_cards_scope_excludes_helper_and_legacy_records():
 
 def test_all_smoke_outputs_parse_and_redact():
     reset()
-    write("claude/hooks/ingest.log", "2026-06-27T10:00:00Z stop: ingest http=400 api_key=abc123\n")
+    write("claude/logs/hook-ingest.log", "2026-06-27T10:00:00Z stop: ingest http=400 api_key=abc123\n")
     write("claude/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
     write("codex/skills/foo/SKILL.md", "---\nname: duplicate\n---\n")
     write("projects/app/README.md", "# App\n")
@@ -448,7 +923,7 @@ def test_improve_and_compare_control_loop():
     data, proc = run("all")
     check(proc.returncode == 0 and data, "control loop first all exits 0")
 
-    write("claude/hooks/ingest.log", "2026-06-27T10:05:00Z stop: ingest http=500 cwd=/tmp/app session=s4\n")
+    write("claude/logs/hook-ingest.log", "2026-06-27T10:05:00Z stop: ingest http=500 cwd=/tmp/app session=s4\n")
     data, proc = run("all")
     check(proc.returncode == 0 and data, "control loop second all exits 0")
 
@@ -463,6 +938,160 @@ def test_improve_and_compare_control_loop():
     summary = compare.get("summary", {})
     check(summary.get("added", 0) + summary.get("worsened", 0) > 0, "compare detects added or worsened findings")
     check(Path(compare["report"]).exists() and Path(compare["html"]).exists(), "compare writes markdown and html report")
+
+
+def test_security_corrections_regressions():
+    result = subprocess.run(
+        [sys.executable, str(HERE / "security_corrections_test.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    check(
+        result.returncode == 0,
+        "production authority and immutable observability regressions: "
+        + result.stderr,
+    )
+
+def test_protocol_checklist_project_equals_work_item():
+    # Grok r8 8750, r9 eefe, r10 dd87: the checklist stores the absolute project that later
+    # status/step/close checks expect, never a cwd guess; with no absolute project it refuses.
+    reset()
+    ledger = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    checklist = ROOT / "out" / "operator-intelligence" / "development-protocol.json"
+    goal = "Fix a project that does not exist yet"
+
+    def record(wid):
+        rows = read_json(checklist) if checklist.exists() else []
+        return next((r for r in rows if r["work_id"] == wid), None)
+
+    def legacy_item(project):
+        reset()
+        start, _ = run("work-start", ["--project", str(ROOT / "projects"), "--goal", goal])
+        items = [json.loads(l) for l in ledger.read_text().splitlines() if l]
+        for item in items:
+            if item["work_id"] == start["work_id"]:
+                item["project"] = project
+        ledger.write_text("".join(json.dumps(i) + "\n" for i in items))
+        return start["work_id"]
+
+    # New protocol work: a bare name binds only under the projects root (r12 44b0); a path binds as typed.
+    fresh, _ = run("work-start", ["--project", "never-made-c29", "--goal", goal, "--development-protocol"])
+    check(fresh.get("ok") is False and not checklist.exists(), f"new missing bare name refuses protocol work: {fresh}")
+    (ROOT / "job" / "cwd-new-c29").mkdir(parents=True)
+    argv = base_cmd("work-start", ["--project", "cwd-new-c29", "--goal", goal, "--development-protocol"])
+    out = json.loads(subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job").stdout or "{}")
+    check(out.get("ok") is False and not checklist.exists(), f"new bare name found only in cwd refuses protocol work: {out}")
+    argv = base_cmd("work-start", ["--project", "./cwd-new-c29", "--goal", goal, "--development-protocol"])
+    out = json.loads(subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job").stdout or "{}")
+    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == out["work_id"])
+    check(item["project"] == str((ROOT / "job" / "cwd-new-c29").resolve()) == record(out["work_id"])["project"],
+          "new explicit relative path binds as typed in work item and checklist")
+    # A legacy bare name that resolves under the projects root keeps its earned rows.
+    wid = legacy_item("legacy-c29")
+    write("projects/legacy-c29/README.md", "# legacy\n")
+    started, _ = run("protocol-start", ["--work-id", wid, "--project", "legacy-c29", "--goal", goal])
+    check(started.get("ok") is True, f"legacy existing bare name enrolls: {started}")
+    first = record(wid)["steps"][0]["step_id"]
+    run("protocol-step", ["--work-id", wid, "--step", first, "--result", "running"])
+    status, _ = run("protocol-status", ["--work-id", wid])
+    kept = next(s for s in status.get("steps", []) if s["step_id"] == first)
+    check(kept["status"] == "running" and Path(record(wid)["project"]).is_absolute(),
+          f"legacy bare name keeps step rows across status: {kept}")
+    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == wid)
+    check(item["project"] == record(wid)["project"],
+          "legacy bare name: enrollment pins the work item to the checklist's absolute project (classify compares them)")
+    # A bare name found only in the caller's cwd is a guess, not the project: refuse it.
+    wid = legacy_item("cwd-only-c29")
+    (ROOT / "job" / "cwd-only-c29").mkdir(parents=True)
+    argv = base_cmd("protocol-start", ["--work-id", wid, "--project", "cwd-only-c29", "--goal", goal])
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job")
+    out = json.loads(proc.stdout or "{}")
+    check(out.get("ok") is False and record(wid) is None, f"bare name found only in cwd refuses enrollment: {out}")
+    # Grok r12 44b0: close must apply the same binding rule as status, never a cwd-only match.
+    sys.path.insert(0, str(CLI.parent))
+    import development_protocol as dp
+    bound, _ = dp.prepare_start([], wid, str((ROOT / "job" / "cwd-only-c29").resolve()), goal, lane="small", ui=False)
+    for row in bound["steps"]:
+        row.update(status="not-applicable", exception_reason="fixture")
+    checklist.write_text(json.dumps([bound]))
+    argv = base_cmd("work-close", ["--work-id", wid])
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job")
+    closed = json.loads(proc.stdout or "{}")
+    check("work-close-protocol-incomplete" in ids(closed),
+          f"close refuses a checklist bound to a cwd-only bare name: {ids(closed)}")
+    # Without a knowable absolute directory, enrollment refuses instead of storing a guess.
+    for legacy in ("missing-bare-c29", ".client-c29", "missing-c29/sub"):
+        wid = legacy_item(legacy)
+        started, _ = run("protocol-start", ["--work-id", wid, "--project", legacy, "--goal", goal])
+        again, _ = run("work-start", ["--work-id", wid, "--project", legacy, "--goal", goal, "--development-protocol"])
+        check(started.get("ok") is False and again.get("ok") is False and record(wid) is None,
+              f"legacy {legacy!r} with no absolute project refuses enrollment: {started} {again}")
+
+
+def test_protocol_uses_canonical_work_identity():
+    reset()
+    missing = "./missing-protocol-project"
+    missing_start, _ = run("work-start", ["--project", missing, "--goal", "Fix missing project", "--development-protocol"])
+    missing_id = missing_start["work_id"]
+    explicit, _ = run("protocol-start", ["--work-id", missing_id, "--project", missing, "--goal", "Fix missing project"])
+    check(explicit.get("ok") is True, "explicit enrollment resolves nonexistent relative project identity")
+    missing_status, _ = run("protocol-status", ["--work-id", missing_id])
+    check(missing_status.get("exists") is True and "error" not in missing_status,
+          "nonexistent relative project retains canonical protocol status identity")
+    missing_step, _ = run("protocol-step", ["--work-id", missing_id, "--step", missing_status["steps"][0]["step_id"], "--result", "running"])
+    check(missing_step.get("ok") is True,
+          "nonexistent relative project retains canonical protocol step identity")
+    reset()
+    project = ROOT / "projects" / "identity-ui"
+    write("projects/identity-ui/README.md", "# UI\n")
+    goal = "Build a UI screen"
+    start, _ = run("work-start", ["--project", str(project), "--goal", goal])
+    work_id = start["work_id"]
+    for supplied_project, supplied_goal in ((str(project), "typo"), (str(ROOT), goal)):
+        result, _ = run(
+            "protocol-start",
+            [
+                "--work-id",
+                work_id,
+                "--project",
+                supplied_project,
+                "--goal",
+                supplied_goal,
+            ],
+        )
+        check(
+            result.get("ok") is False,
+            "protocol enrollment rejects mismatched canonical identity",
+        )
+    result, _ = run(
+        "protocol-start",
+        ["--work-id", work_id, "--project", "identity-ui", "--goal", goal],
+    )
+    check(
+        result.get("ok") is True, "protocol enrollment resolves canonical project alias"
+    )
+    rows = result["protocol"]["steps"]
+    check(
+        next(row for row in rows if row["step_id"] == "design")["required"],
+        "canonical UI goal retains required design",
+    )
+    ledger = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    items = [json.loads(line) for line in ledger.read_text().splitlines() if line]
+    for item in items:
+        if item["work_id"] == work_id:
+            item["goal"] = "Changed UI scope"
+    ledger.write_text("".join(json.dumps(item) + "\n" for item in items))
+    result, _ = run("protocol-status", ["--work-id", work_id])
+    check(
+        result.get("ok") is False and "identity" in result.get("error", ""),
+        "later scope changes invalidate protocol identity",
+    )
+    result, _ = run("work-close", ["--work-id", work_id])
+    check(
+        "work-close-protocol-incomplete" in ids(result),
+        "closeout rejects changed protocol identity",
+    )
 
 
 def test_daily_work_envelope_and_pathway_cooperation():
@@ -1109,6 +1738,11 @@ def test_selected_work_scoring_regression_kills_aggregate_mutant():
             replacement_counts.append(mutant_source.count(original))
             mutant_source = mutant_source.replace(original, replacement)
         mutant_cli.write_text(mutant_source, encoding="utf-8")
+        # operating-layer.py imports its sibling development_protocol at module load, so a mutant
+        # copied alone cannot start and dies before any assertion can kill it.
+        shutil.copy2(CLI.parent / "development_protocol.py", mutant_scripts / "development_protocol.py")
+        shutil.copy2(HERE / "operating_layer_test_harness.py",
+                     mutant_tests_dir / "operating_layer_test_harness.py")
 
         namespace = runpy.run_path(str(mutant_tests), run_name="selected_work_aggregate_mutant")
         mutant_test = namespace["test_pathway_next_scores_only_selected_active_work"]
@@ -1987,19 +2621,29 @@ def test_pathway_metric_reuses_generic_verifier_binding():
     }])
 
     parse_calls = 0
+    credit_calls = 0
     original_parse = opl.parse_generic_verifier_command
+    original_credit = opl.proof_credits_pathway
 
     def counting_parse(*call_args, **call_kwargs):
         nonlocal parse_calls
         parse_calls += 1
         return original_parse(*call_args, **call_kwargs)
 
+    def counting_credit(*call_args, **call_kwargs):
+        nonlocal credit_calls
+        credit_calls += 1
+        return original_credit(*call_args, **call_kwargs)
+
     opl.parse_generic_verifier_command = counting_parse
+    opl.proof_credits_pathway = counting_credit
     metric = opl.compute_pathway_metric(paths)
     check(metric["proved"] == len(recommendations),
           "the verifier-binding cache preserves the proved recommendation count")
     check(parse_calls == 1,
           "pathway-metric parses one shared generic verifier binding once per computation")
+    check(credit_calls == len(recommendations),
+          "pathway-metric validates only the matching proof for each recommendation")
 
     parse_calls = 0
     freshness_cache = {}
@@ -2831,11 +3475,16 @@ def test_tier_calibration_measures_defaults_from_closed_outcomes():
     wi_path = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
     wi_path.parent.mkdir(parents=True, exist_ok=True)
     # 3 closed "live" outcomes (across different projects — tier defs are global): every default
-    # pathway proved EXCEPT docs (always N/A), plus security (NOT in live's default) always proved.
+    # pathway proved EXCEPT docs and release (explicitly N/A), plus security (NOT in live's
+    # default) always proved. Release cannot be represented as proved without a currently
+    # corroborated approval-backed proof row; this calibration fixture is not testing that stack.
     live_default = ["govern", "data", "implementation", "quality", "observability", "release", "docs"]
     rows = []
     for i in range(3):
-        itin = [{"pathway": p, "status": ("na" if p == "docs" else "proved")} for p in live_default]
+        itin = [
+            {"pathway": p, "status": ("na" if p in {"docs", "release"} else "proved")}
+            for p in live_default
+        ]
         itin.append({"pathway": "security", "status": "proved"})
         if i == 0:
             itin.append({"pathway": "security", "status": "proved"})  # duplicate entry — must not double-count
@@ -4416,6 +5065,143 @@ print("OBSERVABILITY_RECEIPT_SHA256=" + hashlib.sha256(receipt_path.read_bytes()
     return evidence, receipt_path, receipt, artifacts["metric_artifact"], verifier
 
 
+def _install_observability_test_contract(
+        opl, proj, verifier, contract_root, trusted=True):
+    """Register one ephemeral Rainman-shaped contract for verifier-path adversarial tests."""
+    contract_root = Path(contract_root).resolve()
+    try:
+        contract_relative = contract_root.relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise AssertionError("test contract root must stay beneath the owned test root") from exc
+    if (not contract_relative.parts
+            or contract_relative.parts[0] != "contract-fixtures"):
+        raise AssertionError("test contract root must stay inside contract-fixtures")
+    key = proj.resolve().relative_to((ROOT / "projects").resolve()).as_posix()
+    contract = json.loads(json.dumps(opl._OBSERVABILITY_DEFAULT_CONTRACT))
+    contract["project_key"] = key
+    contract["trusted_verifier_sha256"] = (
+        [opl.sha256_file(verifier)] if trusted else [])
+    parts = key.split("/")
+    path = contract_root.joinpath(*parts[:-1], f"{parts[-1]}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(contract) + "\n", encoding="utf-8")
+    return path
+
+
+def _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root):
+    import argparse
+    args = argparse.Namespace(
+        evidence=str(evidence), work_id=work_id, pathway="observability",
+        gate="observability-gate", kind="verify", result="pass", stale_after_days=30,
+        verified_by="", recommendation_id=recommendation_id,
+        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
+        proof_type="artifact", canary_target=None, project=str(proj),
+    )
+    return opl.build_proof_record(
+        args,
+        work_item={"work_id": work_id, "project": str(proj), "project_name": proj.name},
+        projects_root=str(ROOT / "projects"),
+        observability_contract_root=contract_root,
+    )
+
+
+def test_observability_untrusted_verifier_has_no_side_effects():
+    reset()
+    proj = ROOT / "projects" / "observability-untrusted"
+    proj.mkdir(parents=True)
+    work_id = "W-observability-untrusted"
+    recommendation_id = "REC-observability-untrusted"
+    opl = load_cli("observability_untrusted_side_effect")
+    evidence, receipt_path, receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-untrusted")
+    sentinel = ROOT / "out" / "untrusted-verifier-executed"
+    verifier.write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('ran')\n"
+        + verifier.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    receipt["verifier_source_sha256"] = opl.sha256_file(verifier)
+    receipt["artifact_sha256"] = {
+        **receipt["artifact_sha256"], "verifier_artifact": opl.sha256_file(verifier),
+    }
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
+    }), encoding="utf-8")
+    contract_root = ROOT / "contract-fixtures" / "untrusted"
+    contract_root.mkdir(parents=True)
+    helper_refused_repo_root = False
+    try:
+        _install_observability_test_contract(
+            opl, proj, verifier, REPO / "contracts" / "observability",
+            trusted=False)
+    except AssertionError:
+        helper_refused_repo_root = True
+    check(helper_refused_repo_root,
+          "mutable contract fixtures cannot target the checked-in contracts root")
+    _install_observability_test_contract(
+        opl, proj, verifier, contract_root, trusted=False)
+    proof, warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    check(proof.get("exit_code") is None
+          and proof.get("observability_executed_verifier_sha256") == "",
+          "a registered project with an untrusted verifier refuses before subprocess execution")
+    check(not sentinel.exists(),
+          "a registered-but-untrusted verifier cannot produce external file side effects")
+    check(any("not registered in the resolved contract" in error
+              for error in proof.get("observability_receipt_errors", [])),
+          "the refusal identifies the selected contract allowlist")
+    check(warning is not None and warning.get("id") == "proof-logged-unverified",
+          "untrusted verifier refusal is surfaced as a loud unverified proof")
+
+    late_sentinel = ROOT / "out" / "late-swapped-verifier-executed"
+    late_verifier = write(
+        "out/operator-artifacts/late-swapped-verifier.py",
+        "print('ORIGINAL_TRUSTED_VERIFIER')\n",
+    )
+    expected_digest = opl.sha256_file(late_verifier)
+    late_verifier.write_text(
+        f"from pathlib import Path\nPath({str(late_sentinel)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    late_exit, _stdout_sha, _stdout_bytes, _stdout = opl.run_observability_verifier_argv(
+        [sys.executable, str(late_verifier)], str(proj),
+        expected_verifier_sha256=expected_digest, trusted_sha256=[expected_digest])
+    check(late_exit == 126 and not late_sentinel.exists(),
+          "a verifier swapped after trust selection is rehashed and refused at execution time")
+
+
+def test_observability_historical_contract_digest_invalidation():
+    reset()
+    proj = ROOT / "projects" / "observability-history"
+    proj.mkdir(parents=True)
+    work_id = "W-observability-history"
+    recommendation_id = "REC-observability-history"
+    opl = load_cli("observability_historical_contract")
+    evidence, receipt_path, _receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-history")
+    contract_root = ROOT / "contract-fixtures" / "history"
+    contract_root.mkdir(parents=True)
+    contract_path = _install_observability_test_contract(
+        opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    verifier_digest = opl.sha256_file(verifier)
+    check(proof.get("observability_executed_verifier_sha256") == verifier_digest
+          and proof.get("observability_post_verifier_sha256") == verifier_digest,
+          "the proof records and rechecks the exact verifier digest that executed")
+    check(opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
+          "a fully bound proof credits while its exact contract snapshot remains current")
+    contract_path.write_bytes(contract_path.read_bytes() + b" ")
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
+          "historical observability credit is invalidated when current contract bytes drift")
+
+
 def test_observability_pre_runtime_hold_carries_without_credit_or_repeat():
     """A Tier-A verifier can validate a negative claim but cannot launder caller `pass`."""
     reset()
@@ -5014,6 +5800,10 @@ def test_observability_runtime_receipt_completeness_binding_and_replay_guards():
         duplicate, opl.sha256_file(receipt_path), receipt, "runtime"
     )["bound"] is False, "duplicate contradictory observability markers fail closed")
 
+    receipt["contract_key"] = "rainman-thorp"
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
+    }), encoding="utf-8")
     logged, _ = run("work-log", [
         "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
         "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
@@ -5022,18 +5812,18 @@ def test_observability_runtime_receipt_completeness_binding_and_replay_guards():
         "--recommendation-id", recommendation_id,
     ])
     proof = next(record for record in logged["records"] if "verifier_strength" in record)
-    check(proof.get("canary_mutant_failed") is True and not opl.proof_is_verified(proof),
-          "a structurally complete runtime receipt stays uncredited without a trusted verifier root")
+    check(proof.get("exit_code") is None and not opl.proof_is_verified(proof),
+          "an unregistered project contract refuses before verifier execution")
     check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE == "TRUSTED_VERIFIER_NOT_CONFIGURED"
           and not opl.OBSERVABILITY_TRUSTED_VERIFIER_SHA256,
           "runtime observability verifier trust is explicitly unconfigured and fail closed")
-    check(set(proof.get("observability_artifact_canary_results", {}))
-          == set(opl.OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
-          and all(proof["observability_artifact_canary_results"].values()),
-          "every one of the seven receipt-bound artifacts independently trips the verifier")
-    check(proof.get("observability_artifact_restoration_sha256")
-          == proof.get("observability_artifact_sha256"),
-          "every mutation canary restores the exact pre-run artifact hash")
+    check(proof.get("observability_artifact_canary_results") == {},
+          "an unregistered verifier cannot reach any artifact canary subprocess")
+    check(any("observability_contract_not_registered" in error
+              for error in proof.get("observability_receipt_errors", [])),
+          "G2 names the missing per-project contract instead of Rainman enum errors")
+    check(proof.get("observability_contract_key") == "observability-runtime",
+          "receipt-supplied contract_key cannot select the Rainman contract")
     generic = {
         "pathway": "quality", "result": "pass", "verifier_strength": "executed",
         "exit_code": 0, "trivial_verifier": False, "canary_mutant_failed": None,
@@ -5057,19 +5847,18 @@ def test_observability_proof_rejects_verifier_that_ignores_one_bound_artifact():
         opl, proj, work_id, recommendation_id, "observability-ignored-artifact",
         ignore_field="log_artifact",
     )
-    logged, _ = run("work-log", [
-        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
-        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
-        "--project", str(proj),
-        "--verify-cmd", f"{sys.executable} {verifier} {receipt_path}",
-        "--recommendation-id", recommendation_id,
-    ])
-    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    contract_root = ROOT / "contract-fixtures" / "ignored-artifact"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
     results = proof.get("observability_artifact_canary_results", {})
     check(results.get("log_artifact") is False
           and all(value is True for field, value in results.items() if field != "log_artifact"),
           "one ignored receipt-bound artifact is detected by its independent mutation canary")
-    check(not opl.proof_is_verified(proof),
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
           "a verifier that ignores any one observability artifact cannot earn credit")
 
 
@@ -5117,16 +5906,14 @@ print("OBSERVABILITY_RECEIPT_SHA256=" + hashlib.sha256(receipt_path.read_bytes()
     receipt_path.write_text(json.dumps({
         "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
     }), encoding="utf-8")
-    import argparse
-    args = argparse.Namespace(
-        evidence=str(evidence), work_id=work_id, pathway="observability",
-        gate="observability-gate", kind="verify", result="pass", stale_after_days=30,
-        verified_by="", recommendation_id=recommendation_id,
-        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
-        proof_type="artifact", canary_target=None, project=str(proj),
-    )
-    proof, warning = opl.build_proof_record(args, projects_root=str(ROOT / "projects"))
-    check(not opl.proof_is_verified(proof),
+    contract_root = ROOT / "contract-fixtures" / "stateful-verifier"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
+    proof, warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
           "a schedule-aware invocation-counter verifier cannot earn runtime observability credit")
     check(opl.OBSERVABILITY_RUNTIME_VERIFIER_TRUST_STATE != "CONFIGURED_AND_VERIFIED",
           "black-box mutation behavior cannot substitute for a configured verifier trust root")
@@ -5152,6 +5939,9 @@ def test_observability_proof_revalidates_receipt_freshness_after_canaries():
         "status": "RUNTIME_OBSERVABILITY_RECEIPT",
         "observability_receipt": receipt,
     }), encoding="utf-8")
+    contract_root = ROOT / "contract-fixtures" / "expiry"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
 
     before_expiry = issued_at + opl.timedelta(seconds=30)
     after_expiry = issued_at + opl.timedelta(seconds=61)
@@ -5161,17 +5951,9 @@ def test_observability_proof_revalidates_receipt_freshness_after_canaries():
         return next(clock_values, after_expiry)
 
     opl.utc_now = controlled_utc_now
-    import argparse
-    args = argparse.Namespace(
-        evidence=str(evidence), work_id=work_id, pathway="observability",
-        gate="observability-gate", kind="verify", result="pass",
-        stale_after_days=30, verified_by="", recommendation_id=recommendation_id,
-        verify_cmd=f"{sys.executable} {verifier} {receipt_path}", reviewer="",
-        proof_type="artifact", canary_target=None, project=str(proj),
-    )
-    proof, warning = opl.build_proof_record(
-        args, projects_root=str(ROOT / "projects")
-    )
+    proof, warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
     canary_results = proof.get("observability_artifact_canary_results", {})
     check(set(canary_results) == set(opl.OBSERVABILITY_RECEIPT_ARTIFACT_FIELDS)
           and all(canary_results.values()),
@@ -5188,7 +5970,8 @@ def test_observability_proof_revalidates_receipt_freshness_after_canaries():
           "post-canary receipt expiry fails semantic snapshot revalidation")
     check(proof.get("observability_credit_scope") == ""
           and proof.get("observability_outcome") == ""
-          and not opl.proof_is_verified(proof),
+          and not opl.proof_is_verified(
+              proof, observability_contract_root=contract_root),
           "an expired post-verifier receipt cannot earn observability credit")
     check(warning is not None and warning.get("id") == "proof-logged-unverified",
           "post-verifier receipt expiry produces a loud unverified finding")
@@ -5208,28 +5991,77 @@ def test_observability_proof_rejects_mid_verification_artifact_mutation():
     evidence, receipt_path, _receipt, metric, verifier = _observability_runtime_fixture(
         opl, proj, work_id, recommendation_id, "observability-mutation", mutate=True
     )
-    logged, _ = run("work-log", [
-        "--work-id", work_id, "--pathway", "observability", "--kind", "verify",
-        "--evidence", str(evidence), "--result", "pass", "--proof-type", "artifact",
-        "--project", str(proj),
-        "--verify-cmd", f"{sys.executable} {verifier} {receipt_path}",
-        "--recommendation-id", recommendation_id,
-    ])
-    proof = next(record for record in logged["records"] if "verifier_strength" in record)
+    contract_root = ROOT / "contract-fixtures" / "artifact-mutation"
+    contract_root.mkdir(parents=True)
+    _install_observability_test_contract(opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
     check(proof.get("canary_mutant_failed") is False
           and proof.get("observability_artifact_canary_errors"),
           "TOCTOU fixture fails the per-artifact restoration canary")
     check(proof.get("observability_snapshot_stable") is False
           and any("artifacts changed" in error for error in proof.get("observability_snapshot_errors", [])),
           "post-verifier hashes detect observability artifact mutation")
-    check(not opl.proof_is_verified(proof),
+    check(not opl.proof_is_verified(
+        proof, observability_contract_root=contract_root),
           "mutated observability evidence cannot receive pathway credit")
-    status, _ = run("work-status", ["--work-id", work_id])
-    obs_status = next(
-        entry["status"] for entry in status["summary"]["itinerary"]
-        if entry["pathway"] == "observability"
+    check(proof.get("observability_credit_scope") == "",
+          "TOCTOU failure leaves observability credit closed")
+
+
+def test_observability_proof_binds_contract_and_rejects_contract_toctou():
+    reset()
+    proj = ROOT / "projects" / "observability-contract-toctou"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "reject mutable observability contract",
+        "--tier", "production-secure",
+    ])
+    work_id = started["work_id"]
+    recommendation_id = "REC-observability-contract-toctou"
+    opl = load_cli("observability_contract_toctou")
+    evidence, receipt_path, receipt, _metric, verifier = _observability_runtime_fixture(
+        opl, proj, work_id, recommendation_id, "observability-contract-toctou"
     )
-    check(obs_status == "required", "TOCTOU failure leaves observability coverage open")
+    contract_root = ROOT / "contract-fixtures" / "contract-toctou"
+    contract_root.mkdir(parents=True)
+    contract_path = contract_root / f"{proj.name}.json"
+    source = verifier.read_text(encoding="utf-8")
+    source = source.replace(
+        'print("OBSERVABILITY_DECISION=CREDIT")',
+        f'Path({str(contract_path)!r}).write_text('
+        f'Path({str(contract_path)!r}).read_text(encoding="utf-8") + " ", encoding="utf-8")\n'
+        'print("OBSERVABILITY_DECISION=CREDIT")',
+        1,
+    )
+    verifier.write_text(source, encoding="utf-8")
+    receipt["verifier_source_sha256"] = opl.sha256_file(verifier)
+    receipt["artifact_sha256"] = {
+        **receipt["artifact_sha256"], "verifier_artifact": opl.sha256_file(verifier),
+    }
+    receipt_path.write_text(json.dumps({
+        "status": "RUNTIME_OBSERVABILITY_RECEIPT", "observability_receipt": receipt,
+    }), encoding="utf-8")
+    contract_path = _install_observability_test_contract(
+        opl, proj, verifier, contract_root)
+    proof, _warning = _build_observability_test_proof(
+        opl, proj, work_id, recommendation_id, evidence, receipt_path, verifier,
+        contract_root)
+    check(proof.get("exit_code") == 0,
+          "contract TOCTOU fixture passes the pre-execution allowlist before mutation")
+    check(proof.get("observability_contract_key") == proj.name
+          and proof.get("observability_contract_path") == str(contract_path)
+          and proof.get("observability_contract_schema_version") == 1
+          and len(proof.get("observability_contract_sha256", "")) == 64,
+          "proof records the resolved contract key, path, schema, and pre-run SHA")
+    check(proof.get("observability_contract_post_sha256")
+          != proof.get("observability_contract_sha256")
+          and any("contract changed" in error
+                  for error in proof.get("observability_snapshot_errors", [])),
+          "post-verifier contract rehash detects TOCTOU mutation")
+    check(not opl.observability_bound_contract_is_current(proof, contract_root),
+          "a proof whose contract bytes changed during execution cannot credit")
 
 
 def test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts():
@@ -5245,6 +6077,141 @@ def test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contract
         hollow = opl.check_verifier_template(pathway, "")
         complete = opl.check_verifier_template(pathway, baton + "\n" + "\n".join(spec["required_artifact_terms"]))
         check(not hollow["valid"] and complete["valid"], f"{pathway} template rejects hollow artifacts and accepts its contract")
+    json_baton = json.dumps({
+        "scope": "Mechanical contract extraction with durable continuity.",
+        "lineage": {"source": "engine constants"},
+        "verification": {"fidelity": "24/24"},
+        "what_changed": ["The contract was extracted."],
+        "more_relevant": ["Phase 2 containment."],
+        "less_relevant": [],
+        "next_pathway_must_use": ["Read the locked constraints."],
+        "do_not_do_yet": ["Do not resolve arbitrary project paths yet."],
+        "open_decisions": [],
+        "active_risk_overlays": ["rollback"],
+    })
+    parsed_json = opl.extract_carry_forward_sections(json_baton)
+    check(opl.check_verifier_template("data", json_baton)["valid"]
+          and parsed_json.get("summary")
+          == "Mechanical contract extraction with durable continuity."
+          and parsed_json.get("do_not_do_yet")
+          == ["Do not resolve arbitrary project paths yet."]
+          and parsed_json.get("open_decisions") == [],
+          "strict JSON receipts preserve complete carry-forward fields, including empty lists")
+    duplicate_json = json_baton[:-1] + ',"what_changed":["shadowed"]}'
+    check(not opl.check_verifier_template("data", duplicate_json)["valid"],
+          "duplicate-key JSON receipts fail the carry-forward template closed")
+    markdown_suffix = baton + "\nlineage\nverification"
+    duplicate_with_headings = (
+        '{\n  "summary": "first",\n  "summary": "second"\n}\n' + markdown_suffix
+    )
+    nan_with_headings = '{"summary": NaN}\n' + markdown_suffix
+    check(not opl.check_verifier_template("data", duplicate_with_headings)["valid"]
+          and not opl.check_verifier_template("data", nan_with_headings)["valid"],
+          "invalid JSON candidates cannot fall through to valid-looking Markdown headings")
+    empty_json_baton = json.dumps({
+        "summary": "An explicitly empty continuity fixture.",
+        "lineage": {},
+        "verification": {},
+        **{field: [] for field in opl.CARRY_FORWARD_LIST_FIELDS},
+    })
+    empty_evidence = write("out/operator-artifacts/empty-json-baton.json", empty_json_baton)
+    empty_record = opl.build_carry_forward_record({
+        "work_id": "W-empty-json-baton",
+        "project": "fixture-project",
+        "project_path": str(ROOT / "projects" / "fixture-project"),
+        "pathway": "data",
+        "evidence_path": str(empty_evidence),
+        "artifact_sha256": opl.sha256_file(empty_evidence),
+        "proof_id": "P-empty-json-baton",
+        "result": "pass",
+        "verifier_strength": "executed",
+        "exit_code": 0,
+        "trivial_verifier": False,
+        "canary_mutant_failed": True,
+    }, {
+        "project": str(ROOT / "projects" / "fixture-project"),
+        "project_name": "fixture-project",
+        "risk_overlays": [{"id": "rollback"}],
+    })
+    check(empty_record is not None
+          and all(empty_record[field] == [] for field in opl.CARRY_FORWARD_LIST_FIELDS),
+          "the carry-forward builder preserves every explicit empty JSON list without fallback")
+
+
+def test_phase1_g1_verifier_rejects_ambiguous_receipts():
+    """The registered G1 verifier accepts only its exact, unambiguous continuity receipt."""
+    import importlib.util
+
+    reset()
+    verifier_path = (
+        REPO / ".planning/per-project-observability-contracts/quality/verify_phase1_fidelity.py"
+    )
+    spec = importlib.util.spec_from_file_location("phase1_g1_fidelity_verifier", verifier_path)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    receipt_path = (
+        REPO / ".planning/per-project-observability-contracts/quality/receipt-phase1-g1-2026-10-20.json"
+    )
+    raw = receipt_path.read_text(encoding="utf-8")
+    contract_sha256 = verifier.sha256_bytes(verifier.CONTRACT_PATH.read_bytes())
+    check(verifier.validate_g1_receipt(receipt_path, contract_sha256) == [],
+          "the canonical G1 receipt passes its strict verifier")
+
+    duplicate = raw.replace(
+        '  "summary": ',
+        '  "summary": "attacker-first-value",\n  "summary": ',
+        1,
+    )
+    nonfinite = raw[:-2] + ',\n  "ambiguous": NaN\n}\n'
+    duplicate_path = write("out/g1-mutants/duplicate.json", duplicate)
+    nonfinite_path = write("out/g1-mutants/nonfinite.json", nonfinite)
+    check(verifier.validate_g1_receipt(duplicate_path, contract_sha256)
+          and verifier.validate_g1_receipt(nonfinite_path, contract_sha256),
+          "duplicate keys and non-finite values fail the G1 verifier closed")
+
+    parsed = json.loads(raw)
+    non_string_path = write(
+        "out/g1-mutants/non-string-list.json",
+        json.dumps({**parsed, "open_decisions": [42]}),
+    )
+    missing_lineage = dict(parsed)
+    missing_lineage.pop("lineage")
+    missing_lineage_path = write(
+        "out/g1-mutants/missing-lineage.json", json.dumps(missing_lineage)
+    )
+    wrong_verification_path = write(
+        "out/g1-mutants/wrong-verification.json",
+        json.dumps({**parsed, "verification": "not a receipt object"}),
+    )
+    check(verifier.validate_g1_receipt(non_string_path, contract_sha256)
+          and verifier.validate_g1_receipt(missing_lineage_path, contract_sha256)
+          and verifier.validate_g1_receipt(wrong_verification_path, contract_sha256),
+          "malformed carry-forward, lineage, and verification fields cannot earn G1 credit")
+
+
+    # Exercise the entrypoints with temporary mutants, without changing tracked evidence.
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    contract = json.loads(verifier.CONTRACT_PATH.read_text())
+    contract["schema_version"] = True
+    mutant_contract = write("out/g1-mutants/bool-contract.json", json.dumps(contract))
+    with patch.object(verifier, "CONTRACT_PATH", mutant_contract), patch.object(sys, "argv", [str(verifier_path)]), contextlib.redirect_stdout(io.StringIO()):
+        check(verifier.main() == 1, "fidelity rejects boolean metadata in place of integer")
+
+    sys.path.insert(0, str(verifier_path.parent))
+    try:
+        runner_spec = importlib.util.spec_from_file_location("phase1_g1_runner", verifier_path.with_name("verify_phase1_g1.py"))
+        runner = importlib.util.module_from_spec(runner_spec)
+        runner_spec.loader.exec_module(runner)
+    finally:
+        sys.path.pop(0)
+    altered = json.loads(raw)
+    altered["verification"]["canonical_suite"] = "forged result"
+    altered_path = write("out/g1-mutants/altered-verification.json", json.dumps(altered))
+    with patch.object(runner, "RECEIPT_PATH", altered_path), patch.object(runner, "run", side_effect=AssertionError("altered receipt reached execution")), contextlib.redirect_stdout(io.StringIO()):
+        check(runner.main() == 1, "G1 command rejects altered verification before executing checks")
 
 
 def test_audit_proof_integrity_uses_active_outcomes_and_reports_history():
@@ -5697,6 +6664,25 @@ def test_resolve_project_dir_nesting_and_unverified_proof_loudness():
         mod.resolve_project_dir("shadowed", projects_root=str(projects)) == "shadowed",
         "meta directories (_archive) never satisfy the nested search",
     )
+    # 2026-09-03 regression: from a cwd holding a same-named folder, the bare name still
+    # resolves to the projects root (Path("koho").exists() must not win over the join).
+    import os as _os
+    (projects / "koho" / "koho" / ".planning").mkdir(parents=True)
+    _cwd = _os.getcwd()
+    try:
+        _os.chdir(projects / "koho")
+        check(
+            mod.resolve_project_dir("koho", projects_root=str(projects))
+            == str((projects / "koho").resolve()),
+            "bare name from a cwd with a same-named subfolder resolves to the projects root",
+        )
+        check(
+            mod.resolve_project_dir("./koho", projects_root=str(projects))
+            == str((projects / "koho" / "koho").resolve()),
+            "an explicit relative path still resolves relative to the cwd",
+        )
+    finally:
+        _os.chdir(_cwd)
 
     import argparse
     ev = write("out/proof-evidence.md", "# evidence\n")
@@ -5825,9 +6811,10 @@ def test_artifact_filename_dates_use_local_day_not_utc():
 
 
 def test_approval_issue_guard_blocks_agent_shell_issuance():
-    """The PreToolUse guard blocks only executable approval issuance commands."""
+    """The PreToolUse guard blocks executable approval authority mutations."""
     waiver = "--kind production-secure-waiver --work-id W-test --pathway release"
     release = "--kind release-production-approval --work-id W-test --release-receipt r.json"
+    invalidation = "--ticket-id AT-000000000000 --reason compromised-ticket"
     deeply_nested = f"operating-layer.py approval-issue {waiver}"
     for _ in range(5):
         deeply_nested = f"bash -c {shlex.quote(deeply_nested)}"
@@ -5897,6 +6884,13 @@ def test_approval_issue_guard_blocks_agent_shell_issuance():
         ("locale quoted subcommand", f"operating-layer.py $\"approval-issue\" {waiver}"),
         ("approval issue help", "operating-layer.py approval-issue --help"),
         ("release ticket", f"operating-layer.py approval-issue {release}"),
+        ("approval invalidation", f"operating-layer.py approval-invalidate {invalidation}"),
+        ("legacy inline override", "APPROVAL_ISSUE_CHAT_OVERRIDE=1 "
+         f"operating-layer.py approval-issue {waiver}"),
+        ("legacy inline invalidation override", "APPROVAL_ISSUE_CHAT_OVERRIDE=1 "
+         f"operating-layer.py approval-invalidate {invalidation}"),
+        ("nested legacy override", "bash -c 'APPROVAL_ISSUE_CHAT_OVERRIDE=1 "
+         f"operating-layer.py approval-invalidate {invalidation}'"),
     ]
     for label, command in blocked:
         proc = run_approval_guard({"tool_name": "Bash", "tool_input": {"command": command}})
@@ -5937,7 +6931,9 @@ def test_approval_issue_guard_blocks_agent_shell_issuance():
     check(malformed.stderr == APPROVAL_GUARD_DENIAL,
           "approval guard malformed fallback gives the exact denial")
 
-    for variable in ("CLAUDE_HOOK_FORCE", "EXTERNAL_SEND_APPROVED"):
+    for variable in (
+        "APPROVAL_ISSUE_CHAT_OVERRIDE", "CLAUDE_HOOK_FORCE", "EXTERNAL_SEND_APPROVED",
+    ):
         proc = run_approval_guard(
             {"tool_name": "Bash", "tool_input": {"command": blocked[0][1]}},
             env={variable: "1"},
@@ -5997,6 +6993,34 @@ def test_approval_issue_guard_allows_non_issuance_text_and_fail_open_inputs():
         check(proc.stdout == "" and proc.stderr == "",
               f"approval guard is silent for {label}")
 
+    # The raw-input fast path must not hide JSON escapes or shell-joined names.
+    for subcommand in ("approval-issue", "approval-invalidate"):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {
+            "command": "operating-layer.py " + subcommand + " --help"}})
+        for index, char in enumerate(subcommand):
+            escaped = subcommand[:index] + "\\u%04x" % ord(char) + subcommand[index + 1:]
+            proc = run_approval_guard(payload.replace(subcommand, escaped), raw=True)
+            check(proc.returncode == 2 and proc.stderr == APPROVAL_GUARD_DENIAL,
+                  f"approval guard decodes escaped {subcommand} character {index}")
+        joined = subcommand[:3] + "'" + subcommand[3:7] + "'" + subcommand[7:]
+        proc = run_approval_guard({"tool_name": "Bash", "tool_input": {
+            "command": "operating-layer.py " + joined + " --help"}})
+        check(proc.returncode == 2 and proc.stderr == APPROVAL_GUARD_DENIAL,
+              f"approval guard keeps unescaped shell-joined {subcommand} blocked")
+
+    # A fresh interpreter proves the optimization removes imports, not timing
+    # samples or validation: ordinary commands never initialize the JSON stack.
+    probe = subprocess.run(
+        ["python3", "-S", "-c",
+         "import runpy, sys; "
+         f"guard=runpy.run_path({str(APPROVAL_GUARD)!r}); "
+         "assert guard['main']() == 0; assert 'json' not in sys.modules"],
+        input='{"tool_name":"Bash","tool_input":{"command":"true"}}',
+        capture_output=True, text=True, timeout=5,
+    )
+    check(probe.returncode == 0,
+          "approval guard skips JSON initialization only for proven noncandidate input")
+
     invalid = run_approval_guard("{not-json", raw=True)
     check(invalid.returncode == 0, "approval guard fails open on invalid JSON")
     check(invalid.stdout == "" and invalid.stderr == "",
@@ -6047,8 +7071,8 @@ def test_approval_issue_guard_repeatable_verifier():
     check(installed.returncode == 0,
           f"verifier fixture installs guard links ({installed.stderr.strip()})")
 
-    claude_hook = claude_home / "hooks" / "approval-issue-guard.py"
-    codex_hook = codex_home / "hooks" / "approval-issue-guard.py"
+    claude_hook = claude_home / "hooks" / "approval-issue-guard.sh"
+    codex_hook = codex_home / "hooks" / "approval-issue-guard.sh"
     claude_settings = claude_home / "settings.json"
     codex_settings = codex_home / "hooks.json"
 
@@ -6075,8 +7099,8 @@ def test_approval_issue_guard_repeatable_verifier():
             encoding="utf-8",
         )
 
-    claude_command = f"python3 {claude_hook}"
-    codex_command = f"python3 {codex_hook}"
+    claude_command = f"/bin/bash {claude_hook}"
+    codex_command = f"/bin/bash {codex_hook}"
     save_settings(claude_settings, claude_command)
     save_settings(codex_settings, codex_command)
     save_settings(isolated_settings, claude_command)
@@ -6088,7 +7112,7 @@ def test_approval_issue_guard_repeatable_verifier():
     verifier_cmd = [
         sys.executable,
         str(APPROVAL_GUARD_VERIFIER),
-        "--repo-hook", str(APPROVAL_GUARD),
+        "--repo-hook", str(APPROVAL_GUARD_LAUNCHER),
         "--claude-hook", str(claude_hook),
         "--codex-hook", str(codex_hook),
         "--claude-settings", str(claude_settings),
@@ -6098,17 +7122,27 @@ def test_approval_issue_guard_repeatable_verifier():
         "--runs", "4",
     ]
 
-    def verify():
+    def verify(runs="4"):
+        command = list(verifier_cmd)
+        command[command.index("--runs") + 1] = runs
+        # This is a cancellation budget for sequential child processes, not
+        # the performance verdict. The verifier still rejects p95 >= 50ms.
+        # Each of 33 behavior fixtures and each timing sample has a 5s bound.
+        cancellation_budget = 30 + (33 + int(runs)) * 5
         return subprocess.run(
-            verifier_cmd, capture_output=True, text=True, timeout=30,
+            command, capture_output=True, text=True, timeout=cancellation_budget,
         )
 
     def verify_source(source, runs="1"):
         command = list(verifier_cmd)
         command[command.index("--repo-hook") + 1] = str(source)
         command[command.index("--runs") + 1] = runs
+        # This is a cancellation budget for sequential child processes, not
+        # the performance verdict. The verifier still rejects p95 >= 50ms.
+        # Each of 33 behavior fixtures and each timing sample has a 5s bound.
+        cancellation_budget = 30 + (33 + int(runs)) * 5
         return subprocess.run(
-            command, capture_output=True, text=True, timeout=30,
+            command, capture_output=True, text=True, timeout=cancellation_budget,
         )
 
     def point_installed_links(source):
@@ -6122,17 +7156,20 @@ def test_approval_issue_guard_repeatable_verifier():
         except (TypeError, ValueError):
             return {}
 
-    passed = verify()
+    # With four samples nearest-rank p95 is the maximum, so one scheduler
+    # outlier can masquerade as a guard regression. Match the production
+    # verifier's 120-run sample while preserving its strict 50ms threshold.
+    passed = verify(runs="120")
     summary = verifier_json(passed)
     check(passed.returncode == 0,
-          f"repeatable approval guard verifier passes its complete fixture ({passed.stderr.strip()})")
+          f"repeatable approval guard verifier passes its complete fixture ({passed.stdout.strip()}; {passed.stderr.strip()})")
     check(summary.get("status") == "pass", "approval guard verifier returns a JSON pass status")
-    check(summary.get("run_count") == 4, "approval guard verifier honors its run-count override")
+    check(summary.get("run_count") == 120, "approval guard verifier honors its run-count override")
     check(summary.get("settings_checked") == 3,
           "approval guard verifier reports all three settings files")
-    check(summary.get("symlinks_checked") == 2,
-          "approval guard verifier reports both installed links")
-    check(summary.get("blocked_fixtures") == 15 and summary.get("allowed_fixtures") == 12,
+    check(summary.get("symlinks_checked") == 4,
+          "approval guard verifier reports installed launcher and parser links")
+    check(summary.get("blocked_fixtures") == 24 and summary.get("allowed_fixtures") == 12,
           "approval guard verifier runs fixtures through source and both installed links")
     check(isinstance(summary.get("p95_ms"), (int, float)) and summary.get("p95_ms") < 50,
           "approval guard verifier reports p95 below 50ms")
@@ -6144,6 +7181,23 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier reports the fake ledger line count")
     check(all(path.read_bytes() == before for path, before in settings_before.items()),
           "approval guard verifier leaves all settings bytes unchanged")
+
+    save_settings(codex_settings, f"python3 {codex_hook}")
+    old_launch = verify()
+    check(old_launch.returncode != 0 and "exact guard entry" in old_launch.stdout,
+          "approval guard verifier refuses configuration missing measured shell entry point")
+    save_settings(codex_settings, codex_command)
+
+    # Observe the interpreter flag in a child, rather than trusting argv text.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("guard_launch_verifier", APPROVAL_GUARD_VERIFIER)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    launch_probe = ROOT / "guard-launch-probe.sh"
+    launch_probe.write_text("python3 -S -c 'import sys; raise SystemExit(0 if sys.flags.no_site else 1)'\n")
+    launch_result, _ = verifier.run_hook(launch_probe, "{}")
+    check(launch_result.returncode == 0,
+          "approval guard verifier actually launches Python without site initialization")
 
     save_settings(codex_settings, codex_command, after=True)
     not_last = verify()
@@ -6163,15 +7217,10 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects invalid settings JSON")
     save_settings(claude_settings, claude_command)
 
-    slow_hook = ROOT / "slow-approval-guard.py"
+    (ROOT / "approval-issue-guard.py").symlink_to(APPROVAL_GUARD)
+    slow_hook = ROOT / "slow-approval-guard.sh"
     slow_hook.write_text(
-        "import subprocess, sys, time\n"
-        "time.sleep(0.06)\n"
-        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
-        "input=sys.stdin.read(), capture_output=True, text=True)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "raise SystemExit(proc.returncode)\n",
+        "sleep 0.06\n" + f"/bin/bash {shlex.quote(str(APPROVAL_GUARD_LAUNCHER))}\n",
         encoding="utf-8",
     )
     point_installed_links(slow_hook)
@@ -6179,17 +7228,10 @@ def test_approval_issue_guard_repeatable_verifier():
     check(slow.returncode != 0 and "p95" in slow.stdout.lower(),
           "approval guard verifier rejects a hook at or above the p95 limit")
 
-    mutating_hook = ROOT / "mutating-approval-guard.py"
+    mutating_hook = ROOT / "mutating-approval-guard.sh"
     mutating_hook.write_text(
-        "import subprocess, sys\n"
-        "from pathlib import Path\n"
-        f"with Path({str(ledger)!r}).open('ab') as handle:\n"
-        "    handle.write(b'test-only-change\\n')\n"
-        f"proc = subprocess.run([sys.executable, {str(APPROVAL_GUARD)!r}], "
-        "input=sys.stdin.read(), capture_output=True, text=True)\n"
-        "sys.stdout.write(proc.stdout)\n"
-        "sys.stderr.write(proc.stderr)\n"
-        "raise SystemExit(proc.returncode)\n",
+        f"printf 'test-only-change\\n' >> {shlex.quote(str(ledger))}\n"
+        + f"/bin/bash {shlex.quote(str(APPROVAL_GUARD_LAUNCHER))}\n",
         encoding="utf-8",
     )
     point_installed_links(mutating_hook)
@@ -6199,7 +7241,50 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects any ledger mutation")
 
     ledger.write_bytes(ledger_bytes)
-    point_installed_links(APPROVAL_GUARD)
+    point_installed_links(APPROVAL_GUARD_LAUNCHER)
+
+    alternate_source = ROOT / "alternate-checkout" / "hooks"
+    alternate_source.mkdir(parents=True)
+    alternate_launcher = alternate_source / "approval-issue-guard.sh"
+    alternate_parser = alternate_source / "approval-issue-guard.py"
+    alternate_launcher.write_bytes(APPROVAL_GUARD_LAUNCHER.read_bytes())
+    alternate_parser.write_bytes(APPROVAL_GUARD.read_bytes())
+    point_installed_links(alternate_launcher)
+    for link in (claude_hook.with_suffix(".py"), codex_hook.with_suffix(".py")):
+        link.unlink()
+        link.symlink_to(alternate_parser)
+    alternate_checkout = verify_source(alternate_launcher)
+    check("tracked source" not in alternate_checkout.stdout
+          and verifier_json(alternate_checkout).get("blocked_fixtures") == 24,
+          "verifier binds parser to the selected alternate source checkout")
+    point_installed_links(APPROVAL_GUARD_LAUNCHER)
+    for link in (claude_hook.with_suffix(".py"), codex_hook.with_suffix(".py")):
+        link.unlink()
+        link.symlink_to(APPROVAL_GUARD)
+
+    alternate_hook = codex_hook.parent / "guard.sh"
+    alternate_hook.symlink_to(APPROVAL_GUARD_LAUNCHER)
+    save_settings(codex_settings, f"/bin/bash {alternate_hook}")
+    alternate_command = list(verifier_cmd)
+    alternate_command[alternate_command.index("--codex-hook") + 1] = str(alternate_hook)
+    alternate = subprocess.run(alternate_command, capture_output=True, text=True, timeout=240)
+    check("installed parser" not in alternate.stdout,
+          "alternate launcher basename checks its actual parser sibling")
+    save_settings(codex_settings, codex_command)
+
+    parser_link = codex_hook.with_suffix(".py")
+    parser_link.unlink()
+    parser_link.write_text(APPROVAL_GUARD.read_text())
+    detached_parser = verify()
+    check(detached_parser.returncode != 0 and "installed parser" in detached_parser.stdout,
+          "approval guard verifier rejects a detached parser copy")
+    parser_link.unlink()
+    parser_link.symlink_to(CLI)
+    wrong_parser = verify()
+    check(wrong_parser.returncode != 0 and "installed parser" in wrong_parser.stdout,
+          "approval guard verifier rejects an incorrectly targeted parser")
+    parser_link.unlink()
+    parser_link.symlink_to(APPROVAL_GUARD)
 
     codex_hook.unlink()
     codex_hook.symlink_to(CLI)
@@ -6208,6 +7293,244 @@ def test_approval_issue_guard_repeatable_verifier():
           "approval guard verifier rejects a link to the wrong source")
     check(ledger.read_bytes() == ledger_bytes,
           "approval guard verifier failure paths leave fake ledger bytes unchanged")
+
+
+def test_approval_ledger_strict_reader_and_authority_refusal_exit_codes():
+    """Authority input is all-or-nothing and repo CLI mutation refusals fail at the shell."""
+    opl = load_cli("approval_strict_ledger")
+    reset()
+    proj = ROOT / "projects" / "strict-approval-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj), "--goal", "strict approval ledger fixture",
+        "--tier", "production-secure",
+    ])
+    wid = started["work_id"]
+    reason = "strict authority fixture"
+    issued, issued_proc = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "observability", "--reason", reason,
+    ])
+    check(issued_proc.returncode == 0 and bool(issued.get("records")),
+          "an isolated valid approval issue exits zero")
+    covered, _ = run("work-cover", [
+        "--work-id", wid, "--pathway", "observability", "--na", "--reason", reason,
+    ])
+    waiver_entry = next(
+        entry for entry in covered["records"][0]["itinerary"]
+        if entry.get("pathway") == "observability"
+    )
+    ledger = ROOT / "out/operator-intelligence/approvals.ndjson"
+    valid_bytes = ledger.read_bytes()
+    valid_events = opl._strict_approval_events(ledger)
+    check(opl.approval_events_valid(valid_events),
+          "the strict reader accepts a complete ordered approval ledger")
+
+    # Root authority pre-consumes at issue time. The first engine attachment must still occur
+    # inside the exact 15-minute review window for both waiver and release consumers.
+    waiver_digest = issued["records"][0]["subject_digest"]
+    waiver_issue_event = next(
+        event for event in valid_events
+        if event.get("event") == "issued" and event.get("subject_digest") == waiver_digest
+    )
+    waiver_expiry = opl.parse_ts(waiver_issue_event["expires_at"])
+    waiver_consumer = f"work-cover:{wid}:observability"
+    timely_waiver, timely_refusal = opl.prebound_approval_for_consumer(
+        valid_events, waiver_digest, waiver_consumer,
+        now=waiver_expiry - opl.timedelta(seconds=1),
+    )
+    stale_waiver, stale_refusal = opl.prebound_approval_for_consumer(
+        valid_events, waiver_digest, waiver_consumer,
+        now=waiver_expiry + opl.timedelta(seconds=1),
+    )
+    check(timely_waiver is not None and not timely_refusal,
+          "a root-preconsumed waiver is attachable inside its review window")
+    check(stale_waiver is None and stale_refusal == "expired",
+          "a root-preconsumed waiver cannot be attached after its review window")
+
+    release_receipt = write(
+        "out/operator-artifacts/strict-root-preconsumed-release.json",
+        json.dumps({"strict_fixture": True}) + "\n",
+    )
+    release_issue, _ = run("approval-issue", [
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(release_receipt),
+        "--reason", "strict preconsumed release fixture",
+    ])
+    release_subject = opl.release_approval_subject(
+        wid, proj.name, opl.sha256_file(release_receipt)
+    )
+    release_consumer = "P-strict-root-preconsumed-release"
+    release_consumption, release_refusal = opl.consume_approval(
+        type("Paths", (), {"approvals_path": ledger})(),
+        release_subject,
+        release_consumer,
+    )
+    check(release_consumption is not None and not release_refusal,
+          "the isolated fixture creates an exact preconsumed release binding")
+    valid_bytes = ledger.read_bytes()
+    valid_events = opl._strict_approval_events(ledger)
+    release_digest = release_issue["records"][0]["subject_digest"]
+    release_issue_event = next(
+        event for event in valid_events
+        if event.get("event") == "issued" and event.get("subject_digest") == release_digest
+    )
+    release_expiry = opl.parse_ts(release_issue_event["expires_at"])
+    stale_release, stale_release_refusal = opl.prebound_approval_for_consumer(
+        valid_events, release_digest, release_consumer,
+        now=release_expiry + opl.timedelta(seconds=1),
+    )
+    check(stale_release is None and stale_release_refusal == "expired",
+          "a root-preconsumed release cannot be attached after its review window")
+
+    original_store_classifier = opl.approval_store_is_protected
+    original_event_loader = opl.approval_events_for
+    try:
+        opl.approval_store_is_protected = lambda _paths: True
+        opl.approval_events_for = lambda _paths: valid_events
+        protected_stale_waiver, protected_waiver_refusal = opl.consume_approval(
+            type("Paths", (), {"approvals_path": ledger})(),
+            waiver_issue_event["subject"],
+            waiver_consumer,
+            now=waiver_expiry + opl.timedelta(seconds=1),
+        )
+        protected_stale_release, protected_release_refusal = opl.consume_approval(
+            type("Paths", (), {"approvals_path": ledger})(),
+            release_subject,
+            release_consumer,
+            now=release_expiry + opl.timedelta(seconds=1),
+        )
+    finally:
+        opl.approval_store_is_protected = original_store_classifier
+        opl.approval_events_for = original_event_loader
+    check(protected_stale_waiver is None and protected_waiver_refusal == "expired",
+          "protected consume rejects a stale root-preconsumed waiver")
+    check(protected_stale_release is None and protected_release_refusal == "expired",
+          "protected consume rejects a stale root-preconsumed release")
+
+    lines = valid_bytes.splitlines(keepends=True)
+    malformed_cases = {
+        "malformed middle": lines[0] + b"{not-json}\n" + b"".join(lines[1:]),
+        "truncated tail": valid_bytes[:-1],
+        "reordered consumption": b"".join([lines[1], lines[0], *lines[2:]]),
+        "unknown event": valid_bytes.replace(b'"event": "consumed"', b'"event": "forged"', 1),
+    }
+    for label, payload in malformed_cases.items():
+        ledger.write_bytes(payload)
+        events = opl._strict_approval_events(ledger)
+        check(not opl.approval_events_valid(events) and len(events) == 0,
+              f"the strict reader rejects the whole ledger for {label}")
+        check(not opl.waiver_corroborated(waiver_entry, covered["records"][0], events),
+              f"{label} cannot retain waiver credit")
+
+    ledger.write_bytes(valid_bytes)
+    symlink = ROOT / "out/operator-intelligence/symlinked-approvals.ndjson"
+    symlink.symlink_to(ledger)
+    check(not opl.approval_events_valid(opl._strict_approval_events(symlink)),
+          "a symlinked approval ledger is rejected")
+    original_cap = opl.NDJSON_READ_MAX_BYTES
+    try:
+        opl.NDJSON_READ_MAX_BYTES = len(valid_bytes) - 1
+        check(not opl.approval_events_valid(opl._strict_approval_events(ledger)),
+              "an over-cap approval ledger is rejected instead of truncated")
+        check(not opl._approval_write_fits(valid_events),
+              "the projected-size guard refuses the write that would cross the read cap")
+    finally:
+        opl.NDJSON_READ_MAX_BYTES = original_cap
+
+    bad_ticket, bad_ticket_proc = run("approval-invalidate", [
+        "--ticket-id", "not-a-ticket", "--reason", "invalid id fixture",
+    ])
+    check(bad_ticket_proc.returncode == 2
+          and "approval-invalidate-invalid-ticket-id" in ids(bad_ticket),
+          "an invalidation validation refusal exits nonzero")
+    missing_reason, missing_reason_proc = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "docs",
+    ])
+    check(missing_reason_proc.returncode == 2
+          and "approval-issue-missing-reason" in ids(missing_reason),
+          "an issue validation refusal exits nonzero")
+
+    # A live-shaped lexical output path remains protected even when it symlinks to the suite's
+    # valid user ledger. The repo CLI renders the sudo helper command and changes no bytes.
+    live_link = ROOT / "live-output-link"
+    live_link.symlink_to(ROOT / "out", target_is_directory=True)
+    before = ledger.read_bytes()
+    protected, protected_proc = run("approval-invalidate", [
+        "--output-root", str(live_link),
+        "--ticket-id", issued["records"][0]["ticket_id"],
+        "--reason", "protected path fixture",
+    ])
+    check(protected_proc.returncode == 2
+          and "approval-invalidate-human-helper-required" in ids(protected)
+          and str(protected.get("authority_command", "")).startswith(
+              "/usr/bin/sudo -k; /usr/bin/sudo -- "
+          ),
+          "a symlinked live-shaped store still requires the root-owned helper")
+    check(ledger.read_bytes() == before,
+          "a protected helper-required refusal leaves the user ledger byte-identical")
+
+    protected_release, protected_release_proc = run("approval-issue", [
+        "--output-root", str(live_link),
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(release_receipt),
+        "--reason", "reviewed strict root command fixture",
+    ])
+    authority_command = str(protected_release.get("authority_command", ""))
+    authority_prefix = (
+        "/usr/bin/sudo -k; /usr/bin/sudo -- "
+        "/usr/local/libexec/pathway-approval "
+    )
+    helper_argv = shlex.split(authority_command[len(authority_prefix):])
+    subject_json = helper_argv[helper_argv.index("--subject-json") + 1]
+    rendered_subject = json.loads(subject_json)
+    import importlib.machinery
+    import importlib.util
+    helper_loader = importlib.machinery.SourceFileLoader(
+        "pathway_approval_command_parser", str(APPROVAL_HELPER_SOURCE)
+    )
+    helper_spec = importlib.util.spec_from_loader(helper_loader.name, helper_loader)
+    helper_module = importlib.util.module_from_spec(helper_spec)
+    helper_loader.exec_module(helper_module)
+    parsed_helper_args = helper_module._build_parser().parse_args(helper_argv)
+    check(protected_release_proc.returncode == 2
+          and authority_command.startswith(authority_prefix)
+          and rendered_subject.get("release_receipt_sha256")
+          == opl.sha256_file(release_receipt)
+          and "[REDACTED]" not in authority_command,
+          "the protected release command preserves the exact reviewed receipt digest")
+    check(parsed_helper_args.command == "issue"
+          and parsed_helper_args.subject_json == subject_json,
+          "the installed helper parser accepts the emitted shlex argument vector")
+
+    project_fragment = '"project":' + json.dumps(rendered_subject["project"])
+    duplicate_subject_json = subject_json.replace(
+        project_fragment,
+        '"project":"sk-proj-' + ("A" * 32) + '",' + project_fragment,
+        1,
+    )
+    check(duplicate_subject_json != subject_json,
+          "duplicate authority subject regression plants the adversarial key")
+    duplicate_argv = list(helper_argv)
+    duplicate_argv[duplicate_argv.index("--subject-json") + 1] = duplicate_subject_json
+    duplicate_command = authority_prefix + shlex.join(duplicate_argv)
+    duplicate_redacted = opl.redact_obj({"authority_command": duplicate_command})
+    check(not opl._is_safe_authority_command(duplicate_command)
+          and duplicate_redacted.get("authority_command") != duplicate_command
+          and "[REDACTED]" in duplicate_redacted.get("authority_command", ""),
+          "duplicate authority subject keys cannot bypass command redaction")
+
+    spoofed_reason, spoofed_reason_proc = run("approval-issue", [
+        "--output-root", str(live_link),
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(release_receipt),
+        "--reason", "reviewed \u202e visually reversed",
+    ])
+    check(spoofed_reason_proc.returncode == 2
+          and "approval-issue-reason-not-storable" in ids(spoofed_reason)
+          and not spoofed_reason.get("authority_command"),
+          "Unicode bidi controls are refused before an authority command is displayed")
 
 
 def test_approval_authority_single_use_waiver_and_release_credit():
@@ -6281,6 +7604,38 @@ def test_approval_authority_single_use_waiver_and_release_credit():
     check(len(consumed_events) == 1
           and consumed_events[0].get("consumed_by") == f"work-cover:{wid}:observability",
           "consumption appends one durable ledger event bound to the consuming work-cover")
+
+    context_events = opl.approval_events_for(
+        type("Paths", (), {"approvals_path": approvals_path})()
+    )
+    covered_item = covered["records"][0]
+    context_digest = opl.work_context_sha256(covered_item, "observability")
+    check(issued_event["subject"].get("schema_version") == 2
+          and issued_event["subject"].get("work_context_sha256") == context_digest
+          and opl.waiver_corroborated(obs_entry, covered_item, context_events),
+          "a waiver v2 subject binds the unchanged work context and survives its status update")
+    context_mutations = []
+    for label, field, value in (
+        ("work id", "work_id", "W-mutated-context"),
+        ("project name", "project_name", "mutated-project"),
+        ("resolved project path", "project", str(proj / "mutated-target")),
+        ("goal", "goal", "mutated production goal"),
+        ("tier", "tier", "live"),
+        ("outcome profile", "outcome_profile", {"id": "mutated-profile"}),
+        ("risk overlays", "risk_overlays", [{"id": "mutated-risk"}]),
+    ):
+        mutated_item = json.loads(json.dumps(covered_item))
+        mutated_item[field] = value
+        context_mutations.append((label, mutated_item))
+    obligation_mutation = json.loads(json.dumps(covered_item))
+    obligation_mutation["itinerary"] = [
+        entry for entry in obligation_mutation["itinerary"]
+        if entry.get("pathway") != "observability"
+    ]
+    context_mutations.append(("obligation identity", obligation_mutation))
+    for label, mutated_item in context_mutations:
+        check(not opl.waiver_corroborated(obs_entry, mutated_item, context_events),
+              f"mutating the waiver-bound {label} invalidates corroboration")
 
     # Criterion 5: the consumed ticket cannot be spent by any other consumer.
     class _ApprovalPaths:
@@ -6460,6 +7815,222 @@ def test_approval_authority_single_use_waiver_and_release_credit():
            for e in approved_status["summary"]["itinerary"]}["release"] == "proved",
           "release flips to proved through the approved, corroborated proof")
 
+    # Close the remaining fixture pathways with exact waiver tickets so the item is genuinely
+    # ready and closed before its release approval is invalidated. This exercises current views,
+    # not a hand-edited status label.
+    for pathway in approved_status["summary"]["itinerary_coverage"]["open"]:
+        if pathway == "release":
+            continue
+        reason = f"{pathway} is not applicable in the release invalidation fixture"
+        run("approval-issue", [
+            "--kind", "production-secure-waiver", "--work-id", wid,
+            "--pathway", pathway, "--reason", reason,
+        ])
+        run("work-cover", [
+            "--work-id", wid, "--pathway", pathway, "--na", "--reason", reason,
+        ])
+    closed, _ = run("work-close", ["--work-id", wid])
+    check(closed.get("closed") is True,
+          "the fully corroborated fixture closes before its release ticket is invalidated")
+
+    carry_forward_path = ROOT / "out/operator-intelligence/pathway-carry-forward.ndjson"
+    raw_carry_forwards = [
+        json.loads(line)
+        for line in carry_forward_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    historical_release = next(
+        row for row in reversed(raw_carry_forwards)
+        if row.get("work_id") == wid and row.get("pathway") == "release"
+    )
+    check(historical_release.get("credits_pathway") is True
+          and historical_release.get("pathway_outcome") == "proved",
+          "the historical release carry-forward records the originally credited decision")
+
+    release_ticket = approved_issue["records"][0]["ticket_id"]
+    invalidated, _ = run("approval-invalidate", [
+        "--ticket-id", release_ticket,
+        "--reason", "release approval was issued through an agent bypass",
+    ])
+    check(invalidated.get("status") == "invalidated",
+          "the exact consumed release ticket accepts an append-only invalidation")
+    reopened_status, _ = run("work-status", ["--work-id", wid])
+    reopened_states = {
+        entry["pathway"]: entry["status"]
+        for entry in reopened_status["summary"]["itinerary"]
+    }
+    check(reopened_states["release"] == "required"
+          and reopened_status["summary"]["closeout_readiness"] == "not_ready",
+          "status-time corroboration reopens release after exact-ticket invalidation")
+    persisted_closed = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted_closed.get("status") == "closed",
+          "the raw work ledger preserves the historical close event")
+    daily, _ = run("work-daily")
+    dashboard = read_json(daily["dashboard"])
+    current_item = next(
+        item for item in dashboard.get("active_work_items", [])
+        if item.get("work_id") == wid
+    )
+    check(current_item.get("persisted_status") == "closed"
+          and current_item.get("current_status_reason") == "approval_invalidated",
+          "the dashboard projects invalidated closed work back into the active current view")
+    view_paths = type("Paths", (), {
+        "approvals_path": approvals_path,
+        "proofs_path": proofs_path,
+        "carry_forward_path": carry_forward_path,
+    })()
+    corrected_carry = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(corrected_carry.get("credits_pathway") is False
+          and corrected_carry.get("pathway_outcome") == "approval_invalidated",
+          "the latest carry-forward view removes invalidated release credit")
+    later_docs = {
+        **historical_release,
+        "carry_forward_id": "CF-later-docs-after-release",
+        "pathway": "docs",
+        "proof_id": "P-later-docs",
+        "summary": "Documentation followed the historical release proof.",
+        "source_artifact": "/tmp/later-docs.md",
+        "what_changed": ["The operator guide now names the current workflow."],
+        "more_relevant": ["Use the current operator guide."],
+        "less_relevant": ["Ignore the superseded draft."],
+        "next_pathway_must_use": ["Read the current operator guide first."],
+        "do_not_do_yet": ["Do not skip the docs review."],
+        "open_decisions": ["Choose the final navigation label."],
+        "active_risk_overlays": ["rollback", "docs-freshness"],
+        "source": "docs carry-forward fixture",
+        "created_at": "2099-01-01T00:00:00Z",
+    }
+    raw_carry_forwards.append(later_docs)
+    carry_forward_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in raw_carry_forwards),
+        encoding="utf-8",
+    )
+    corrected_later_baton = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(corrected_later_baton.get("pathway") == "docs"
+          and corrected_later_baton.get("credits_pathway") is True
+          and corrected_later_baton.get("release_credit_current") is False
+          and corrected_later_baton.get("release_pathway_outcome")
+          == "approval_invalidated",
+          "a later non-release baton still carries the current release invalidation overlay")
+    preserved_docs_fields = {
+        key: corrected_later_baton.get(key)
+        for key in (
+            "summary", "source_artifact", "what_changed", "more_relevant", "less_relevant",
+            "next_pathway_must_use", "do_not_do_yet", "open_decisions",
+            "active_risk_overlays", "source",
+        )
+    }
+    check(preserved_docs_fields == {key: later_docs[key] for key in preserved_docs_fields}
+          and corrected_later_baton.get("release_approval_summary")
+          == "The release approval no longer corroborates; release proof is open again."
+          and corrected_later_baton.get("invalidated_release_proof_id")
+          == historical_release.get("proof_id"),
+          "release invalidation overlays a later baton without clobbering its continuity fields")
+    visible_overlay = opl.carry_forward_effect(corrected_later_baton, "release")
+    check(later_docs["summary"] in visible_overlay
+          and corrected_later_baton["release_approval_summary"] in visible_overlay
+          and corrected_later_baton["release_approval_do_not_do_yet"][0] in visible_overlay,
+          "a later docs baton stays primary while its release hold is operator-visible")
+
+    invalidated_ledger_bytes = approvals_path.read_bytes()
+    proof_rows = [
+        json.loads(line) for line in proofs_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    release_proof_row = next(
+        row for row in proof_rows
+        if row.get("proof_id") == historical_release.get("proof_id")
+    )
+    original_consumption_id = release_proof_row["release_approval_consumed_id"]
+    release_proof_row["release_approval_consumed_id"] = "AC-ffffffffffff"
+    proofs_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in proof_rows),
+        encoding="utf-8",
+    )
+    uncorroborated_carry = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(uncorroborated_carry.get("release_pathway_outcome")
+          == "approval_uncorroborated"
+          and uncorroborated_carry.get("summary") == later_docs["summary"],
+          "a mismatched release claim is classified as uncorroborated without clobbering docs")
+    release_proof_row["release_approval_consumed_id"] = original_consumption_id
+    proofs_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in proof_rows),
+        encoding="utf-8",
+    )
+
+    approvals_path.write_bytes(invalidated_ledger_bytes + b'{"event":"invalidated"')
+    invalid_ledger_carry = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(invalid_ledger_carry.get("release_pathway_outcome")
+          == "approval_ledger_invalid"
+          and invalid_ledger_carry.get("release_approval_state_reason")
+          == "truncated-tail"
+          and invalid_ledger_carry.get("summary") == later_docs["summary"],
+          "an invalid authority ledger is classified separately and preserves the later baton")
+    approvals_path.write_bytes(invalidated_ledger_bytes)
+
+    proof_ledger_bytes = proofs_path.read_bytes()
+    carry_forward_bytes = carry_forward_path.read_bytes()
+    proofs_path.write_text(
+        "".join(
+            json.dumps(row, sort_keys=True) + "\n" for row in proof_rows
+            if row.get("proof_id") != historical_release.get("proof_id")
+        ),
+        encoding="utf-8",
+    )
+    missing_proof_docs = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(missing_proof_docs.get("release_pathway_outcome") == "release_proof_missing"
+          and missing_proof_docs.get("credits_pathway") is True
+          and missing_proof_docs.get("summary") == later_docs["summary"],
+          "a missing release proof overlays a later docs baton without clobbering it")
+    carry_forward_path.write_text(
+        json.dumps(historical_release, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    missing_proof_release = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(missing_proof_release.get("credits_pathway") is False
+          and missing_proof_release.get("pathway_outcome") == "release_proof_missing"
+          and missing_proof_release.get("release_proof_id")
+          == historical_release.get("proof_id"),
+          "a missing release proof removes credit from the latest release baton")
+    proofs_path.write_bytes(proof_ledger_bytes)
+    carry_forward_path.write_bytes(carry_forward_bytes)
+
+    raw_after_invalidation = next(
+        row for row in reversed([
+            json.loads(line)
+            for line in carry_forward_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ])
+        if row.get("work_id") == wid and row.get("pathway") == "release"
+    )
+    check(raw_after_invalidation.get("credits_pathway") is True
+          and raw_after_invalidation.get("pathway_outcome") == "proved",
+          "the raw carry-forward ledger preserves the historical proved record")
+
+    clean_issue, _ = run("approval-issue", [
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(receipt_path),
+        "--reason", "independent fixture reapproval",
+    ])
+    run("work-log", release_log_args)
+    restored_status, _ = run("work-status", ["--work-id", wid])
+    check(clean_issue["records"][0]["ticket_id"] != release_ticket
+          and restored_status["summary"]["closeout_readiness"] == "ready",
+          "a new exact ticket and new consumption restore readiness without reviving the old ticket")
+    restored_daily, _ = run("work-daily")
+    restored_dashboard = read_json(restored_daily["dashboard"])
+    check(wid not in {
+              item.get("work_id")
+              for item in restored_dashboard.get("active_work_items", [])
+          },
+          "a clean reapproval returns the still-closed item to the effective closed set")
+
     # Criterion 10 tail: deleting the consumption from the ledger kills the credit at status time.
     ledger = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
               if line.strip()]
@@ -6472,6 +8043,511 @@ def test_approval_authority_single_use_waiver_and_release_credit():
     check({e["pathway"]: e["status"]
            for e in uncorroborated_status["summary"]["itinerary"]}["release"] == "required",
           "a release proof whose approval is missing from the ledger loses credit at status time")
+    check(uncorroborated_status["summary"]["work_item"].get("status") == "active"
+          and uncorroborated_status["summary"]["work_item"].get("current_status_reason")
+          == "approval_uncorroborated",
+          "work-status reopens a closed item whose claimed release consumption is missing")
+    uncorroborated_daily, _ = run("work-daily")
+    uncorroborated_dashboard = read_json(uncorroborated_daily["dashboard"])
+    check(any(
+              item.get("work_id") == wid
+              and item.get("current_status_reason") == "approval_uncorroborated"
+              for item in uncorroborated_dashboard.get("active_work_items", [])
+          ),
+          "the dashboard exposes closed work with an uncorroborated approval claim")
+    uncorroborated_route, uncorroborated_route_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(uncorroborated_route_proc.returncode == 0
+          and uncorroborated_route.get("work_id") == wid,
+          "pathway-next can continue closed work with an uncorroborated approval claim")
+    uncorroborated_portfolio, _ = run("portfolio-next")
+    uncorroborated_portfolio_row = next(
+        row for row in uncorroborated_portfolio.get("records", [])
+        if row.get("project") == proj.name
+    )
+    check(uncorroborated_portfolio_row.get("active_work") == 1,
+          "portfolio-next counts uncorroborated historically closed work as active")
+
+
+def test_production_secure_closed_view_rechecks_current_readiness():
+    """Deleting approval claims cannot hide a forged production-secure close."""
+    reset()
+    proj = ROOT / "projects" / "closed-view-root-authority-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "production authority current-view regression",
+        "--tier", "production-secure",
+    ])
+    wid = started["work_id"]
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+    items = [
+        json.loads(line)
+        for line in work_items_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    target = next(item for item in items if item.get("work_id") == wid)
+    target["status"] = "closed"
+    target["closed_at"] = "2026-08-31T00:00:00Z"
+    claimed = target["itinerary"][0]
+    claimed.update({
+        "status": "na",
+        "reason": "forged approval claim fixture",
+        "waiver_digest": "0" * 64,
+        "waiver_consumed_id": "AC-000000000000",
+    })
+    work_items_path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in items),
+        encoding="utf-8",
+    )
+    claimed_status, _ = run("work-status", ["--work-id", wid])
+    check(claimed_status["summary"]["work_item"].get("current_status_reason")
+          == "approval_uncorroborated",
+          "a forged approval claim cannot keep a production-secure item closed")
+
+    # Deleting the claim fields must not turn the historical closed label into authority.
+    for field in ("waiver_digest", "waiver_consumed_id"):
+        claimed.pop(field, None)
+    work_items_path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in items),
+        encoding="utf-8",
+    )
+    stripped_status, _ = run("work-status", ["--work-id", wid])
+    current_item = stripped_status["summary"]["work_item"]
+    check(current_item.get("status") == "active"
+          and current_item.get("persisted_status") == "closed"
+          and current_item.get("current_status_reason")
+          == "production_secure_not_ready",
+          "claim deletion still reopens a not-ready production-secure close")
+    daily, _ = run("work-daily")
+    dashboard = read_json(daily["dashboard"])
+    check(any(item.get("work_id") == wid
+              for item in dashboard.get("active_work_items", [])),
+          "the dashboard exposes a bare forged production-secure close")
+    routed, routed_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(routed_proc.returncode == 0 and routed.get("work_id") == wid,
+          "pathway-next continues a bare forged production-secure close")
+    portfolio, _ = run("portfolio-next")
+    portfolio_row = next(
+        row for row in portfolio.get("records", []) if row.get("project") == proj.name
+    )
+    check(portfolio_row.get("active_work") == 1,
+          "portfolio-next counts a bare forged production-secure close as active")
+    calibration, _ = run("tier-calibrate")
+    secure_tier = next(
+        tier for tier in calibration.get("tiers", [])
+        if tier.get("tier") == "production-secure"
+    )
+    check(secure_tier.get("closed_outcomes") == 0,
+          "tier calibration excludes a bare forged production-secure close")
+    persisted = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted.get("status") == "closed",
+          "current-view correction preserves the append-only historical close")
+
+
+def test_live_closed_view_reopens_when_release_proof_is_missing():
+    """A user-writable proof deletion cannot preserve cached release authority at live tier."""
+    opl = load_cli("live_release_proof_deletion")
+    reset()
+    proj = ROOT / "projects" / "live-release-proof-deletion-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "ship an internal live workflow",
+        "--tier", "live",
+    ])
+    wid = started["work_id"]
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+    items = [
+        json.loads(line)
+        for line in work_items_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    target = next(item for item in items if item.get("work_id") == wid)
+    target["status"] = "closed"
+    target["closed_at"] = "2026-08-31T00:00:00Z"
+    for entry in target["itinerary"]:
+        entry["status"] = "proved"
+        entry["proved_by_run"] = f"R-deleted-{entry['pathway']}"
+    work_items_path.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in items),
+        encoding="utf-8",
+    )
+
+    # Preserve the stronger adversarial shape too: the root/user test ledger still records an
+    # invalidated consumed release ticket, while the same-user proof row it named is gone.
+    subject = opl.release_approval_subject(wid, proj.name, "a" * 64)
+    digest = opl.approval_subject_digest(subject)
+    approvals_path = ROOT / "out/operator-intelligence/approvals.ndjson"
+    approval_events = [
+        {
+            "event": "issued", "kind": opl.APPROVAL_KIND_RELEASE,
+            "subject_digest": digest, "ticket_id": "AT-111111111111",
+            "subject": subject, "issued_at": "2026-08-31T00:00:00Z",
+            "expires_at": "2026-08-31T00:15:00Z", "reason": "reviewed release",
+            "work_id": wid, "issued_by": "fixture-human",
+        },
+        {
+            "event": "consumed", "kind": opl.APPROVAL_KIND_RELEASE,
+            "subject_digest": digest, "ticket_id": "AT-111111111111",
+            "at": "2026-08-31T00:01:00Z", "work_id": wid, "pathway": "release",
+            "consumed_by": "P-deleted-release-proof", "consumption_id": "AC-222222222222",
+        },
+        {
+            "event": "invalidated", "kind": opl.APPROVAL_KIND_RELEASE,
+            "subject_digest": digest, "ticket_id": "AT-111111111111",
+            "at": "2026-08-31T00:02:00Z", "work_id": wid,
+            "reason": "compromised approval", "invalidated_by": "fixture-human",
+            "invalidation_id": "AI-333333333333",
+        },
+    ]
+    approvals_path.parent.mkdir(parents=True, exist_ok=True)
+    approvals_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in approval_events),
+        encoding="utf-8",
+    )
+
+    status, status_proc = run("work-status", ["--work-id", wid])
+    current = status["summary"]["work_item"]
+    release_entry = next(
+        entry for entry in status["summary"]["itinerary"]
+        if entry.get("pathway") == "release"
+    )
+    check(status_proc.returncode == 0
+          and release_entry.get("status") == "required"
+          and status["summary"]["closeout_readiness"] == "not_ready"
+          and current.get("status") == "active"
+          and current.get("persisted_status") == "closed"
+          and current.get("current_status_reason") == "release_proof_missing",
+          "a missing live-tier release proof reopens cached credit and the closed current view")
+    valid_ledger = approvals_path.read_bytes()
+    approvals_path.write_bytes(valid_ledger + b'{"event":"invalidated"')
+    invalid_status, invalid_status_proc = run("work-status", ["--work-id", wid])
+    invalid_current = invalid_status["summary"]["work_item"]
+    check(invalid_status_proc.returncode == 0
+          and invalid_status["summary"]["closeout_readiness"] == "not_ready"
+          and invalid_current.get("status") == "active"
+          and invalid_current.get("current_status_reason") == "approval_ledger_invalid",
+          "proof deletion plus an invalid authority ledger still reopens a live closed view")
+    approvals_path.write_bytes(valid_ledger)
+    persisted = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted.get("status") == "closed",
+          "missing-proof projection preserves the append-only historical close")
+
+
+def test_approval_invalidation_revokes_exact_ticket_credit():
+    """Invalidation is append-only, exact-ticket, and retroactive for waiver and release credit."""
+    opl = load_cli("approval_invalidation")
+    reset()
+    proj = ROOT / "projects" / "approval-invalidation-proj"
+    proj.mkdir(parents=True, exist_ok=True)
+    started, _ = run("work-start", [
+        "--project", str(proj),
+        "--goal", "invalidate compromised approval tickets",
+        "--tier", "production-secure",
+    ])
+    wid = started["work_id"]
+    approvals_path = ROOT / "out/operator-intelligence/approvals.ndjson"
+
+    waiver_reason = "runtime proof was independently replaced"
+    waiver_issue, _ = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "observability", "--reason", waiver_reason,
+    ])
+    waiver_ticket = waiver_issue["records"][0]["ticket_id"]
+    covered, _ = run("work-cover", [
+        "--work-id", wid, "--pathway", "observability", "--na", "--reason", waiver_reason,
+    ])
+    waiver_entry = next(
+        entry for entry in covered["records"][0]["itinerary"]
+        if entry["pathway"] == "observability"
+    )
+    events = opl.approval_events_for(type("Paths", (), {"approvals_path": approvals_path})())
+    check(opl.waiver_corroborated(waiver_entry, covered["records"][0], events),
+          "the waiver credits before its exact ticket is invalidated")
+
+    # Make every other pathway independently ready, then close through the real gate. This makes
+    # the observability ticket causally load-bearing instead of force-closing unrelated debt.
+    waiver_status, _ = run("work-status", ["--work-id", wid])
+    for pathway in waiver_status["summary"]["itinerary_coverage"]["open"]:
+        if pathway == "observability":
+            continue
+        reason = f"{pathway} is independently waived in the exact-ticket fixture"
+        run("approval-issue", [
+            "--kind", "production-secure-waiver", "--work-id", wid,
+            "--pathway", pathway, "--reason", reason,
+        ])
+        run("work-cover", [
+            "--work-id", wid, "--pathway", pathway, "--na", "--reason", reason,
+        ])
+    run_evidence = write("out/operator-artifacts/waiver-invalidation-run.txt", "run exists\n")
+    run("work-log", [
+        "--work-id", wid, "--pathway", "govern", "--kind", "note",
+        "--evidence", str(run_evidence), "--result", "recorded",
+    ])
+    closed, _ = run("work-close", ["--work-id", wid])
+    check(closed.get("closed") is True,
+          "the waiver invalidation fixture closes through fully corroborated current state")
+
+    # Reproduce the compromised historical shape: the ticket helped close the item before the
+    # bypass was discovered. Invalidation must restore it to active current work without
+    # deleting the old approval events.
+    work_items_path = ROOT / "out/operator-intelligence/work-items.ndjson"
+
+    invalidated, _ = run("approval-invalidate", [
+        "--ticket-id", waiver_ticket, "--reason", "ticket was issued through an agent bypass",
+    ])
+    check(invalidated.get("status") == "invalidated"
+          and invalidated["records"][0].get("event") == "invalidated"
+          and invalidated["records"][0].get("ticket_id") == waiver_ticket,
+          "approval-invalidate appends an event bound to the exact waiver ticket")
+    persisted_item = next(
+        item for item in (
+            json.loads(line)
+            for line in work_items_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if item.get("work_id") == wid
+    )
+    check(persisted_item.get("status") == "closed",
+          "invalidation preserves the historical closed work record")
+    daily, _ = run("work-daily")
+    daily_dashboard = read_json(daily["dashboard"])
+    current_item = next(
+        item for item in daily_dashboard.get("active_work_items", [])
+        if item.get("work_id") == wid
+    )
+    check(current_item.get("status") == "active"
+          and current_item.get("persisted_status") == "closed"
+          and current_item.get("current_status_reason") == "approval_invalidated",
+          "the invalidated closed item returns to the current active-work dashboard view")
+    check(daily.get("summary", {}).get("active") == 1
+          and daily.get("summary", {}).get("closed") == 0,
+          "dashboard counts use invalidation-aware current status")
+    events = [json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()]
+    check(not opl.waiver_corroborated(waiver_entry, persisted_item, events),
+          "an invalidated consumed waiver loses corroboration")
+    current_context_sha = opl.work_context_sha256(persisted_item, "observability")
+    blocked_consumption, refusal = opl.consume_approval(
+        type("Paths", (), {"approvals_path": approvals_path})(),
+        opl.waiver_subject(
+            wid, proj.name, "observability", waiver_reason, current_context_sha
+        ),
+        f"work-cover:{wid}:observability",
+    )
+    check(blocked_consumption is None and refusal == "invalidated",
+          "invalidation is checked before idempotent consumption reuse")
+    status, _ = run("work-status", ["--work-id", wid])
+    check({entry["pathway"]: entry["status"]
+           for entry in status["summary"]["itinerary"]}["observability"] == "required",
+          "status recomputation reopens an invalidated waiver")
+    check(status["summary"]["work_item"].get("status") == "active"
+          and status["summary"]["work_item"].get("current_status_reason")
+          == "approval_invalidated",
+          "work-status exposes the same invalidation-aware current status as the dashboard")
+    calibration, _ = run("tier-calibrate")
+    production_secure_tier = next(
+        tier for tier in calibration.get("tiers", [])
+        if tier.get("tier") == "production-secure"
+    )
+    check(production_secure_tier.get("closed_outcomes") == 0,
+          "tier calibration excludes a historically closed outcome reopened by invalidation")
+    routed, routed_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(routed_proc.returncode == 0 and routed.get("work_id") == wid,
+          "pathway-next can continue an invalidated historically closed work item")
+    portfolio, _ = run("portfolio-next")
+    portfolio_row = next(
+        row for row in portfolio.get("records", []) if row.get("project") == proj.name
+    )
+    check(portfolio_row.get("active_work") == 1,
+          "portfolio-next counts invalidated historically closed work as currently active")
+
+    repeated, _ = run("approval-invalidate", [
+        "--ticket-id", waiver_ticket, "--reason", "repeat correction is idempotent",
+    ])
+    events_after_repeat = [
+        json.loads(line) for line in approvals_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    check(repeated.get("status") == "already_invalidated"
+          and len([event for event in events_after_repeat
+                   if event.get("event") == "invalidated"
+                   and event.get("ticket_id") == waiver_ticket]) == 1,
+          "repeating an invalidation is idempotent and does not append a duplicate")
+
+    reissued, _ = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "observability", "--reason", waiver_reason,
+    ])
+    check(reissued["records"][0]["ticket_id"] != waiver_ticket,
+          "a later deliberate issue receives a distinct ticket id")
+    still_open, _ = run("work-status", ["--work-id", wid])
+    check({entry["pathway"]: entry["status"]
+           for entry in still_open["summary"]["itinerary"]}["observability"] == "required",
+          "a clean reissue without a new consumption cannot launder the old consumption")
+    recovered, _ = run("work-cover", [
+        "--work-id", wid, "--pathway", "observability", "--na", "--reason", waiver_reason,
+    ])
+    recovered_entry = next(
+        entry for entry in recovered["records"][0]["itinerary"]
+        if entry["pathway"] == "observability"
+    )
+    check(recovered_entry.get("waiver_consumed_id") != waiver_entry.get("waiver_consumed_id"),
+          "the new ticket earns credit only after its own new consumption")
+    recovered_events = opl.approval_events_for(
+        type("Paths", (), {"approvals_path": approvals_path})()
+    )
+    recovered_consumption = next(
+        event for event in reversed(recovered_events)
+        if event.get("event") == "consumed"
+        and event.get("consumption_id") == recovered_entry.get("waiver_consumed_id")
+    )
+    check(recovered_consumption.get("ticket_id") == reissued["records"][0]["ticket_id"]
+          and opl.waiver_corroborated(
+              recovered_entry, recovered["records"][0], recovered_events
+          ),
+          "the replacement waiver corroborates only against its own ticket consumption")
+
+    # An invalidated ticket that was never consumed did not grant credit and cannot reopen work.
+    unused_reason = "docs is independently waived in the exact-ticket fixture"
+    unused_issue, _ = run("approval-issue", [
+        "--kind", "production-secure-waiver", "--work-id", wid,
+        "--pathway", "docs", "--reason", unused_reason,
+    ])
+    run("approval-invalidate", [
+        "--ticket-id", unused_issue["records"][0]["ticket_id"],
+        "--reason", "unused ticket correction fixture",
+    ])
+    unused_daily, _ = run("work-daily")
+    unused_dashboard = read_json(unused_daily["dashboard"])
+    check(wid not in {
+              item.get("work_id")
+              for item in unused_dashboard.get("active_work_items", [])
+          },
+          "invalidating an unconsumed ticket does not falsely reopen unrelated closed work")
+
+    # Authority corruption fails closed across every current-state surface while raw history
+    # remains untouched. Restore the bytes afterward so later exact-ticket checks stay isolated.
+    valid_ledger_bytes = approvals_path.read_bytes()
+    approvals_path.write_bytes(valid_ledger_bytes + b'{"event":"invalidated"')
+    invalid_status, _ = run("work-status", ["--work-id", wid])
+    check(invalid_status["summary"]["work_item"].get("status") == "active"
+          and invalid_status["summary"]["work_item"].get("current_status_reason")
+          == "approval_ledger_invalid",
+          "a truncated approval ledger reopens approval-dependent work-status fail closed")
+    invalid_daily, _ = run("work-daily")
+    invalid_dashboard = read_json(invalid_daily["dashboard"])
+    check(any(
+              item.get("work_id") == wid
+              and item.get("current_status_reason") == "approval_ledger_invalid"
+              for item in invalid_dashboard.get("active_work_items", [])
+          ),
+          "a truncated approval ledger reopens the dashboard current view")
+    invalid_route, invalid_route_proc = run("pathway-next", [
+        "--project", str(proj), "--work-id", wid,
+    ])
+    check(invalid_route_proc.returncode == 0 and invalid_route.get("work_id") == wid,
+          "pathway-next can route approval-dependent work while authority is fail closed")
+    invalid_portfolio, _ = run("portfolio-next")
+    invalid_portfolio_row = next(
+        row for row in invalid_portfolio.get("records", []) if row.get("project") == proj.name
+    )
+    check(invalid_portfolio_row.get("active_work") == 1,
+          "portfolio-next exposes approval-dependent work while authority is fail closed")
+    approvals_path.write_bytes(valid_ledger_bytes)
+
+    receipt = write("out/operator-artifacts/invalidation-release.json", "{\"release\":true}\n")
+    receipt_sha = opl.sha256_file(receipt)
+    release_issue, _ = run("approval-issue", [
+        "--kind", "release-production-approval", "--work-id", wid,
+        "--release-receipt", str(receipt), "--reason", "reviewed release correction fixture",
+    ])
+    release_ticket = release_issue["records"][0]["ticket_id"]
+    release_subject = opl.release_approval_subject(wid, proj.name, receipt_sha)
+    paths = type("Paths", (), {"approvals_path": approvals_path})()
+    consumption, refusal = opl.consume_approval(paths, release_subject, "P-invalidation-release")
+    check(consumption is not None and refusal == "",
+          "the release fixture consumes its exact ticket before invalidation")
+    release_proof = {
+        "work_id": wid,
+        "project": proj.name,
+        "proof_id": "P-invalidation-release",
+        "release_receipt_sha256": receipt_sha,
+        "release_approval_digest": release_issue["subject_digest"],
+        "release_approval_consumed_id": consumption["consumption_id"],
+    }
+    events = opl.approval_events_for(paths)
+    check(opl.release_approval_corroborated(release_proof, events),
+          "the release approval corroborates before invalidation")
+
+    proofs_path = ROOT / "out/operator-intelligence/proofs.ndjson"
+    carry_forward_path = ROOT / "out/operator-intelligence/pathway-carry-forward.ndjson"
+    proofs_path.write_text(json.dumps(release_proof, sort_keys=True) + "\n", encoding="utf-8")
+    carry_forward = {
+        "carry_forward_id": "CF-invalidation-release",
+        "work_id": wid,
+        "project": proj.name,
+        "pathway": "release",
+        "source_artifact": str(receipt),
+        "summary": "Release proof previously credited.",
+        "what_changed": ["Release was marked proved."],
+        "more_relevant": [],
+        "less_relevant": [],
+        "next_pathway_must_use": ["Use the release proof."],
+        "do_not_do_yet": [],
+        "open_decisions": [],
+        "active_risk_overlays": [],
+        "artifact_sha256": receipt_sha,
+        "proof_id": release_proof["proof_id"],
+        "credits_pathway": True,
+        "pathway_outcome": "proved",
+        "created_at": "2026-08-30T00:00:00Z",
+    }
+    carry_forward_path.write_text(
+        json.dumps(carry_forward, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    view_paths = type("Paths", (), {
+        "approvals_path": approvals_path,
+        "proofs_path": proofs_path,
+        "carry_forward_path": carry_forward_path,
+    })()
+    check(opl.latest_carry_forward_for_work(view_paths, wid).get("credits_pathway") is False,
+          "approval alone cannot credit a release baton without a complete verified proof")
+    run("approval-invalidate", [
+        "--ticket-id", release_ticket, "--reason", "release ticket came from an agent bypass",
+    ])
+    check(not opl.release_approval_corroborated(release_proof, opl.approval_events_for(paths)),
+          "an invalidated consumed release ticket loses corroboration")
+    corrected = opl.latest_carry_forward_for_work(view_paths, wid)
+    check(corrected.get("credits_pathway") is False
+          and corrected.get("pathway_outcome") == "approval_invalidated",
+          "the current carry-forward view cannot retain proved release credit after invalidation")
+
+    missing, _ = run("approval-invalidate", [
+        "--ticket-id", "AT-ffffffffffff", "--reason", "unknown ticket regression",
+    ])
+    check("approval-invalidate-ticket-not-found" in ids(missing),
+          "approval-invalidate refuses an unknown exact ticket")
 
 
 def test_release_provider_action_consumes_approval_without_release_credit():
@@ -7304,8 +9380,334 @@ def test_research_focus_map_derivation_and_addendum_verifier():
           "no focus key still returns None")
 
 
+
+def test_protocol_explicit_lane_cli_preflight_and_reactivation():
+    reset()
+    project = ROOT / "projects" / "protocol-fixture"
+    project.mkdir(parents=True)
+    goal = "Normal feature with unchanged UI compatibility"
+    flags = ["--project", str(project), "--goal", goal, "--development-protocol"]
+    item, proc = run("work-start", flags + ["--protocol-lane", "normal", "--protocol-ui", "no"])
+    check(proc.returncode == 0 and item and item.get("work_id"), "explicit protocol work-start accepts paired scope")
+    if proc.returncode or not item or not item.get("work_id"):
+        return
+    wid = item["work_id"]
+    store = ROOT / "out" / "operator-intelligence" / "development-protocol.json"
+    works = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
+    record = read_json(store)[0]
+    check(sum(r["required"] for r in record["steps"]) == 9, "explicit non-UI CLI ignores UI goal word")
+    baseline = (store.read_bytes(), works.read_bytes())
+    for command, args in [
+        ("work-start", flags + ["--protocol-lane", "normal"]),
+        ("work-start", flags + ["--work-id", "not-an-id"]),
+        ("work-start", flags + ["--work-id", "W-unknown"]),
+        ("work-start", flags + ["--work-id", wid, "--protocol-lane", "small", "--protocol-ui", "no"]),
+        ("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", "wrong goal"]),
+        ("protocol-status", ["--work-id", wid, "--protocol-lane", "normal", "--protocol-ui", "no"]),
+    ]:
+        _, rejected = run(command, args)
+        check(rejected.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+              "protocol preflight rejection preserves both stores: " + command + str(args[-2:]))
+    rows = [json.loads(l) for l in works.read_text().splitlines()]
+    original = rows[0]
+    original.update(status="closed", proof_marker="keep", tier="live")
+    # Distinct historical ID proves explicit selection does not use today's date-derived ID.
+    older = dict(original, work_id="W-20000101-protocol-fixture-old", status="closed")
+    works.write_text("\n".join(json.dumps(x) for x in [original, older]) + "\n")
+    prior = read_json(store)[0]
+    older_protocol = dict(prior, work_id=older["work_id"])
+    store.write_text(json.dumps([prior, older_protocol]))
+    before_store = store.read_bytes()
+    closed_baseline = (before_store, works.read_bytes())
+    _, rejected = run("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])
+    check(rejected.returncode != 0 and (store.read_bytes(), works.read_bytes()) == closed_baseline,
+          "closed protocol-start does not reactivate or mutate")
+    resumed, proc = run("work-start", flags + ["--work-id", older["work_id"]])
+    after = [json.loads(l) for l in works.read_text().splitlines()]
+    selected = next(x for x in after if x["work_id"] == older["work_id"])
+    check(proc.returncode == 0 and resumed.get("work_id") == older["work_id"] and selected["status"] == "active",
+          "explicit cross-day original ID reactivates")
+    check(store.read_bytes() == before_store, "reactivation preserves exact checklist bytes")
+    check(all(selected.get(k) == older.get(k) for k in ("tier", "itinerary", "outcome_profile", "risk_overlays", "proof_marker")),
+          "explicit reactivation preserves scope itinerary and proof")
+    check(next(x for x in after if x["work_id"] == wid)["status"] == "closed", "same-goal sibling remains closed")
+    baseline = (store.read_bytes(), works.read_bytes())
+    _, rejected = run("work-start", flags + ["--work-id", older["work_id"], "--tier", "prototype"])
+    check(rejected.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+          "explicit selector cannot retier")
+    # Same-day selection and omitted selection must never choose an older sibling.
+    resumed, proc = run("work-start", flags + ["--work-id", wid])
+    check(proc.returncode == 0 and resumed.get("work_id") == wid and store.read_bytes() == before_store,
+          "explicit same-day ID reopens without checklist edits")
+    resumed, proc = run("work-start", flags)
+    check(proc.returncode == 0 and resumed.get("work_id") == wid,
+          "omitted ID retains today's derived identity")
+    baseline = (store.read_bytes(), works.read_bytes())
+    for change in [["--work-id", wid, "--goal", "foreign"], ["--work-id", wid, "--project", str(project.parent)],
+                   ["--work-id", wid, "--protocol-lane", "normal"]]:
+        _, proc = run("work-start", flags + change)
+        check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+              "identity and partial scope failures preserve both stores " + str(change[-2:]))
+    works.write_bytes(baseline[1] + baseline[1].splitlines(keepends=True)[0])
+    duplicate = (store.read_bytes(), works.read_bytes())
+    _, proc = run("work-start", flags + ["--work-id", wid])
+    check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == duplicate,
+          "duplicate explicit work identity refuses unchanged")
+    works.write_bytes(baseline[1])
+    for malformed, destination in [(b"{broken", store), (b"{broken", works)]:
+        destination.write_bytes(malformed)
+        corrupt = (store.read_bytes(), works.read_bytes())
+        _, proc = run("work-start", flags + ["--work-id", wid])
+        check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == corrupt,
+              "malformed store refuses without work activation")
+        store.write_bytes(baseline[0]); works.write_bytes(baseline[1])
+    # protocol-start agrees with work-start on scope and cannot silently change it.
+    started, proc = run("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal,
+                        "--protocol-lane", "normal", "--protocol-ui", "no"])
+    check(proc.returncode == 0 and sum(r["required"] for r in started["protocol"]["steps"]) == 9,
+          "protocol-start uses identical explicit applicability")
+    # Exercise the actual recovery CLI with an independently reviewed frozen scope fixture.
+    scope = project / "scope.json"; plan = project / "plan.md"; review = project / "review.json"
+    plan.write_text("fixture reviewed plan")
+    sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    body = {"work_id": wid, "project": str(project), "goal_sha256": hashlib.sha256(goal.encode()).hexdigest(),
+            "lane": "normal", "ui": False, "extra_required": [], "reason": "fixture review",
+            "approved_plan": {"path": str(plan), "sha256": sha(plan)}}
+    contract_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "independent fixture", "contract_sha256": contract_hash}))
+    body["review"] = {"path": str(review), "sha256": sha(review)}; scope.write_text(json.dumps(body))
+    status, _ = run("protocol-status", ["--work-id", wid])
+    classify_args = ["--work-id", wid, "--protocol-lane", "normal", "--protocol-ui", "no", "--evidence", str(scope),
+                     "--reason", "fixture reviewed classification", "--expected-record-sha", status["record_sha256"]]
+    classified, proc = run("protocol-classify", classify_args)
+    check(proc.returncode == 0 and classified.get("ok") and not classified.get("ready"),
+          "actual CLI classification keeps pending gates")
+    baseline = (store.read_bytes(), works.read_bytes())
+    _, proc = run("protocol-classify", classify_args)
+    check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+          "stale CLI classification leaves both stores unchanged")
+    plan.write_text("changed approved plan")
+    baseline = (store.read_bytes(), works.read_bytes())
+    _, proc = run("work-start", flags + ["--work-id", wid])
+    check(proc.returncode != 0 and (store.read_bytes(), works.read_bytes()) == baseline,
+          "stale evidence preflight cannot activate or write status")
+    status, _ = run("protocol-status", ["--work-id", wid])
+    check(status.get("scope_invalid") and not status.get("ready"), "changed scope cannot pass closeout")
+    store.unlink()
+    before_work = works.read_bytes()
+    _, rejected = run("work-start", flags + ["--work-id", older["work_id"]])
+    check(rejected.returncode != 0 and not store.exists() and works.read_bytes() == before_work,
+          "missing required protocol is not silently recreated")
+
+
+def test_protocol_work_id_with_dot_stays_selectable():
+    # stable_work_id keeps '.' from the goal slug, so every protocol path must accept it.
+    reset()
+    project = ROOT / "projects" / "protocol-dot-fixture"; project.mkdir(parents=True)
+    goal = "Ship 1.0 release notes"
+    flags = ["--project", str(project), "--goal", goal, "--development-protocol"]
+    item, proc = run("work-start", flags + ["--protocol-lane", "small", "--protocol-ui", "no"])
+    wid = (item or {}).get("work_id", "")
+    check(proc.returncode == 0 and "." in wid, "dotted goal yields a dotted work ID")
+    if proc.returncode or "." not in wid:
+        return
+    for command, args in [("work-start", flags), ("work-start", flags + ["--work-id", wid]),
+                          ("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])]:
+        out, proc = run(command, args)
+        check(proc.returncode == 0, "dotted work ID accepted by " + command + str(args[-2:]))
+
+
+def test_protocol_step_cli_keeps_operator_shell_verifier():
+    # The CLI hands protocol-step its documented operator-trust verifier runner, so shell
+    # syntax such as `cd X && cmd` keeps working there while the module itself runs no shell.
+    reset()
+    project = ROOT / "projects" / "protocol-shell-fixture"; project.mkdir(parents=True)
+    item, proc = run("work-start", ["--project", str(project), "--goal", "shell verifier fixture",
+                     "--development-protocol", "--protocol-lane", "small", "--protocol-ui", "no"])
+    check(proc.returncode == 0 and item.get("work_id"), "protocol work starts for shell verifier fixture")
+    if proc.returncode or not item.get("work_id"):
+        return
+    evidence = project / "proof.txt"; evidence.write_text("proof")
+    marker = project / "shell-ran"
+    step, proc = run("protocol-step", ["--work-id", item["work_id"], "--step", "pathway", "--result", "pass",
+                     "--evidence", str(evidence), "--verify-cmd", f"false || touch {marker}"])
+    check(proc.returncode == 0 and step.get("ok") and marker.exists(),
+          "CLI protocol-step runs operator shell syntax through the shared verifier runner")
+
+
+def test_protocol_first_write_gate_survives_checklist_io_failure():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    mod = load_cli("first_write_gate")
+    # (existing work status, explicit lane): new work, unmarked active work, and an unmarked
+    # closed item reopened without a scope change (a scoped reopen is refused before any write).
+    for existing, lane, selected in ((None, "normal", False), ("active", "normal", False), ("closed", None, False),
+                                     ("closed", "normal", False), ("active", None, True)):
+        reset()
+        project = ROOT / "projects" / "gate-fixture"; project.mkdir()
+        args = SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
+            projects_root=str(ROOT / "projects"), output_root=str(ROOT / "out"),
+            project=str(project), goal="ordinary protocol gate", work_id=None, tier=None,
+            development_protocol=True, protocol_lane=lane, protocol_ui=None if lane is None else "no")
+        paths = mod.Paths(args); paths.operator_intel.mkdir(parents=True)
+        wid = mod.stable_work_id(project, args.goal)
+        if selected:
+            args.work_id = wid
+        if existing:
+            mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project),
+                "goal": args.goal, "status": existing, "proof_marker": "preserve"}])
+        before = paths.work_items_path.read_bytes() if existing else None
+        with patch.object(mod.development_protocol, "write", side_effect=OSError("injected checklist write failure")):
+            result = mod.run_work_start(args, paths)
+        if existing == "closed" and lane is not None:
+            check(result.get("ok") is False and paths.work_items_path.read_bytes() == before
+                  and not paths.development_protocol_path.exists(),
+                  "scoped reopen of closed work is refused before any write")
+            continue
+        item = mod.read_ndjson(paths.work_items_path)[0]
+        check(result.get("ok") is False and not paths.development_protocol_path.exists(),
+              f"ordinary protocol start reports checklist failure existing={existing} selected={selected}")
+        check(item.get("development_protocol_required") is True,
+              f"first work write retains required gate existing={existing} selected={selected}")
+        if existing: check(item.get("proof_marker") == "preserve", "unmarked reopen preserves unrelated proof")
+        close_result = {}
+        with patch.object(mod, "work_status_summary", return_value={"work_item": item, "closeout_readiness": "ready"}), \
+             patch.object(mod, "build_daily_dashboard", return_value={}), \
+             patch.object(mod, "update_work_item", side_effect=AssertionError("unguarded closure")):
+            try: close_result = mod.run_work_close(SimpleNamespace(work_id=wid), paths)
+            except AssertionError: pass
+        check(close_result.get("closed") is False,
+              f"missing checklist refuses close despite otherwise-ready work existing={existing} selected={selected}")
+
+
+def test_protocol_start_gate_survives_checklist_io_failure():
+    # protocol-start on active, unmarked work: a failed checklist write must still block close.
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_start_gate")
+    project = ROOT / "projects" / "start-gate-fixture"; project.mkdir()
+    goal = "ordinary protocol-start gate"
+    paths = mod.Paths(SimpleNamespace(claude_home=str(ROOT / "claude"), codex_home=str(ROOT / "codex"),
+        projects_root=str(ROOT / "projects"), output_root=str(ROOT / "out")))
+    paths.operator_intel.mkdir(parents=True)
+    wid = mod.stable_work_id(project, goal)
+    mod.write_ndjson(paths.work_items_path, [{"work_id": wid, "project": str(project), "goal": goal, "status": "active"}])
+    argv = base_cmd("protocol-start", ["--work-id", wid, "--project", str(project), "--goal", goal])[2:]
+    with patch.object(mod.development_protocol, "write", side_effect=OSError("injected checklist write failure")), \
+         contextlib.redirect_stdout(io.StringIO()):
+        code = mod.main(argv)
+    item = mod.read_ndjson(paths.work_items_path)[0]
+    check(code != 0 and not paths.development_protocol_path.exists(), "protocol-start reports checklist write failure")
+    check(item.get("development_protocol_required") is True, "protocol-start keeps required gate after failed write")
+    with patch.object(mod, "work_status_summary", return_value={"work_item": item, "closeout_readiness": "ready"}), \
+         patch.object(mod, "build_daily_dashboard", return_value={}), \
+         patch.object(mod, "update_work_item", side_effect=AssertionError("unguarded closure")):
+        try: close_result = mod.run_work_close(SimpleNamespace(work_id=wid), paths)
+        except AssertionError: close_result = {}
+    check(close_result.get("closed") is False, "protocol-start failure leaves work unclosable")
+
+
+def test_protocol_close_classification_lock_order():
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_close_lock")
+    d = mod.development_protocol
+    store = ROOT / "protocol.json"; works = ROOT / "work-items.ndjson"
+    work = {"work_id": "W-lock", "project": str(ROOT), "goal": "fixture", "status": "active", "development_protocol_required": True}
+    works.write_text(json.dumps(work) + "\n")
+    proof = ROOT / "proof.md"; proof.write_text("verified fixture")
+    plan = ROOT / "plan.md"; plan.write_text("reviewed fixture plan")
+    scope = ROOT / "scope.json"; review = ROOT / "scope-review.json"
+    body = {"work_id": "W-lock", "project": str(ROOT), "goal_sha256": hashlib.sha256(b"fixture").hexdigest(),
+            "lane": "small", "ui": False, "extra_required": [], "reason": "fixture",
+            "approved_plan": {"path": str(plan), "sha256": d.digest(plan)}}
+    review.write_text(json.dumps({"verdict": "APPROVE", "reviewer": "independent fixture", "contract_sha256": d.object_digest(body)}))
+    body["review"] = {"path": str(review), "sha256": d.digest(review)}; scope.write_text(json.dumps(body))
+    record = d.start(store, "W-lock", str(ROOT), "fixture", lane="small", ui=False)
+    d.classify(store, work, "small", False, str(scope), "fixture", d.record_digest(record))
+    for row in d.read(store)[0]["steps"]:
+        d.step(store, "W-lock", row["step_id"], "pass" if row["required"] else "na", str(proof), "true", reason="fixture conditional")
+    paths = SimpleNamespace(work_items_path=works, development_protocol_path=store, daily_dashboard_path=ROOT / "dashboard.md",
+                            projects_root=ROOT)
+    entered = threading.Event(); release = threading.Event(); attempting = threading.Event(); classified = threading.Event()
+    result = {}; errors = []
+    def status(*args):
+        entered.set()
+        if not release.wait(5): raise RuntimeError("fixture close barrier timeout")
+        return {"work_item": work, "closeout_readiness": "ready"}
+    def close():
+        try: result.update(mod.run_work_close(SimpleNamespace(work_id="W-lock"), paths))
+        except Exception as exc: errors.append(str(exc))
+    def classify():
+        attempting.set()
+        try:
+            with d.locked(works):
+                classified.set()
+                record = d.read(store)[0]
+                d.classify(store, work, "small", False, str(scope), "fixture", d.record_digest(d.refresh(record)))
+        except ValueError: result["stale_classify_rejected"] = True
+        except Exception as exc: errors.append(str(exc))
+    with patch.object(mod, "work_status_summary", side_effect=status), patch.object(mod, "build_daily_dashboard", return_value={}):
+        a = threading.Thread(target=close); a.start()
+        check(entered.wait(5), "close reaches controlled readiness barrier")
+        b = threading.Thread(target=classify); b.start()
+        check(attempting.wait(5) and not classified.wait(0.1), "classification cannot enter while close owns work lock")
+        plan.write_text("changed while close is paused")
+        release.set(); a.join(5); b.join(5)
+    check(not a.is_alive() and not b.is_alive() and not errors, "close and classification serialize without deadlock")
+    check(result.get("closed") is False and result.get("stale_classify_rejected") is True,
+          "stale evidence blocks both close and classification")
+    check(json.loads(works.read_text())["status"] == "active" and d.status(store, "W-lock")["scope_invalid"],
+          "stale scope never becomes closed")
+
+
+def test_protocol_close_holds_checklist_lock_through_close_write():
+    # A protocol-step between the readiness read and the closed write must not slip in.
+    import fcntl
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    reset()
+    mod = load_cli("protocol_close_hold")
+    d = mod.development_protocol
+    store = ROOT / "protocol.json"; works = ROOT / "work-items.ndjson"
+    work = {"work_id": "W-hold", "project": str(ROOT), "goal": "fixture", "status": "active", "development_protocol_required": True}
+    works.write_text(json.dumps(work) + "\n")
+    proof = ROOT / "proof.md"; proof.write_text("verified fixture")
+    d.start(store, "W-hold", str(ROOT), "fixture", lane="small", ui=False)
+    for row in d.read(store)[0]["steps"]:
+        d.step(store, "W-hold", row["step_id"], "pass" if row["required"] else "na", str(proof), "true", reason="fixture conditional")
+    paths = SimpleNamespace(work_items_path=works, development_protocol_path=store, daily_dashboard_path=ROOT / "dashboard.md",
+                            projects_root=ROOT)
+    held = []
+    def update(*args, **kwargs):
+        with store.with_suffix(".lock").open("a") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(probe, fcntl.LOCK_UN); held.append(False)
+            except BlockingIOError:
+                held.append(True)
+        return dict(work, status="closed")
+    with patch.object(mod, "work_status_summary", return_value={"work_item": work, "closeout_readiness": "ready"}), \
+         patch.object(mod, "build_daily_dashboard", return_value={}), patch.object(mod, "update_work_item", side_effect=update), \
+         patch.object(mod, "extract_learning_candidate", return_value={}), \
+         patch.object(mod, "write_learning_candidate", return_value=([], ROOT / "l.md", ROOT / "l.html")):
+        result = mod.run_work_close(SimpleNamespace(work_id="W-hold"), paths)
+    check(result.get("closed") is True and held == [True], "close holds the checklist lock while it writes closed")
+
+
 def main():
     tests = [
+        test_protocol_step_cli_keeps_operator_shell_verifier,
+        test_protocol_first_write_gate_survives_checklist_io_failure,
+        test_protocol_start_gate_survives_checklist_io_failure,
+        test_protocol_close_classification_lock_order,
+        test_protocol_close_holds_checklist_lock_through_close_write,
+        test_protocol_work_id_with_dot_stays_selectable,
+        test_protocol_explicit_lane_cli_preflight_and_reactivation,
         test_design_findings_route_to_design_pathway,
         test_design_gate_is_derived_from_repo_not_goal_wording,
         test_resolve_project_dir_nesting_and_unverified_proof_loudness,
@@ -7318,6 +9720,9 @@ def main():
         test_agent_cards_scope_excludes_helper_and_legacy_records,
         test_all_smoke_outputs_parse_and_redact,
         test_improve_and_compare_control_loop,
+        test_security_corrections_regressions,
+        test_protocol_checklist_project_equals_work_item,
+        test_protocol_uses_canonical_work_identity,
         test_daily_work_envelope_and_pathway_cooperation,
         test_daily_work_stale_measurement_detection,
         test_work_close_extracts_learning_candidate,
@@ -7353,7 +9758,11 @@ def main():
         test_approval_issue_guard_allows_non_issuance_text_and_fail_open_inputs,
         test_approval_issue_guard_installer_uses_one_canonical_source,
         test_approval_issue_guard_repeatable_verifier,
+        test_approval_ledger_strict_reader_and_authority_refusal_exit_codes,
         test_approval_authority_single_use_waiver_and_release_credit,
+        test_production_secure_closed_view_rechecks_current_readiness,
+        test_live_closed_view_reopens_when_release_proof_is_missing,
+        test_approval_invalidation_revokes_exact_ticket_credit,
         test_release_provider_action_consumes_approval_without_release_credit,
         test_approval_authority_survives_review_findings,
         test_proof_add_flips_itinerary_coverage,
@@ -7383,11 +9792,15 @@ def main():
         test_release_proof_rejects_mid_verification_evidence_mutation,
         test_observability_pre_runtime_hold_carries_without_credit_or_repeat,
         test_observability_runtime_receipt_completeness_binding_and_replay_guards,
+        test_observability_untrusted_verifier_has_no_side_effects,
+        test_observability_historical_contract_digest_invalidation,
         test_observability_proof_rejects_verifier_that_ignores_one_bound_artifact,
         test_observability_proof_rejects_stateful_invocation_counter_verifier,
         test_observability_proof_revalidates_receipt_freshness_after_canaries,
         test_observability_proof_rejects_mid_verification_artifact_mutation,
+        test_observability_proof_binds_contract_and_rejects_contract_toctou,
         test_verifier_templates_reject_hollow_artifacts_and_accept_complete_contracts,
+        test_phase1_g1_verifier_rejects_ambiguous_receipts,
         test_research_focus_map_derivation_and_addendum_verifier,
         test_audit_proof_integrity_uses_active_outcomes_and_reports_history,
         test_canary_mutant_is_symlink_safe,
@@ -7396,6 +9809,10 @@ def main():
         test_canary_selects_relevant_target_in_dirty_registered_checkout,
         test_canary_run_guard_skips_trivial_and_slow_verifiers,
         test_proof_canary_observability_report,
+        test_observability_contract_loader_fails_closed_and_gates_schema,
+        test_observability_contract_resolution_g2_and_identity_guards,
+        test_agents_observability_contract_uses_generic_drill_envelope,
+        test_agents_g3_verifier_executes_negative_canaries,
         test_cohens_kappa_inter_rater_agreement,
         test_fleiss_kappa_multi_rater_agreement,
         test_kappa_reliability_thresholds,
