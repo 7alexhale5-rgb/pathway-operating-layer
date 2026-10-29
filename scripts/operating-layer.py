@@ -8987,6 +8987,10 @@ def run_work_start(args, paths):
                 if existing and existing.get("status") == "closed" and lane is not None:
                     raise ValueError("reactivate without scope changes, then classify separately")
                 # The checklist stores the project later checks expect: the selected item's, or new work's.
+                # A bare name for new work must bind under the projects root, never via the cwd fallback.
+                raw = str(args.project).strip()
+                if not selected and os.sep not in raw and not raw.startswith("."):
+                    protocol_project_dir(raw, paths.projects_root)
                 checklist_project = (protocol_expected_identity(paths, wid)[0] if selected
                                      else str(Path(project).resolve()))
                 prepared, created = development_protocol.prepare_start(records, wid, checklist_project, args.goal, lane=lane, ui=ui)
@@ -9860,12 +9864,20 @@ def _run_work_close_locked(args, paths):
         }
     summary = work_status_summary(paths, args.work_id)
     findings = []
-    protocol_ready, protocol_status = development_protocol.enforce_close(
-        paths.development_protocol_path, args.work_id,
-        (resolve_project_dir(summary["work_item"]["project"], paths.projects_root),
-         summary["work_item"]["goal"]) if summary.get("work_item") else None,
-        lock=False,
-    )
+    work = summary.get("work_item")
+    try:
+        # Same binding rule as protocol-status/step; never fall back to a cwd match.
+        identity = (protocol_project_dir(work["project"], paths.projects_root), work["goal"]) if work else None
+    except ValueError as exc:
+        try:
+            has_checklist = any(r["work_id"] == args.work_id for r in development_protocol.read(paths.development_protocol_path))
+        except (ValueError, KeyError, TypeError, OSError):
+            has_checklist = True  # an unreadable store fails closed, as enforce_close does
+        protocol_ready = not has_checklist
+        protocol_status = dict(exists=has_checklist, ready=False, open=["invalid-protocol-identity"], error=str(exc))
+    else:
+        protocol_ready, protocol_status = development_protocol.enforce_close(
+            paths.development_protocol_path, args.work_id, identity, lock=False)
     if (summary.get("work_item") or {}).get("development_protocol_required") and not protocol_status.get("exists"):
         protocol_ready = False
     if not protocol_ready:

@@ -975,10 +975,18 @@ def test_protocol_checklist_project_equals_work_item():
         ledger.write_text("".join(json.dumps(i) + "\n" for i in items))
         return start["work_id"]
 
+    # New protocol work: a bare name binds only under the projects root (r12 44b0); a path binds as typed.
     fresh, _ = run("work-start", ["--project", "never-made-c29", "--goal", goal, "--development-protocol"])
-    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == fresh["work_id"])
-    check(Path(item["project"]).is_absolute() and record(fresh["work_id"])["project"] == item["project"],
-          "new bare name: checklist stores the work item's absolute project")
+    check(fresh.get("ok") is False and not checklist.exists(), f"new missing bare name refuses protocol work: {fresh}")
+    (ROOT / "job" / "cwd-new-c29").mkdir(parents=True)
+    argv = base_cmd("work-start", ["--project", "cwd-new-c29", "--goal", goal, "--development-protocol"])
+    out = json.loads(subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job").stdout or "{}")
+    check(out.get("ok") is False and not checklist.exists(), f"new bare name found only in cwd refuses protocol work: {out}")
+    argv = base_cmd("work-start", ["--project", "./cwd-new-c29", "--goal", goal, "--development-protocol"])
+    out = json.loads(subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job").stdout or "{}")
+    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == out["work_id"])
+    check(item["project"] == str((ROOT / "job" / "cwd-new-c29").resolve()) == record(out["work_id"])["project"],
+          "new explicit relative path binds as typed in work item and checklist")
     # A legacy bare name that resolves under the projects root keeps its earned rows.
     wid = legacy_item("legacy-c29")
     write("projects/legacy-c29/README.md", "# legacy\n")
@@ -1000,6 +1008,18 @@ def test_protocol_checklist_project_equals_work_item():
     proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job")
     out = json.loads(proc.stdout or "{}")
     check(out.get("ok") is False and record(wid) is None, f"bare name found only in cwd refuses enrollment: {out}")
+    # Grok r12 44b0: close must apply the same binding rule as status, never a cwd-only match.
+    sys.path.insert(0, str(CLI.parent))
+    import development_protocol as dp
+    bound, _ = dp.prepare_start([], wid, str((ROOT / "job" / "cwd-only-c29").resolve()), goal, lane="small", ui=False)
+    for row in bound["steps"]:
+        row.update(status="not-applicable", exception_reason="fixture")
+    checklist.write_text(json.dumps([bound]))
+    argv = base_cmd("work-close", ["--work-id", wid])
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job")
+    closed = json.loads(proc.stdout or "{}")
+    check("work-close-protocol-incomplete" in ids(closed),
+          f"close refuses a checklist bound to a cwd-only bare name: {ids(closed)}")
     # Without a knowable absolute directory, enrollment refuses instead of storing a guess.
     for legacy in ("missing-bare-c29", ".client-c29", "missing-c29/sub"):
         wid = legacy_item(legacy)
