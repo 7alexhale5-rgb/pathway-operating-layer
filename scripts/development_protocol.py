@@ -137,7 +137,9 @@ def scope_evidence_changed(dependencies):
 
 def prepare_start(records, work_id, project, goal, required=None, *, lane=None, ui=None):
     """Pure preflight: caller may hold both stores' locks before any mutation."""
-    project = str(Path(project).expanduser().resolve())
+    # Resolve paths only; a bare NAME stays as-is, matching resolve_project_dir and the work item.
+    if os.sep in project or project.startswith("."):
+        project = str(Path(project).expanduser().resolve())
     extras = scope_inputs(lane, ui, required)
     matches = [r for r in records if r["work_id"] == work_id]
     if len(matches) > 1:
