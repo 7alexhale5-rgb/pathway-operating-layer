@@ -8986,8 +8986,9 @@ def run_work_start(args, paths):
             if getattr(args, "development_protocol", False) or matches:
                 if existing and existing.get("status") == "closed" and lane is not None:
                     raise ValueError("reactivate without scope changes, then classify separately")
-                # The checklist stores the work item's exact project: as selected, or as new work will store it.
-                checklist_project = project if selected else str(Path(project).resolve())
+                # The checklist stores the project later checks expect: the selected item's, or new work's.
+                checklist_project = (protocol_expected_identity(paths, wid)[0] if selected
+                                     else str(Path(project).resolve()))
                 prepared, created = development_protocol.prepare_start(records, wid, checklist_project, args.goal, lane=lane, ui=ui)
             if selected:
                 if args.tier is not None and args.tier != existing.get("tier"):
@@ -9817,7 +9818,11 @@ def protocol_expected_identity(paths, work_id):
                  if row.get("work_id") == work_id), None)
     if not item or not item.get("project") or not item.get("goal"):
         raise ValueError("protocol requires an existing canonical work item")
-    return resolve_project_dir(item["project"], paths.projects_root), item["goal"]
+    raw = str(item["project"])
+    if not Path(raw).is_absolute() and (os.sep in raw or raw.startswith(".")):
+        # A stored relative path resolves against whatever cwd runs the check; never guess proof's directory.
+        raise ValueError("work item project is a relative path; restart work with an absolute --project")
+    return resolve_project_dir(raw, paths.projects_root), item["goal"]
 
 
 def run_work_close(args, paths):
@@ -13736,7 +13741,7 @@ def main(argv=None):
                 records = development_protocol.read(paths.development_protocol_path)
                 if work.get("development_protocol_required") and not any(r["work_id"] == args.work_id for r in records):
                     raise ValueError("required existing checklist missing; cannot recreate")
-                protocol, created = development_protocol.prepare_start(records, args.work_id, work["project"], args.goal, lane=lane, ui=ui)
+                protocol, created = development_protocol.prepare_start(records, args.work_id, project, args.goal, lane=lane, ui=ui)
                 # Mark the gate before the checklist write so a failed write still blocks close.
                 update_work_item(paths, args.work_id, development_protocol_required=True)
                 if created:

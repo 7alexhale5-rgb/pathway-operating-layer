@@ -260,17 +260,15 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(frozen, set(retry["record"]["legacy_protected_required"]))
         self.assertTrue(all(s["status"] == "passed" for s in d.read(self.store)[0]["steps"]))
 
-    def test_new_checklist_stores_project_verbatim(self):
-        # Callers pass the work item's exact project string; the checklist must never re-derive it
-        # from cwd, or the pair diverges (Grok r7 ca4f, r8 8750, r9 eefe). Shapes from every caller.
-        original = Path.cwd()
-        try:
-            os.chdir(self.root)
-            for i, project in enumerate(("client", ".client", "./not-yet-made", "a/b", str(self.root))):
-                d.start(self.store, f"W-shape{i}", project, self.goal, lane="small", ui=False)
-                self.assertEqual(project, d.read(self.store)[-1]["project"])
-        finally:
-            os.chdir(original)
+    def test_new_checklist_requires_absolute_project(self):
+        # Callers pass the absolute project later checks expect; a relative or bare value would be
+        # wiped or cwd-guessed on the next read (Grok r7 ca4f, r8 8750, r9 eefe, r10 dd87).
+        d.start(self.store, "W-abs", str(self.root), self.goal, lane="small", ui=False)
+        self.assertEqual(str(self.root), d.read(self.store)[0]["project"])
+        for i, project in enumerate(("client", ".client", "./not-yet-made", "a/b")):
+            with self.assertRaises(ValueError):
+                d.start(self.store, f"W-rel{i}", project, self.goal, lane="small", ui=False)
+        self.assertEqual(1, len(d.read(self.store)))
 
     def test_classify_parses_only_the_bytes_it_hashed(self):
         self.start()

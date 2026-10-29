@@ -954,36 +954,49 @@ def test_security_corrections_regressions():
     )
 
 def test_protocol_checklist_project_equals_work_item():
-    # Grok r8 8750 + r9 eefe: the checklist stores the work item's project string exactly,
-    # whatever its shape, so identity checks never compare a cwd guess with the canonical value.
+    # Grok r8 8750, r9 eefe, r10 dd87: the checklist stores the absolute project that later
+    # status/step/close checks expect, never a cwd guess; with no absolute project it refuses.
     reset()
     ledger = ROOT / "out" / "operator-intelligence" / "work-items.ndjson"
     checklist = ROOT / "out" / "operator-intelligence" / "development-protocol.json"
-
-    def pair(wid):
-        item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == wid)
-        record = next(r for r in read_json(checklist) if r["work_id"] == wid)
-        return item["project"], record["project"]
-
     goal = "Fix a project that does not exist yet"
-    fresh, _ = run("work-start", ["--project", "never-made-c29", "--goal", goal, "--development-protocol"])
-    work_proj, list_proj = pair(fresh["work_id"])
-    check(work_proj == list_proj, f"new bare name: checklist {list_proj!r} equals work item {work_proj!r}")
-    for legacy in (".client-c29", "missing-c29/sub"):
+
+    def record(wid):
+        rows = read_json(checklist) if checklist.exists() else []
+        return next((r for r in rows if r["work_id"] == wid), None)
+
+    def legacy_item(project):
         reset()
         start, _ = run("work-start", ["--project", str(ROOT / "projects"), "--goal", goal])
-        wid = start["work_id"]
         items = [json.loads(l) for l in ledger.read_text().splitlines() if l]
         for item in items:
-            if item["work_id"] == wid:
-                item["project"] = legacy
+            if item["work_id"] == start["work_id"]:
+                item["project"] = project
         ledger.write_text("".join(json.dumps(i) + "\n" for i in items))
+        return start["work_id"]
+
+    fresh, _ = run("work-start", ["--project", "never-made-c29", "--goal", goal, "--development-protocol"])
+    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == fresh["work_id"])
+    check(Path(item["project"]).is_absolute() and record(fresh["work_id"])["project"] == item["project"],
+          "new bare name: checklist stores the work item's absolute project")
+    # A legacy bare name that resolves under the projects root keeps its earned rows.
+    wid = legacy_item("legacy-c29")
+    write("projects/legacy-c29/README.md", "# legacy\n")
+    started, _ = run("protocol-start", ["--work-id", wid, "--project", "legacy-c29", "--goal", goal])
+    check(started.get("ok") is True, f"legacy existing bare name enrolls: {started}")
+    first = record(wid)["steps"][0]["step_id"]
+    run("protocol-step", ["--work-id", wid, "--step", first, "--result", "running"])
+    status, _ = run("protocol-status", ["--work-id", wid])
+    kept = next(s for s in status.get("steps", []) if s["step_id"] == first)
+    check(kept["status"] == "running" and Path(record(wid)["project"]).is_absolute(),
+          f"legacy bare name keeps step rows across status: {kept}")
+    # Without a knowable absolute directory, enrollment refuses instead of storing a guess.
+    for legacy in ("missing-bare-c29", ".client-c29", "missing-c29/sub"):
+        wid = legacy_item(legacy)
         started, _ = run("protocol-start", ["--work-id", wid, "--project", legacy, "--goal", goal])
-        check(started.get("ok") is True, f"legacy {legacy!r} protocol-start accepted: {started}")
-        work_proj, list_proj = pair(wid)
-        check(work_proj == list_proj == legacy, f"legacy {legacy!r}: checklist {list_proj!r} equals work item")
         again, _ = run("work-start", ["--work-id", wid, "--project", legacy, "--goal", goal, "--development-protocol"])
-        check(again.get("ok", True) is not False, f"legacy {legacy!r} selected re-start keeps identity: {again}")
+        check(started.get("ok") is False and again.get("ok") is False and record(wid) is None,
+              f"legacy {legacy!r} with no absolute project refuses enrollment: {started} {again}")
 
 
 def test_protocol_uses_canonical_work_identity():

@@ -137,7 +137,7 @@ def scope_evidence_changed(dependencies):
 
 def prepare_start(records, work_id, project, goal, required=None, *, lane=None, ui=None):
     """Pure preflight: caller may hold both stores' locks before any mutation."""
-    # project is the work item's exact string; callers own it, so identity never depends on cwd.
+    # Callers pass the absolute project later identity checks expect (never a cwd guess).
     extras = scope_inputs(lane, ui, required)
     matches = [r for r in records if r["work_id"] == work_id]
     if len(matches) > 1:
@@ -152,6 +152,8 @@ def prepare_start(records, work_id, project, goal, required=None, *, lane=None, 
         if scope_evidence_changed(existing.get("scope_dependencies", {})):
             raise ValueError("scope evidence changed; use reviewed protocol-classify")
         return existing, False
+    if not Path(project).is_absolute():
+        raise ValueError("protocol needs an absolute project directory; restart work with --project PATH")
     extras = extras or set()
     needed = requirements(goal, lane, ui, extras)
     record = dict(work_id=work_id, project=str(project), goal=goal, created_at=now(), steps=[],
