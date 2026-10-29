@@ -8997,7 +8997,7 @@ def run_work_start(args, paths):
                 # Mark the gate before the checklist write so a failed write still blocks close.
                 updates = dict(status="active", mode="semi-automatic", closeout_readiness="not_ready")
                 if prepared is not None:
-                    updates["development_protocol_required"] = True
+                    updates.update(development_protocol_required=True, project=checklist_project)
                 item = update_work_item(paths, wid, **updates)
                 if prepared is not None and created:
                     development_protocol.write(paths.development_protocol_path, records + [prepared])
@@ -9818,11 +9818,22 @@ def protocol_expected_identity(paths, work_id):
                  if row.get("work_id") == work_id), None)
     if not item or not item.get("project") or not item.get("goal"):
         raise ValueError("protocol requires an existing canonical work item")
-    raw = str(item["project"])
-    if not Path(raw).is_absolute() and (os.sep in raw or raw.startswith(".")):
-        # A stored relative path resolves against whatever cwd runs the check; never guess proof's directory.
+    return protocol_project_dir(item["project"], paths.projects_root), item["goal"]
+
+
+def protocol_project_dir(raw, projects_root):
+    """The one absolute project a checklist is bound to; refuse anything that depends on cwd."""
+    raw = str(raw)
+    if Path(raw).is_absolute():
+        return resolve_project_dir(raw, projects_root)
+    if os.sep in raw or raw.startswith("."):
         raise ValueError("work item project is a relative path; restart work with an absolute --project")
-    return resolve_project_dir(raw, paths.projects_root), item["goal"]
+    found = resolve_project_dir(raw, projects_root)
+    root = Path(projects_root or DEFAULT_PROJECTS_ROOT).expanduser().resolve()
+    # Bare names bind only through the projects root; resolve_project_dir's last-resort cwd match is a guess.
+    if not Path(found).is_absolute() or not Path(found).is_relative_to(root):
+        raise ValueError("project name not found under the projects root; restart work with an absolute --project")
+    return found
 
 
 def run_work_close(args, paths):
@@ -13743,7 +13754,8 @@ def main(argv=None):
                     raise ValueError("required existing checklist missing; cannot recreate")
                 protocol, created = development_protocol.prepare_start(records, args.work_id, project, args.goal, lane=lane, ui=ui)
                 # Mark the gate before the checklist write so a failed write still blocks close.
-                update_work_item(paths, args.work_id, development_protocol_required=True)
+                # Pin the work item to the checklist's absolute project so every later compare agrees.
+                update_work_item(paths, args.work_id, development_protocol_required=True, project=project)
                 if created:
                     development_protocol.write(paths.development_protocol_path, records + [protocol])
                 result = {"ok": True, "protocol": protocol, "work_id": args.work_id}

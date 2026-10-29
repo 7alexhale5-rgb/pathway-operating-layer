@@ -990,6 +990,16 @@ def test_protocol_checklist_project_equals_work_item():
     kept = next(s for s in status.get("steps", []) if s["step_id"] == first)
     check(kept["status"] == "running" and Path(record(wid)["project"]).is_absolute(),
           f"legacy bare name keeps step rows across status: {kept}")
+    item = next(json.loads(l) for l in ledger.read_text().splitlines() if l and json.loads(l)["work_id"] == wid)
+    check(item["project"] == record(wid)["project"],
+          "legacy bare name: enrollment pins the work item to the checklist's absolute project (classify compares them)")
+    # A bare name found only in the caller's cwd is a guess, not the project: refuse it.
+    wid = legacy_item("cwd-only-c29")
+    (ROOT / "job" / "cwd-only-c29").mkdir(parents=True)
+    argv = base_cmd("protocol-start", ["--work-id", wid, "--project", "cwd-only-c29", "--goal", goal])
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120, cwd=ROOT / "job")
+    out = json.loads(proc.stdout or "{}")
+    check(out.get("ok") is False and record(wid) is None, f"bare name found only in cwd refuses enrollment: {out}")
     # Without a knowable absolute directory, enrollment refuses instead of storing a guess.
     for legacy in ("missing-bare-c29", ".client-c29", "missing-c29/sub"):
         wid = legacy_item(legacy)
